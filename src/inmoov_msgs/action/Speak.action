@@ -1,0 +1,14 @@
+# Goal — что сказать
+string text
+string voice        # instruct_text для CosyVoice3 ("говори радостно", "" = по умолчанию)
+float32 rate        # скорость: 0.0/1.0 = нормальная, 0.5 = медленно, 2.0 = быстро
+---
+# Result
+bool success
+string message      # описание ошибки если !success
+float32 audio_sec   # фактическая длительность воспроизведения
+---
+# Feedback (публикуется во время синтеза и воспроизведения)
+string status       # "connecting" | "synthesizing" | "playing" | "done"
+float32 progress    # 0.0..1.0 если Content-Length известен, иначе -1.0
+int32 bytes_played  # байт воспроизведено (для синхронизации жестов)

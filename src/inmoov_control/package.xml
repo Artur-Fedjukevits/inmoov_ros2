@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>inmoov_control</name>
+  <version>0.1.0</version>
+  <description>
+    Motion control for InMoov humanoid robot.
+    Replaces xicro per-servo topics with efficient binary batch protocol
+    for ML-based motion control. Provides /joint_states and /face_joint_states
+    aggregated topics for policy inference.
+  </description>
+  <maintainer email="todo@todo.com">Artur</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>python3-serial</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

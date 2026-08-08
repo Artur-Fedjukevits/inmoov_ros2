@@ -1,0 +1,132 @@
+{
+  "neutral": {},
+  "angry": {
+    "forhead_L": 110,
+    "forhead_R": 105,
+    "eyelid_L_Upper": 70,
+    "eyelid_L_Lower": 70,
+    "eyelid_R_Upper": 70,
+    "eyelid_R_Lower": 70,
+    "upperLip": 105,
+    "cheek_L": 75,
+    "cheek_R": 68,
+    "eyebrow_L": 60,
+    "eyebrow_R": 70
+  },
+  "wink": {
+    "eyelid_L_Upper": 70,
+    "eyelid_L_Lower": 75
+  },
+  "disgust": {
+    "upperLip": 105,
+    "forhead_L": 90,
+    "forhead_R": 85,
+    "eyelid_L_Lower": 75,
+    "eyelid_R_Lower": 70,
+    "cheek_R": 105,
+    "eyebrow_L": 60,
+    "eyebrow_R": 70
+  },
+  "fear": {
+    "eyelid_L_Upper": 95,
+    "eyelid_L_Lower": 95,
+    "eyelid_R_Upper": 100,
+    "eyelid_R_Lower": 95,
+    "cheek_L": 75,
+    "cheek_R": 68,
+    "eyebrow_L": 110,
+    "eyebrow_R": 105,
+    "forhead_L": 110,
+    "forhead_R": 105
+  },
+  "happy": {
+    "eyebrow_L": 110,
+    "eyebrow_R": 105,
+    "cheek_L": 115,
+    "cheek_R": 105,
+    "upperLip": 90,
+    "eyelid_L_Lower": 75,
+    "eyelid_R_Lower": 70,
+    "jaw": 90
+  },
+  "smile": {
+    "eyelid_L_Lower": 75,
+    "eyelid_R_Lower": 70,
+    "cheek_L": 115,
+    "cheek_R": 105,
+    "jaw": 75
+  },
+  "sad": {
+    "eyelid_L_Upper": 70,
+    "eyelid_R_Upper": 65,
+    "eyebrow_L": 75,
+    "eyebrow_R": 100,
+    "cheek_L": 75,
+    "cheek_R": 68,
+    "jaw": 10
+  },
+  "sigh": {
+    "eye_lr_L": 100,
+    "eye_ud_L": 110,
+    "eye_lr_R": 100,
+    "eye_ud_R": 115
+  },
+  "sorry": {
+    "eyebrow_L": 110,
+    "eyebrow_R": 105,
+    "cheek_L": 75,
+    "cheek_R": 68
+  },
+  "suspicious": {
+    "upperLip": 90,
+    "forhead_R": 105,
+    "forhead_L": 90,
+    "cheek_L": 115,
+    "eyebrow_R": 70,
+    "eyebrow_L": 110,
+    "eyelid_L_Upper": 95,
+    "eyelid_L_Lower": 95,
+    "eyelid_R_Upper": 70,
+    "eyelid_R_Lower": 70
+  },
+  "thinking": {
+    "eyelid_L_Upper": 76,
+    "eyelid_R_Upper": 73,
+    "eyebrow_L": 60,
+    "eyebrow_R": 70,
+    "forhead_L": 110,
+    "forhead_R": 105,
+    "eye_lr_L": 100,
+    "eye_ud_L": 110,
+    "eye_lr_R": 100,
+    "eye_ud_R": 115
+  },
+  "unamused": {
+    "eyebrow_R": 70,
+    "forhead_L": 110,
+    "forhead_R": 85,
+    "eyelid_L_Upper": 70,
+    "eyelid_L_Lower": 70,
+    "eyelid_R_Upper": 70,
+    "eyelid_R_Lower": 70,
+    "eye_lr_L": 80,
+    "eye_lr_R": 80,
+    "cheek_L": 75,
+    "cheek_R": 68
+  },
+  "surprise": {
+    "eyebrow_L": 110,
+    "eyebrow_R": 105,
+    "eyelid_L_Upper": 95,
+    "eyelid_R_Upper": 100,
+    "forhead_L": 90,
+    "forhead_R": 85,
+    "jaw": 90
+  },
+  "sleeping": {
+    "eyelid_L_Upper": 70,
+    "eyelid_L_Lower": 75,
+    "eyelid_R_Upper": 65,
+    "eyelid_R_Lower": 70
+  }
+}

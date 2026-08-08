@@ -1,0 +1,96 @@
+# lifecycle.yaml — конфигурация тиров и политик для InmoovLifecycleManager
+#
+# critical: нода обязательна, её отказ блокирует тир и всю систему
+# optional: retry → degraded (робот продолжает работать без неё)
+#
+# Добавить CAN-bus ноги: вписать в tier 1, critical: true — и больше ничего не менять.
+
+lifecycle_manager:
+  ros__parameters:
+    retry_count: 3
+    retry_interval_sec: 10.0
+    transition_timeout_sec: 30.0
+    tier_advance_timeout_sec: 90.0
+    watchdog_interval_sec: 5.0       # как часто опрашивать get_state (сек)
+    watchdog_startup_delay_sec: 15.0 # не смотреть на ноды пока система поднимается
+    max_respawn_count: 5             # после N watchdog-recovery — сдаться
+
+    tiers:
+      # ── Тир 0: Foundation ────────────────────────────────────────────────
+      - id: 0
+        description: "Слой данных — должен быть готов раньше всего"
+        nodes:
+          - memory_node
+        critical:
+          - memory_node
+
+      # ── Тир 1: Hardware Drivers ──────────────────────────────────────────
+      - id: 1
+        description: "Прямой доступ к железу"
+        nodes:
+          - audio_source_node
+          - arduino_left
+          - arduino_right
+          - face_capture_node
+          - oak_node
+        critical:
+          - arduino_left        # без Arduino нет движения
+          - arduino_right
+        # face_capture_node, oak_node: retry → degraded (голосовой режим)
+
+      # ── Тир 2: HW Consumers ─────────────────────────────────────────────
+      - id: 2
+        description: "Ноды потребляющие железо первого тира"
+        nodes:
+          - wakeword_node
+          - voice_detector_node
+          - tts_node
+          - joint_state_publisher
+          - face_expressions   # launch name is 'face_expressions', not 'face_expressions_node'
+          - face_detection_node_left
+          - face_detection_node_right
+        critical: []
+        # все: retry → degraded (без них робот всё равно может работать, просто хуже)
+
+      # ── Тир 3: Processing ───────────────────────────────────────────────
+      - id: 3
+        description: "Обработка сигналов"
+        nodes:
+          - face_tracker_node_left
+          - face_tracker_node_right
+          - voice_emotion_node
+          - whisper_stt_node
+        critical: []
+        # все: retry → degraded (без них робот всё равно может работать, просто хуже)
+      # ── Тир 4: Intelligence ─────────────────────────────────────────────
+      - id: 4
+        description: "Распознавание и интеллект"
+        nodes:
+          - face_recognition_node
+          - face_gallery_node
+          - emotion_recognition_node
+          - vision_head_tracker_node
+          - human_detection_node
+          - llm_node
+          - openhab_bridge_node
+        critical:
+          - llm_node             # без LLM нет ответов (есть fallback CPU-модель)
+        # остальные: degraded
+
+      # ── Тир 5: Context & Orchestration ──────────────────────────────────
+      - id: 5
+        description: "Контекст и управление поведением"
+        nodes:
+          - identity_manager_node
+          - behavior_manager_node
+        critical:
+          - identity_manager_node
+          - behavior_manager_node
+
+      # ── Тир 6: Optional External ────────────────────────────────────────
+      - id: 6
+        description: "Опциональные внешние интерфейсы"
+        nodes:
+          - telegram_bridge_node
+        critical: []
+        # Полностью опциональный — degraded не влияет на работу

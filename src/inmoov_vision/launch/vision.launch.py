@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""
+vision.launch.py — запуск vision pipeline для InMoov.
+
+Поток данных:
+  PIR (/pir_state) → inmoov_cognition → /face_detection/enable
+  /face_detection/enable → face_detection_node_{left,right}
+                         → face_tracker_node_{left,right}
+  inmoov_cognition  → /head_tracker/enable → vision_head_tracker_node
+
+  face_capture_node           → /camera/eye_{left,right}/compressed
+  face_detection_node_left    → /face/detections/left
+  face_detection_node_right   → /face/detections/right  (buffalo_l)
+  face_tracker_node_left      → /face/tracks/left
+  face_tracker_node_right     → /face/tracks/right
+  face_recognition_node       → /face/identity  (из /face/tracks/left)
+  emotion_recognition_node    → /face/emotion   (из /face/tracks/left)
+  vision_head_tracker_node    → /joint_command, /face_command
+
+  identity_manager_node живёт в inmoov_cognition пакете.
+
+Использование:
+  ros2 launch inmoov_vision vision.launch.py
+  ros2 launch inmoov_vision vision.launch.py cam_left:=... cam_right:=...
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    args = [
+        DeclareLaunchArgument('cam_left',
+            default_value='/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0'),
+        DeclareLaunchArgument('cam_right',
+            default_value='/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0'),
+        DeclareLaunchArgument('fps',                  default_value='15'),
+        DeclareLaunchArgument('detection_hz',         default_value='5.0'),
+        DeclareLaunchArgument('det_thresh',           default_value='0.5'),
+        DeclareLaunchArgument('analysis_hz',          default_value='2.0'),
+        DeclareLaunchArgument('gain_head',            default_value='0.3'),
+        DeclareLaunchArgument('gain_eye',             default_value='0.6'),
+        DeclareLaunchArgument('rest_rothead',         default_value='90.0'),
+        DeclareLaunchArgument('rest_neck',            default_value='40.0'),
+        # OAK-D Lite (depthai v3 — модель из Luxonis HubAI)
+        DeclareLaunchArgument('oak_model',            default_value='yolov6-nano'),
+        DeclareLaunchArgument('oak_conf_threshold',   default_value='0.5'),
+    ]
+
+    # 1. Камера — всегда запущена (лёгкий процесс)
+    face_capture = Node(
+        package='inmoov_vision',
+        executable='face_capture_node',
+        name='face_capture_node',
+        output='screen',
+        parameters=[{
+            'cam_left':  LaunchConfiguration('cam_left'),
+            'cam_right': LaunchConfiguration('cam_right'),
+            'fps':          LaunchConfiguration('fps'),
+            'width':        640,
+            'height':       480,
+            'jpeg_quality': 85,
+        }],
+    )
+
+    # 2a. Детекция лиц — левый глаз (buffalo_l: bbox + embedding)
+    face_detection_left = Node(
+        package='inmoov_vision',
+        executable='face_detection_node',
+        name='face_detection_node_left',
+        output='screen',
+        parameters=[{
+            'camera_side':  'left',
+            'detection_hz': LaunchConfiguration('detection_hz'),
+            'det_size':     640,
+            'det_thresh':   LaunchConfiguration('det_thresh'),
+            'model_name':   'buffalo_l',
+        }],
+    )
+
+    # 2b. Детекция лиц — правый глаз (buffalo_l: bbox + embedding для fallback/redundancy)
+    face_detection_right = Node(
+        package='inmoov_vision',
+        executable='face_detection_node',
+        name='face_detection_node_right',
+        output='screen',
+        parameters=[{
+            'camera_side':  'right',
+            'detection_hz': LaunchConfiguration('detection_hz'),
+            'det_size':     640,
+            'det_thresh':   LaunchConfiguration('det_thresh'),
+            'model_name':   'buffalo_l',
+        }],
+    )
+
+    # 3a. Трекер левого глаза
+    face_tracker_left = Node(
+        package='inmoov_vision',
+        executable='face_tracker_node',
+        name='face_tracker_node_left',
+        output='screen',
+        parameters=[{
+            'camera_side':    'left',
+            'iou_threshold':  0.20,
+            'max_lost_frames': 20,
+            'max_tracks':      4,
+        }],
+    )
+
+    # 3b. Трекер правого глаза
+    face_tracker_right = Node(
+        package='inmoov_vision',
+        executable='face_tracker_node',
+        name='face_tracker_node_right',
+        output='screen',
+        parameters=[{
+            'camera_side':    'right',
+            'iou_threshold':  0.20,
+            'max_lost_frames': 20,
+            'max_tracks':      4,
+        }],
+    )
+
+    # 4. Распознавание — требует /memory/query сервис
+    face_recognition = Node(
+        package='inmoov_vision',
+        executable='face_recognition_node',
+        name='face_recognition_node',
+        output='screen',
+        parameters=[{
+            'recognition_cooldown_sec': 3.0,
+        }],
+    )
+
+    # 5. Эмоции лица
+    emotion_recognition = Node(
+        package='inmoov_vision',
+        executable='emotion_recognition_node',
+        name='emotion_recognition_node',
+        output='screen',
+        parameters=[{
+            'analysis_hz':    LaunchConfiguration('analysis_hz'),
+            'min_face_size':  48,
+        }],
+    )
+
+    # 9. OAK-D Lite — YOLO object detection + depth (Myriad X VPU)
+    oak = Node(
+        package='inmoov_vision',
+        executable='oak_node',
+        name='oak_node',
+        output='screen',
+        parameters=[{
+            'model_name':     LaunchConfiguration('oak_model'),
+            'conf_threshold': LaunchConfiguration('oak_conf_threshold'),
+        }],
+    )
+
+    # 10. Human detection — body presence via OAK-D Lite YOLO detections
+    human_detection = Node(
+        package='inmoov_vision',
+        executable='human_detection_node',
+        name='human_detection_node',
+        output='screen',
+        parameters=[{
+            'max_distance_m':   4.0,
+            'min_confidence':   0.45,
+            'lost_timeout_sec': 4.0,
+            'publish_rate_hz':  5.0,
+        }],
+    )
+
+    # 7. Галерея фотографий — автосъёмка лиц для gallery-based распознавания
+    face_gallery = Node(
+        package='inmoov_vision',
+        executable='face_gallery_node',
+        name='face_gallery_node',
+        output='screen',
+        parameters=[{
+            'gallery_dir':           '/home/artur/inmoov_faces',
+            'enroll_interval_sec':   1.0,
+            'interact_interval_sec': 15.0,
+            'min_det_score':         0.75,
+            'min_face_px':           60,
+        }],
+    )
+
+    # 8. Head tracker — поворот головы/глаз к лицу (dual-eye leader/follower)
+    head_tracker = Node(
+        package='inmoov_vision',
+        executable='vision_head_tracker_node',
+        name='vision_head_tracker_node',
+        output='screen',
+        parameters=[{
+            'image_width':         640,
+            'image_height':        480,
+            'fov_h_deg':           60.0,
+            'fov_v_deg':           45.0,
+            'gain_head':           LaunchConfiguration('gain_head'),
+            'gain_eye':            LaunchConfiguration('gain_eye'),
+            'rest_rothead':        LaunchConfiguration('rest_rothead'),
+            'rest_neck':           LaunchConfiguration('rest_neck'),
+            'rest_eye_lr':         90.0,
+            'rest_eye_ud':        100.0,
+            'dead_zone_px':        20,
+            'head_dead_zone_px':   80,
+            'eye_limit_deg':       8.0,
+            'return_timeout_sec':  3.0,
+            'track_hz':            15.0,
+            'max_step_deg':        2.0,
+            'bbox_ema_alpha':      0.4,
+            'max_stale_ticks':     5,
+        }],
+    )
+
+    return LaunchDescription(args + [
+        face_capture,
+        face_detection_left,
+        face_detection_right,
+        face_tracker_left,
+        face_tracker_right,
+        face_recognition,
+        face_gallery,
+        emotion_recognition,
+        head_tracker,
+        oak,
+        human_detection,
+    ])
