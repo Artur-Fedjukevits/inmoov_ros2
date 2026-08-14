@@ -48,6 +48,19 @@ class AudioSourceNode(LifecycleNode):
     _RESTART_STORM_COUNT      = 5     # рестартов...
     _RESTART_STORM_WINDOW_SEC = 30.0  # ...за это окно → аварийный выход
 
+    # Инцидент 2026-08-09: pipewire-pulse (сервер протокола PulseAudio)
+    # завис намертво — подтверждено внешним `pactl info`, который не отвечал
+    # НИКАКОМУ клиенту вообще (не только этой ноде). _restart_wireplumber()
+    # чинит только WirePlumber (менеджер политик графа) — это другой systemd-
+    # юнит и он не может исцелить зависший pipewire-pulse/pipewire. Из-за
+    # этого нода крутилась в вечном цикле "рестарт WP → не помогло → пауза
+    # по backoff → повтор" и НЕ ловилась _RESTART_STORM-детектором, т.к.
+    # backoff растягивает попытки дольше чем _RESTART_STORM_WINDOW_SEC.
+    # Поэтому: если N успешных рестартов WirePlumber подряд не вернули
+    # source_ok — эскалируем и рестартуем весь стек (pipewire, pipewire-pulse,
+    # wireplumber).
+    _PW_ESCALATE_AFTER = 2
+
     def __init__(self):
         super().__init__('audio_source_node')
         self._restart_times = deque(maxlen=self._RESTART_STORM_COUNT)
@@ -61,6 +74,8 @@ class AudioSourceNode(LifecycleNode):
         self._stream_running      = False
         self._read_thread         = None
         self._last_wp_restart     = 0.0
+        self._wp_restart_fail_streak = 0
+        self._last_full_pw_restart   = 0.0
         self._recovery_lock       = threading.Lock()
         self._restart_in_progress = False
         # Exponential backoff for persistent PipeWire failures
@@ -86,6 +101,7 @@ class AudioSourceNode(LifecycleNode):
         self._dp('jabra_profile',            'output:analog-stereo+input:mono-fallback')
         self._dp('zero_wp_check_count',      500)  # чанков нулей (~15с) → проверить PipeWire
         self._dp('wp_restart_cooldown_sec',  90.0)
+        self._dp('pw_full_restart_cooldown_sec', 180.0)
 
         self.rate                    = self.get_parameter('sample_rate').value
         self.chunk_size              = self.get_parameter('chunk_size').value
@@ -97,6 +113,7 @@ class AudioSourceNode(LifecycleNode):
         self._jabra_profile          = self.get_parameter('jabra_profile').value
         self._zero_wp_check_count    = self.get_parameter('zero_wp_check_count').value
         self._wp_restart_cooldown    = self.get_parameter('wp_restart_cooldown_sec').value
+        self._pw_full_restart_cooldown = self.get_parameter('pw_full_restart_cooldown_sec').value
 
         self._pub = self.create_lifecycle_publisher(Float32MultiArray, 'raw_audio', 20)
         return TransitionCallbackReturn.SUCCESS
@@ -430,6 +447,7 @@ class AudioSourceNode(LifecycleNode):
             return
         has_card, card_id, profile_ok, source_ok = self._pipewire_jabra_state()
         if has_card and profile_ok and source_ok:
+            self._wp_restart_fail_streak = 0
             self.get_logger().info(
                 'PipeWire в порядке — причина нулей: кнопка Mute на Jabra')
             return
@@ -476,6 +494,15 @@ class AudioSourceNode(LifecycleNode):
         else:
             self.get_logger().warn('Jabra source не появился за 10с после перезапуска WP')
 
+        if source_ok:
+            self._wp_restart_fail_streak = 0
+        else:
+            self._wp_restart_fail_streak += 1
+            if self._wp_restart_fail_streak >= self._PW_ESCALATE_AFTER:
+                self._restart_pipewire_full()
+                self._wp_restart_fail_streak = 0
+                return
+
         # Исправляем профиль если нужно
         _, card_id, profile_ok, _ = self._pipewire_jabra_state()
         if card_id and not profile_ok:
@@ -487,7 +514,13 @@ class AudioSourceNode(LifecycleNode):
             except Exception as e:
                 self.get_logger().warn(f'Не удалось установить профиль: {e}')
 
-        # PCM=100% (ищем карту по имени чтобы не зашивать индекс)
+        self._restore_pcm_and_stream()
+
+    def _restore_pcm_and_stream(self):
+        """PCM=100% (ищем карту по имени чтобы не зашивать индекс) + перезапуск
+        аудио потока. Общий хвост восстановления после рестарта WirePlumber
+        или всего PipeWire-стека — без этого нода думает, что PipeWire в
+        порядке, но реально захват звука остаётся мёртвым/замьюченным."""
         try:
             aplay = subprocess.run(
                 ['aplay', '-l'], capture_output=True, text=True, timeout=5)
@@ -505,6 +538,37 @@ class AudioSourceNode(LifecycleNode):
 
         self.get_logger().info('WirePlumber восстановлен — перезапускаю аудио поток')
         self._restart_stream()
+
+    def _restart_pipewire_full(self):
+        """Эскалация: N рестартов WirePlumber подряд не вернули source_ok —
+        вероятно завис не WirePlumber (менеджер политик), а сам pipewire-pulse
+        (сервер протокола PulseAudio) или pipewire (ядро графа). Рестарт
+        одного WP тогда бесполезен. Перезапускаем весь пользовательский
+        аудио-стек. Своя cooldown-защита — не связана с _wp_restart_cooldown,
+        т.к. это гораздо более тяжёлая операция (роняет звук всей сессии,
+        не только Jabra)."""
+        now = time.time()
+        if now - self._last_full_pw_restart < self._pw_full_restart_cooldown:
+            remaining = self._pw_full_restart_cooldown - (now - self._last_full_pw_restart)
+            self.get_logger().info(
+                f'PW full-restart cooldown: следующая попытка через {remaining:.0f}с')
+            return
+        self._last_full_pw_restart = now
+
+        self.get_logger().fatal(
+            f'{self._PW_ESCALATE_AFTER} рестарта(ов) WirePlumber подряд не помогли — '
+            f'похоже завис pipewire-pulse/pipewire, а не сам WirePlumber. '
+            f'Перезапускаю весь аудио-стек (pipewire, pipewire-pulse, wireplumber)...')
+        try:
+            subprocess.run(
+                ['systemctl', '--user', 'restart',
+                 'pipewire.service', 'pipewire-pulse.service', 'wireplumber.service'],
+                timeout=30, check=True)
+            self.get_logger().info('Аудио-стек перезапущен')
+        except Exception as e:
+            self.get_logger().error(f'Не удалось перезапустить аудио-стек: {e}')
+
+        self._restore_pcm_and_stream()
 
 
 def main():
