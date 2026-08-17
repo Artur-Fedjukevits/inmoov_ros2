@@ -15,11 +15,16 @@ ROS → Arduino commands:
   CMD_SET_SPEEDS   = 0x02   DATA: step sizes, 1 byte each (0=keep current, 1–255 degrees/tick)
                               speed_deg_per_sec ≈ step * 1000 / SMOOTH_INTERVAL_MS (default 60ms)
                               e.g. step=10 → ~167°/s, step=2 → ~33°/s
+  CMD_SLEEP        = 0x03   DATA: 1 byte, 0 = awake, 1 = sleeping
+                              While sleeping, Arduino stops sending CMD_ULTRASONIC,
+                              CMD_PIR and CMD_HALL telemetry.
   CMD_DIAG_REQ     = 0x20   DATA: none — request I2C scan + PCA9685 check
 
 Arduino → ROS events:
   CMD_ULTRASONIC   = 0x10   DATA: uint16 big-endian, distance in cm
   CMD_PIR          = 0x11   DATA: 1 byte, 0 = no motion, 1 = motion detected
+  CMD_HALL         = 0x12   DATA: 5 × uint16 big-endian, raw analogRead (0-1023)
+                              order: [thumb, index, middle, ring, pinky] — right hand only
   CMD_DIAG_RESP    = 0x21   DATA: [n_devices, addr0, addr1, ..., pca_mode1]
                               n_devices: number of I2C devices found
                               addrN:     I2C address of each device (7-bit)
@@ -33,10 +38,12 @@ SOF = b'\xAA\x55'
 
 CMD_SET_SERVOS  = 0x01
 CMD_SET_SPEEDS  = 0x02
+CMD_SLEEP       = 0x03
 CMD_DIAG_REQ    = 0x20
 CMD_DIAG_RESP   = 0x21
 CMD_ULTRASONIC  = 0x10
 CMD_PIR         = 0x11
+CMD_HALL        = 0x12
 CMD_ACK         = 0xFF
 
 HEADER_LEN = 4   # SOF(2) + CMD(1) + LEN(1)
@@ -77,6 +84,11 @@ def build_set_speeds(speeds: list[int]) -> bytes:
     """Build a SET_SPEEDS frame. 0 = keep current speed, 1–255 = step size."""
     data = bytes(max(0, min(255, int(v))) for v in speeds)
     return build_frame(CMD_SET_SPEEDS, data)
+
+
+def build_sleep(sleeping: bool) -> bytes:
+    """Build a SLEEP frame. True = stop periodic sensor telemetry."""
+    return build_frame(CMD_SLEEP, bytes([1 if sleeping else 0]))
 
 
 class FrameParser:

@@ -19,8 +19,8 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from inmoov_control.protocol import (
-    build_frame, build_set_servos, FrameParser,
-    CMD_SET_SERVOS, CMD_ULTRASONIC, CMD_PIR, crc8
+    build_frame, build_set_servos, build_sleep, FrameParser,
+    CMD_SET_SERVOS, CMD_ULTRASONIC, CMD_PIR, CMD_SLEEP, CMD_HALL, crc8
 )
 
 
@@ -125,6 +125,33 @@ def test_parser_pir_frame():
     cmd, data = frames[0]
     assert cmd == CMD_PIR
     assert data[0] == 1
+
+def test_build_sleep_true():
+    frame = build_sleep(True)
+    frames = parse_all(frame)
+    assert len(frames) == 1
+    cmd, data = frames[0]
+    assert cmd == CMD_SLEEP
+    assert data == bytes([1])
+
+def test_build_sleep_false():
+    frame = build_sleep(False)
+    frames = parse_all(frame)
+    cmd, data = frames[0]
+    assert cmd == CMD_SLEEP
+    assert data == bytes([0])
+
+def test_parser_hall_frame():
+    """5 fingers x uint16 big-endian, order [thumb, index, middle, ring, pinky]."""
+    values = [544, 700, 512, 800, 650]
+    data = b''.join(bytes([v >> 8, v & 0xFF]) for v in values)
+    frame = build_frame(CMD_HALL, data)
+    frames = parse_all(frame)
+    assert len(frames) == 1
+    cmd, payload = frames[0]
+    assert cmd == CMD_HALL
+    recovered = [(payload[i] << 8) | payload[i + 1] for i in range(0, 10, 2)]
+    assert recovered == values
 
 
 # ─────────────────────────────────────────────────────────────────────────────

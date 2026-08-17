@@ -12,8 +12,14 @@ Hardware (matching setup_xicro_subsystem1.yaml):
     upperLip            — lip servo
 
   Sensors:
-    ultrasonic (right side) → /ultrasonic_right_distance
-    PIR                     → /pir_state
+    ultrasonic (right side)  → /ultrasonic_right_distance
+    PIR                      → /pir_state
+    Hall finger sensors (5)  → /hall_right_raw (Int16MultiArray, raw analogRead)
+                                order: [thumb, index, middle, ring, pinky]
+                                pins A0-A4 on the Arduino, sent as CMD_HALL frame
+
+  /robot_sleep (latched Bool) is forwarded to the Arduino as CMD_SLEEP —
+  while asleep, ultrasonic/PIR/Hall telemetry stops.
 
 UART packet order (body + face, total 15 servos):
   Byte 0:  omoplate_R
@@ -68,8 +74,10 @@ class ArduinoRightNode(ArduinoCommNode):
 
     HAS_ULTRASONIC   = True
     HAS_PIR          = True
+    HAS_HALL         = True
     ULTRASONIC_TOPIC = 'ultrasonic_right_distance'
     PIR_TOPIC        = 'pir_state'
+    HALL_TOPIC       = 'hall_right_raw'
 
     def __init__(self, serial_port: str = DEFAULT_PORT):
         super().__init__('arduino_right_node', serial_port)

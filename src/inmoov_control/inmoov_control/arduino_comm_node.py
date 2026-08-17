@@ -18,12 +18,13 @@ import serial
 
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
-from std_msgs.msg import Int16, Bool
+from rclpy.qos import QoSProfile, DurabilityPolicy
+from std_msgs.msg import Int16, Int16MultiArray, Bool
 from sensor_msgs.msg import JointState
 
 from .protocol import (
-    FrameParser, build_set_servos, build_set_speeds, deg_per_sec_to_step,
-    CMD_ULTRASONIC, CMD_PIR, CMD_ACK
+    FrameParser, build_set_servos, build_set_speeds, build_sleep, deg_per_sec_to_step,
+    CMD_ULTRASONIC, CMD_PIR, CMD_HALL, CMD_ACK
 )
 
 
@@ -46,15 +47,22 @@ class ArduinoCommNode(LifecycleNode):
       FACE_JOINTS  — list of (joint_name, center_deg) in packet order, or []
       HAS_ULTRASONIC — publish /ultrasonicXXX_distance (Int16, cm)
       HAS_PIR        — publish /pir_state (Bool)
-      ULTRASONIC_TOPIC, PIR_TOPIC — topic names for sensors
+      HAS_HALL       — publish HALL_TOPIC (Int16MultiArray, raw analogRead per finger)
+      ULTRASONIC_TOPIC, PIR_TOPIC, HALL_TOPIC — topic names for sensors
+
+    All subclasses subscribe to /robot_sleep (latched Bool) and forward it to
+    the Arduino as a CMD_SLEEP frame — while asleep, the firmware stops
+    sending CMD_ULTRASONIC/CMD_PIR/CMD_HALL telemetry.
     """
 
     BODY_JOINTS:     list[tuple[str, float, int]] = []   # (joint_name, center_deg, rest_deg)
     FACE_JOINTS:     list[tuple[str, float, int]] = []
     HAS_ULTRASONIC:  bool = False
     HAS_PIR:         bool = False
+    HAS_HALL:        bool = False
     ULTRASONIC_TOPIC: str = 'ultrasonic_distance'
     PIR_TOPIC:        str = 'pir_state'
+    HALL_TOPIC:       str = 'hall_raw'
 
     # Парные суставы: когда приходит команда на ключ — применяем то же значение на значение.
     # Зеркалирование глаз: eye_lr_L ↔ eye_lr_R, eye_ud_L ↔ eye_ud_R.
@@ -78,6 +86,10 @@ class ArduinoCommNode(LifecycleNode):
         self._face_speeds  = [0] * len(self.FACE_JOINTS)
         self._speeds_dirty = False
 
+        # Sleep state — forwarded to Arduino as CMD_SLEEP on change
+        self._sleeping     = False
+        self._sleep_dirty  = False
+
         self._lock = threading.Lock()
 
         # Joint maps
@@ -94,6 +106,7 @@ class ArduinoCommNode(LifecycleNode):
         # Publisher handles (set in on_configure)
         self._ultrasonic_pub = None
         self._pir_pub        = None
+        self._hall_pub       = None
 
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
@@ -102,11 +115,18 @@ class ArduinoCommNode(LifecycleNode):
         if self.FACE_JOINTS:
             self.create_subscription(JointState, '/face_command', self._face_cmd_cb, 10)
 
+        # /robot_sleep is latched (TRANSIENT_LOCAL) — forward to Arduino as CMD_SLEEP
+        sleep_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Bool, '/robot_sleep', self._sleep_cb, sleep_qos)
+
         if self.HAS_ULTRASONIC:
             self._ultrasonic_pub = self.create_lifecycle_publisher(
                 Int16, self.ULTRASONIC_TOPIC, 10)
         if self.HAS_PIR:
             self._pir_pub = self.create_lifecycle_publisher(Bool, self.PIR_TOPIC, 10)
+        if self.HAS_HALL:
+            self._hall_pub = self.create_lifecycle_publisher(
+                Int16MultiArray, self.HALL_TOPIC, 10)
 
         node_name = self.get_name()
         body_names = [n for n, _, _ in self.BODY_JOINTS]
@@ -120,6 +140,8 @@ class ArduinoCommNode(LifecycleNode):
             self._ultrasonic_pub.on_activate(state)
         if self._pir_pub:
             self._pir_pub.on_activate(state)
+        if self._hall_pub:
+            self._hall_pub.on_activate(state)
 
         # Проверяем что порт существует в файловой системе
         if not os.path.exists(self._serial_port):
@@ -129,6 +151,8 @@ class ArduinoCommNode(LifecycleNode):
                 self._ultrasonic_pub.on_deactivate(state)
             if self._pir_pub:
                 self._pir_pub.on_deactivate(state)
+            if self._hall_pub:
+                self._hall_pub.on_deactivate(state)
             return TransitionCallbackReturn.FAILURE
 
         self._connect_serial()
@@ -137,6 +161,8 @@ class ArduinoCommNode(LifecycleNode):
                 self._ultrasonic_pub.on_deactivate(state)
             if self._pir_pub:
                 self._pir_pub.on_deactivate(state)
+            if self._hall_pub:
+                self._hall_pub.on_deactivate(state)
             return TransitionCallbackReturn.FAILURE
 
         self._tx_timer = self.create_timer(0.02, self._send_servos)
@@ -171,6 +197,8 @@ class ArduinoCommNode(LifecycleNode):
             self._ultrasonic_pub.on_deactivate(state)
         if self._pir_pub:
             self._pir_pub.on_deactivate(state)
+        if self._hall_pub:
+            self._hall_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
@@ -262,6 +290,11 @@ class ArduinoCommNode(LifecycleNode):
             msg.data = bool(data[0])
             self._pir_pub.publish(msg)
 
+        elif cmd == CMD_HALL and self._hall_pub and len(data) >= 10:
+            msg = Int16MultiArray()
+            msg.data = [(data[i] << 8) | data[i + 1] for i in range(0, 10, 2)]
+            self._hall_pub.publish(msg)
+
     # -----------------------------------------------------------------------
     # Command callbacks
     # -----------------------------------------------------------------------
@@ -286,6 +319,12 @@ class ArduinoCommNode(LifecycleNode):
                 if step != self._face_speeds[i]:
                     self._face_speeds[i] = step
                     self._speeds_dirty = True
+
+    def _sleep_cb(self, msg: Bool) -> None:
+        with self._lock:
+            if msg.data != self._sleeping:
+                self._sleeping    = msg.data
+                self._sleep_dirty = True
 
     def _joint_cmd_cb(self, msg: JointState) -> None:
         with self._lock:
@@ -325,9 +364,15 @@ class ArduinoCommNode(LifecycleNode):
                 body_spd = list(self._body_speeds)
                 face_spd = list(self._face_speeds)
                 self._speeds_dirty = False
+            sleep_dirty = self._sleep_dirty
+            sleeping    = self._sleeping
+            self._sleep_dirty = False
 
         try:
-            # Send speed update first (only when something changed)
+            # Send sleep-state change first (only when something changed)
+            if sleep_dirty:
+                self._ser.write(build_sleep(sleeping))
+            # Send speed update (only when something changed)
             if dirty:
                 spd_frame = build_set_speeds(body_spd + face_spd)
                 self._ser.write(spd_frame)

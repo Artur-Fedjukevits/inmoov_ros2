@@ -10,10 +10,14 @@
  * ROS2 → Arduino:
  *   CMD=0x01  SET_SERVOS: DATA = SERVO_TOTAL_COUNT bytes, degrees 0-180
  *             Byte order matches ServoIndex enum below.
+ *   CMD=0x03  SLEEP:      DATA = 1 byte, 0=awake, 1=sleeping.
+ *             While sleeping, ULTRASONIC/PIR/HALL telemetry stops.
  *
  * Arduino → ROS2:
  *   CMD=0x10  ULTRASONIC: DATA = uint16 big-endian, distance in cm
  *   CMD=0x11  PIR:        DATA = 1 byte, 0/1
+ *   CMD=0x12  HALL:       DATA = 5 x uint16 big-endian, raw analogRead (0-1023)
+ *             order: [thumb, index, middle, ring, pinky] — pins A0-A4
  *
  * Packet order (14 bytes):
  *   [0]  thumb_R    [1]  index_R    [2]  middle_R   [3]  ring_R
@@ -31,18 +35,29 @@
 #define ULTRASONIC_INTERVAL_MS  250
 #define ULTRASONIC_TIMEOUT_US   25000   // ~4m
 #define PIR_INTERVAL_MS         100
+#define HALL_INTERVAL_MS        100
 
 #define ULTRASONIC_TRIG_PIN     64
 #define ULTRASONIC_ECHO_PIN     63
 #define PIR_PIN                 23
+
+#define THUMB_HALL_PIN          A0
+#define INDEX_HALL_PIN          A1
+#define MIDDLE_HALL_PIN         A2
+#define RING_HALL_PIN           A3
+#define PINKY_HALL_PIN          A4
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Protocol
 // ─────────────────────────────────────────────────────────────────────────────
 #define CMD_SET_SERVOS  0x01
 #define CMD_SET_SPEEDS  0x02
+#define CMD_SLEEP       0x03
 #define CMD_ULTRASONIC  0x10
 #define CMD_PIR         0x11
+#define CMD_HALL        0x12
+
+bool sleeping = false;   // set via CMD_SLEEP; gates ultrasonic/PIR/Hall telemetry
 
 void sendFrame(uint8_t cmd, uint8_t* data, uint8_t len) {
   uint8_t crc = cmd ^ len;
@@ -65,7 +80,7 @@ SmoothServo servos[SERVO_TOTAL_COUNT] = {
   /* MIDDLE_R   pin 4  */ {Servo(), 0, 0,   0,   0, 180,  2, 0,  4},
   /* RING_R     pin 5  */ {Servo(), 0, 0,   0,   0, 180,  2, 0,  5},
   /* PINKY_R    pin 6  */ {Servo(), 0, 0,   0,   0, 180,  2, 0,  6},
-  /* WRIST_R    pin 7  */ {Servo(), 0, 0,   0,   0, 180,  2, 0,  7},
+  /* WRIST_R    pin 7  */ {Servo(), 0, 0,  90,   0, 180,  2, 0,  7},
   /* BICEP_R    pin 8  */ {Servo(), 0, 0,   0,   0,  90,  1, 0,  8},
   /* ROTATE_R   pin 9  */ {Servo(), 0, 0,  90,  40, 180,  1, 0,  9},
   /* SHOULDER_R pin 10 */ {Servo(), 0, 0,  30,   0, 180,  1, 0, 10},
@@ -89,6 +104,11 @@ int16_t  incoming[SERVO_TOTAL_COUNT];
 bool     packet_received = false;
 
 void processFrame(uint8_t cmd, uint8_t* data, uint8_t len) {
+  if (cmd == CMD_SLEEP) {
+    if (len >= 1) sleeping = (data[0] != 0);
+    return;
+  }
+
   if (cmd == CMD_SET_SPEEDS) {
     uint8_t n = min((uint8_t)SERVO_TOTAL_COUNT, len);
     for (uint8_t i = 0; i < n; i++) {
@@ -138,6 +158,7 @@ unsigned long ultrasonic_last    = 0;
 bool          pir_last_state     = false;
 unsigned long pir_last_ms        = 0;
 unsigned long pir_heartbeat_ms   = 0;
+unsigned long hall_last          = 0;
 #define PIR_HEARTBEAT_MS  5000   // re-send current state every 5 s
 
 int readUltrasonicCM() {
@@ -171,6 +192,12 @@ void setup() {
   pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
   pinMode(ULTRASONIC_ECHO_PIN, INPUT);
   pinMode(PIR_PIN, INPUT);
+
+  pinMode(THUMB_HALL_PIN, INPUT);
+  pinMode(INDEX_HALL_PIN, INPUT);
+  pinMode(MIDDLE_HALL_PIN, INPUT);
+  pinMode(RING_HALL_PIN, INPUT);
+  pinMode(PINKY_HALL_PIN, INPUT);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -213,8 +240,8 @@ void loop() {
     s.servo_obj.write(constrain(s.current, s.min_angle, s.max_angle));
   }
 
-  // 4. Ultrasonic — auto at ULTRASONIC_INTERVAL_MS
-  if (now - ultrasonic_last >= ULTRASONIC_INTERVAL_MS) {
+  // 4. Ultrasonic — auto at ULTRASONIC_INTERVAL_MS (paused while sleeping)
+  if (!sleeping && (now - ultrasonic_last >= ULTRASONIC_INTERVAL_MS)) {
     ultrasonic_last = now;
     int dist = readUltrasonicCM();
     if (dist > 0) {
@@ -223,8 +250,8 @@ void loop() {
     }
   }
 
-  // 5. PIR — publish on state change; also heartbeat every 5 s
-  if (now - pir_last_ms >= PIR_INTERVAL_MS) {
+  // 5. PIR — publish on state change; also heartbeat every 5 s (paused while sleeping)
+  if (!sleeping && (now - pir_last_ms >= PIR_INTERVAL_MS)) {
     pir_last_ms = now;
     bool pir_state = (bool)digitalRead(PIR_PIN);
     bool changed   = (pir_state != pir_last_state);
@@ -235,5 +262,23 @@ void loop() {
       uint8_t buf[1] = { (uint8_t)pir_last_state };
       sendFrame(CMD_PIR, buf, 1);
     }
+  }
+
+  // 6. Hall finger sensors — auto at HALL_INTERVAL_MS (paused while sleeping)
+  if (!sleeping && (now - hall_last >= HALL_INTERVAL_MS)) {
+    hall_last = now;
+    uint16_t h[5] = {
+      (uint16_t)analogRead(THUMB_HALL_PIN),
+      (uint16_t)analogRead(INDEX_HALL_PIN),
+      (uint16_t)analogRead(MIDDLE_HALL_PIN),
+      (uint16_t)analogRead(RING_HALL_PIN),
+      (uint16_t)analogRead(PINKY_HALL_PIN),
+    };
+    uint8_t buf[10];
+    for (uint8_t i = 0; i < 5; i++) {
+      buf[i * 2]     = (uint8_t)(h[i] >> 8);
+      buf[i * 2 + 1] = (uint8_t)(h[i] & 0xFF);
+    }
+    sendFrame(CMD_HALL, buf, 10);
   }
 }
