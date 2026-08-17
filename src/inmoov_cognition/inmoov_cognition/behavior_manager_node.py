@@ -916,6 +916,9 @@ class BehaviorManagerNode(LifecycleNode):
             '/search/query':            '',
             '/search/result':           {},
             '/pir/scan_active':         False,
+            '/scene/person_count':      0,
+            '/scene/objects_summary':   '',
+            '/scene/location':          '',
         }
         for key in _bb_defaults:
             self._bb.register_key(key=key, access=py_trees.common.Access.WRITE)
@@ -940,6 +943,9 @@ class BehaviorManagerNode(LifecycleNode):
         self._bb.search.query            = ''
         self._bb.search.result           = {}
         self._bb.pir.scan_active         = False
+        self._bb.scene.person_count      = 0
+        self._bb.scene.objects_summary   = ''
+        self._bb.scene.location          = ''
 
         # Для определения перехода person_present True→False
         self._person_was_present = False
@@ -1077,6 +1083,19 @@ class BehaviorManagerNode(LifecycleNode):
         if ctx.get('introduce_pending', False):
             self._bb.social.introduce_pending = True
             self._bb.social.introduce_text    = ctx.get('introduce_text', '')
+
+    def _scene_ctx_cb(self, msg: String):
+        """Сводка сцены (объекты + люди) от scene_manager_node → Blackboard."""
+        try:
+            ctx = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+
+        self._bb.scene.person_count    = ctx.get('person_count', 0)
+        self._bb.scene.location        = ctx.get('location', '')
+        self._bb.scene.objects_summary = ', '.join(
+            f"{o.get('label')}:{o.get('count')}" for o in ctx.get('objects', [])
+        )
 
     def _person_present_cb(self, msg: Bool):
         """Человек ушёл → даём TTS договорить, потом прощаемся."""
@@ -1229,6 +1248,7 @@ class BehaviorManagerNode(LifecycleNode):
         self.create_subscription(String, '/llm_response',   self._llm_response_cb,   10)
         self.create_subscription(String, 'robot_events',    self._event_cb,           10)
         self.create_subscription(String, '/social_context', self._social_ctx_cb,      10)
+        self.create_subscription(String, '/scene/objects',  self._scene_ctx_cb,       10)
         self.create_subscription(Bool,   '/person_present', self._person_present_cb,  10)
         self.create_subscription(Bool,   '/pir_state',      self._pir_cb,             10)
         self.create_subscription(Bool,   'wake_detected',   self._wake_detected_cb,   10)

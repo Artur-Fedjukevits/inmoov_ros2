@@ -630,13 +630,73 @@ def _strip_episodic_memory(raw: str) -> str:
     return raw[:idx] if idx != -1 else raw
 
 
+_SCENE_LABELS_RU = {
+    'person': 'человек', 'chair': 'стул', 'sofa': 'диван', 'bed': 'кровать',
+    'dining table': 'стол', 'tv monitor': 'телевизор', 'laptop': 'ноутбук',
+    'mouse': 'мышь', 'remote': 'пульт', 'keyboard': 'клавиатура',
+    'cell phone': 'телефон', 'book': 'книга', 'clock': 'часы', 'vase': 'ваза',
+    'bottle': 'бутылка', 'wine glass': 'бокал', 'cup': 'чашка', 'fork': 'вилка',
+    'knife': 'нож', 'spoon': 'ложка', 'bowl': 'миска', 'backpack': 'рюкзак',
+    'handbag': 'сумка', 'umbrella': 'зонт', 'potted plant': 'растение',
+    'scissors': 'ножницы', 'teddy bear': 'плюшевый мишка', 'cat': 'кошка',
+    'dog': 'собака', 'refrigerator': 'холодильник', 'microwave': 'микроволновка',
+    'oven': 'духовка', 'toaster': 'тостер', 'sink': 'раковина',
+}
+
+
+_SCENE_DIRECTION_RU = {'left': 'слева', 'right': 'справа', 'center': 'по центру'}
+
+
+def _ru_label(label: str) -> str:
+    return _SCENE_LABELS_RU.get(label, label)
+
+
+def _ru_direction(direction: str) -> str:
+    return _SCENE_DIRECTION_RU.get(direction, direction)
+
+
+def _build_scene_block(scene_ctx: dict | None) -> str:
+    """Короткое описание сцены (объекты + люди) для конца system prompt."""
+    if not scene_ctx:
+        return ''
+
+    parts = []
+    location = scene_ctx.get('location')
+    if location:
+        parts.append(f'Ты сейчас в: {location}.')
+
+    person_count = scene_ctx.get('person_count', 0)
+    if person_count == 1:
+        parts.append('Перед тобой 1 человек.')
+    elif person_count > 1:
+        parts.append(f'Перед тобой {person_count} человек(а).')
+
+    others = [o for o in scene_ctx.get('objects', []) if o.get('label') != 'person']
+    if others:
+        items_str = ', '.join(
+            f"{_ru_label(o['label'])} ({o['distance_m']:.1f}м, {_ru_direction(o['direction'])})"
+            for o in others
+        )
+        parts.append(f'Рядом: {items_str}.')
+
+    if not parts:
+        return ''
+    # Явно маркируем как снимок "прямо сейчас": иначе модель на низкой
+    # температуре склонна повторять свой предыдущий ответ из истории диалога,
+    # даже если сцена перед камерой уже изменилась.
+    return ('\nСцена ПРЯМО СЕЙЧАС (может отличаться от того, что ты говорил '
+            'раньше в этом разговоре — доверяй этому, а не своим прошлым словам): '
+            + ' '.join(parts) + '\n')
+
+
 def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
-                        memory_context: str = '') -> str:
+                        memory_context: str = '', scene_ctx: dict | None = None) -> str:
     """Формирует системный промпт со схемой устройств и контекстом собеседника.
 
     oh_schema — JSON-строка со схемой OpenHAB (name/label/type/options, без state).
                 Передаётся один раз в начале диалога; состояния запрашиваются
                 через get_openhab_states / search_openhab_items по необходимости.
+    scene_ctx — сводка сцены от scene_manager_node (объекты + люди вокруг).
     """
     if person_ctx:
         name       = person_ctx.get('name') or 'Незнакомец'
@@ -703,14 +763,16 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
         devices_block = 'OpenHAB устройства: нет данных (openhab_bridge_node не запущен).\n'
 
     memory_block = f'\n{memory_context}\n' if memory_context else ''
+    scene_block  = _build_scene_block(scene_ctx)
 
-    # ВАЖНО: весь ДИНАМИЧЕСКИЙ блок (person_block/memory_block — время,
-    # собеседник, последние события — меняется КАЖДЫЙ запрос) вынесен в самый
-    # конец промпта. Всё, что выше, статично между запросами одной сессии
-    # (и часто между сессиями) — это нужно для prefix-кэша на сервере: если
-    # динамика стоит в середине, любой кэш общего префикса (system-prompt)
-    # рвётся с этого места на каждом ходе диалога, и все статичные блоки
-    # после неё (таблица OpenHAB и т.д.) приходится пересчитывать заново.
+    # ВАЖНО: весь ДИНАМИЧЕСКИЙ блок (person_block/memory_block/scene_block —
+    # время, собеседник, последние события, сцена вокруг — меняется КАЖДЫЙ
+    # запрос) вынесен в самый конец промпта. Всё, что выше, статично между
+    # запросами одной сессии (и часто между сессиями) — это нужно для
+    # prefix-кэша на сервере: если динамика стоит в середине, любой кэш
+    # общего префикса (system-prompt) рвётся с этого места на каждом ходе
+    # диалога, и все статичные блоки после неё (таблица OpenHAB и т.д.)
+    # приходится пересчитывать заново.
     # Сначала статика, динамика — последней. См. project_llm_backend_bench.md.
     return f"""/no_think
 Ты робот по имени Лёня. Ты член семьи. Твоя главная задача - общение. Стараться узнать о собеседнике или семье что-то новое и сохранять в базу данных с помощью инструментов. Так же твоя задача отвечать на любые вопросы, и выполнять команды. Ты можешь управлять умным домом через OpenHAB, двигаться и выражать эмоции.
@@ -734,6 +796,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
   (объяснение → медленно и чётко; срочное сообщение → быстро и энергично)
 - Если просто разговор — отвечай текстом без tool call
 - Если пользователь просит "передай на колонку", "скажи в гостиной", "объяви" — используй broadcast_message. НЕ используй items_control для LivingRoom_Chromecast.
+- Если спрашивают "что ты видишь", "кто перед тобой", "что вокруг", "опиши что рядом" — отвечай ТЕКСТОМ БЕЗ tool call, используя блок "Сцена ПРЯМО СЕЙЧАС" ниже. НЕ вызывай robot_control(action="status") для таких вопросов — status предназначен ТОЛЬКО для батареи/позиции сервоприводов, он не знает о зрении и ничего не расскажет о сцене.
 
 ВАЖНО — управление устройствами:
 - НИКОГДА не придумывай имена устройств — используй только точные имена из таблицы ниже.
@@ -743,7 +806,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
 - speak_text в items_control/robot_control пиши ТОЛЬКО уверенный ответ. Если не уверен в результате — не пиши speak_text, сформируй ответ после выполнения.
 
 {devices_block}
-{person_block}{memory_block}"""
+{person_block}{memory_block}{scene_block}"""
 
 
 _RU_WEEKDAY = {
@@ -849,6 +912,8 @@ class LLMNode(LifecycleNode):
 
         # Контекст памяти из memory_node — вставляется в system prompt
         self._memory_context: str = ''
+        # Сводка сцены (объекты + люди) от scene_manager_node — вставляется в system prompt
+        self._scene_context: dict = {}
         # Накапливаем transcript текущего диалога
         self._dialogue_lines: list[str] = []
 
@@ -1381,8 +1446,18 @@ class LLMNode(LifecycleNode):
                 _pid = (person_ctx or {}).get('person_id')
                 memory_context    = (self._memory_context if _pid is not None
                                       else _strip_episodic_memory(self._memory_context))
+                scene_ctx         = self._scene_context
 
-            system_prompt = build_system_prompt(oh_schema, person_ctx, memory_context)
+            system_prompt = build_system_prompt(oh_schema, person_ctx, memory_context, scene_ctx)
+            if scene_ctx:
+                _scene_age = time.time() - scene_ctx.get('updated_at', 0)
+                _scene_labels = [o['label'] for o in scene_ctx.get('objects', [])]
+                self.get_logger().info(
+                    f'Scene context для этого хода: person_count={scene_ctx.get("person_count")}, '
+                    f'objects={_scene_labels}, age={_scene_age:.1f}с')
+            else:
+                self.get_logger().info(
+                    'Scene context для этого хода: пусто (scene_manager_node не отвечает?)')
 
             self.history.append({'role': 'user', 'content': user_text})
             # Обрезаем историю: считаем user-сообщения как ходы (не сырые записи).
@@ -2161,6 +2236,15 @@ class LLMNode(LifecycleNode):
         except Exception:
             pass
 
+    def _scene_context_cb(self, msg: String):
+        """Сводка сцены (объекты + люди) от scene_manager_node → кэш для system prompt."""
+        try:
+            ctx = json.loads(msg.data)
+            with self._lock:
+                self._scene_context = ctx
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f'Невалидный /scene/objects JSON: {e}')
+
     def _person_context_callback(self, msg: String):
         try:
             ctx = json.loads(msg.data)
@@ -2504,6 +2588,7 @@ class LLMNode(LifecycleNode):
         self.create_subscription(String, 'search_result',   self._search_result_callback,  10)
         self.create_subscription(String, 'person_context',  self._person_context_callback, 10)
         self.create_subscription(String, '/social_context', self._social_context_cb,       10)
+        self.create_subscription(String, '/scene/objects',  self._scene_context_cb,        10)
         self.create_subscription(String, 'openhab_schema',  self._oh_schema_callback,      10)
         self.create_subscription(String, 'openhab_items',   self._oh_items_callback,       10)
         self.create_subscription(Bool,   '/introducing',    self._introducing_cb,          10)

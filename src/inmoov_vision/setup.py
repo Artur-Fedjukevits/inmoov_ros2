@@ -34,6 +34,7 @@ setup(
             'vision_head_tracker_node = inmoov_vision.vision_head_tracker_node:main',
             'oak_node                = inmoov_vision.oak_node:main',
             'human_detection_node   = inmoov_vision.human_detection_node:main',
+            'scene_manager_node     = inmoov_vision.scene_manager_node:main',
         ],
     },
 )

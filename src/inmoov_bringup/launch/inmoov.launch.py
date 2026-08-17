@@ -106,6 +106,7 @@ def generate_launch_description():
         DeclareLaunchArgument('rest_neck',            default_value='40.0'),
         DeclareLaunchArgument('oak_model',            default_value='yolov6-nano'),
         DeclareLaunchArgument('oak_conf_threshold',   default_value='0.5'),
+        DeclareLaunchArgument('scene_location',       default_value=''),
 
         # Cognition
         DeclareLaunchArgument('greet_cooldown_sec',   default_value='120.0'),
@@ -492,6 +493,25 @@ def generate_launch_description():
         }],
     )
 
+    scene_manager = LifecycleNode(
+        package='inmoov_vision',
+        executable='scene_manager_node',
+        name='scene_manager_node',
+        namespace='',
+        output='screen',
+        respawn=True,
+        respawn_delay=2.0,
+        parameters=[{
+            'min_confidence':       0.5,
+            'max_distance_m':       4.0,
+            'object_ttl_sec':       8.0,
+            'smoothing_window_sec': 1.0,
+            'publish_rate_hz':      1.0,
+            'top_k_objects':        8,
+            'location_name':        LaunchConfiguration('scene_location'),
+        }],
+    )
+
     llm_node = LifecycleNode(
         package='inmoov_cognition',
         executable='llm_node',
@@ -613,6 +633,7 @@ def generate_launch_description():
         emotion_recognition,
         head_tracker,
         human_detection,
+        scene_manager,
         llm_node,
         openhab_bridge,
         identity_manager,

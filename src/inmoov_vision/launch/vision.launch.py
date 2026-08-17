@@ -47,6 +47,9 @@ def generate_launch_description():
         # OAK-D Lite (depthai v3 — модель из Luxonis HubAI)
         DeclareLaunchArgument('oak_model',            default_value='yolov6-nano'),
         DeclareLaunchArgument('oak_conf_threshold',   default_value='0.5'),
+        # Scene manager — статичное имя текущего места робота (робот на колёсах,
+        # переносится вручную; можно менять на лету через `ros2 param set`)
+        DeclareLaunchArgument('scene_location',       default_value=''),
     ]
 
     # 1. Камера — всегда запущена (лёгкий процесс)
@@ -172,6 +175,23 @@ def generate_launch_description():
         }],
     )
 
+    # 11. Scene manager — сводка сцены (объекты + люди) из /objects/detections
+    scene_manager = Node(
+        package='inmoov_vision',
+        executable='scene_manager_node',
+        name='scene_manager_node',
+        output='screen',
+        parameters=[{
+            'min_confidence':       0.5,
+            'max_distance_m':       4.0,
+            'object_ttl_sec':       8.0,
+            'smoothing_window_sec': 1.0,
+            'publish_rate_hz':      1.0,
+            'top_k_objects':        8,
+            'location_name':        LaunchConfiguration('scene_location'),
+        }],
+    )
+
     # 7. Галерея фотографий — автосъёмка лиц для gallery-based распознавания
     face_gallery = Node(
         package='inmoov_vision',
@@ -227,4 +247,5 @@ def generate_launch_description():
         head_tracker,
         oak,
         human_detection,
+        scene_manager,
     ])

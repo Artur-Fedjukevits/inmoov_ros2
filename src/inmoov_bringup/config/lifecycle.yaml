@@ -71,6 +71,7 @@ lifecycle_manager:
           - emotion_recognition_node
           - vision_head_tracker_node
           - human_detection_node
+          - scene_manager_node
           - llm_node
           - openhab_bridge_node
         critical:
