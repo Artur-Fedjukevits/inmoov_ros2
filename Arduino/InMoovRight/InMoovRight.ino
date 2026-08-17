@@ -75,13 +75,13 @@ void sendFrame(uint8_t cmd, uint8_t* data, uint8_t len) {
 // ─────────────────────────────────────────────────────────────────────────────
 //                              rest  min   max  step  pin
 SmoothServo servos[SERVO_TOTAL_COUNT] = {
-  /* THUMB_R    pin 2  */ {Servo(), 0, 0,   0,   0, 180,  2, 0,  2},
-  /* INDEX_R    pin 3  */ {Servo(), 0, 0,   0,   0, 180,  2, 0,  3},
-  /* MIDDLE_R   pin 4  */ {Servo(), 0, 0,   0,   0, 180,  2, 0,  4},
-  /* RING_R     pin 5  */ {Servo(), 0, 0,   0,   0, 180,  2, 0,  5},
-  /* PINKY_R    pin 6  */ {Servo(), 0, 0,   0,   0, 180,  2, 0,  6},
+  /* THUMB_R    pin 2  */ {Servo(), 0, 0,  60,   0, 140,  2, 0,  2},
+  /* INDEX_R    pin 3  */ {Servo(), 0, 0,  40,   0, 160,  2, 0,  3},
+  /* MIDDLE_R   pin 4  */ {Servo(), 0, 0,  40,   0, 160,  2, 0,  4},
+  /* RING_R     pin 5  */ {Servo(), 0, 0,  30,   0, 150,  2, 0,  5},
+  /* PINKY_R    pin 6  */ {Servo(), 0, 0,  40,   0, 170,  2, 0,  6},
   /* WRIST_R    pin 7  */ {Servo(), 0, 0,  90,   0, 180,  2, 0,  7},
-  /* BICEP_R    pin 8  */ {Servo(), 0, 0,   0,   0,  90,  1, 0,  8},
+  /* BICEP_R    pin 8  */ {Servo(), 0, 0,   0,   0,  80,  1, 0,  8},
   /* ROTATE_R   pin 9  */ {Servo(), 0, 0,  90,  40, 180,  1, 0,  9},
   /* SHOULDER_R pin 10 */ {Servo(), 0, 0,  30,   0, 180,  1, 0, 10},
   /* OMOPLATE_R pin 11 */ {Servo(), 0, 0,  10,  10,  80,  1, 0, 11},
