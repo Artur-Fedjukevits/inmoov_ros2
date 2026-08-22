@@ -38,7 +38,9 @@ alsa-restore срабатывает раньше, чем инициализир�
 после каждой перезагрузки хоста проверить
 `amixer -c ICUSBAUDIO7D contents | grep -A3 "Mic Capture Volume"` —
 должно быть **60% (4157/6928, +0.23дБ)**, а не максимум (6928/6928).
-Восстановить: `amixer -c ICUSBAUDIO7D sset Mic 60% cap`.
+Восстановить: `amixer -c ICUSBAUDIO7D sset Mic 60% cap`. Если стоит
+udev-правило 99-cm6206-gain.rules (см. память) — это должно происходить
+автоматически, но проверить не помешает.
 (Пробовали асимметричный гейн по каналам для компенсации разной
 акустической связи капсюлей с внешним звуком — не получилось: слишком
 чувствительно к точному значению, при перекосе один канал теряет
@@ -93,11 +95,18 @@ swap_channels:=false (дефолт true подобран 2026-08-22, тот же
   - Нет on_set_parameters_callback — `ros2 param set` во время работы
     не применяется, только перезапуск с -p.
 
+LifecycleNode (интегрирована в inmoov_bringup, тир 1 — Hardware Drivers,
+рядом с audio_source_node/oak_node/face_capture_node, тоже прямой доступ
+к железу). Параметры читаются в on_configure, поток открывается и
+рабочий поток стартует в on_activate.
+
 Топик:
   /sound_direction  (inmoov_msgs/SoundDirection)
 
-Отдельный запуск для теста (без launch-файла):
+Отдельный запуск для теста (без launch-файла, ручные lifecycle-переходы):
   ros2 run inmoov_voice sound_localization_node
+  ros2 lifecycle set /sound_localization_node configure
+  ros2 lifecycle set /sound_localization_node activate
   ros2 topic echo /sound_direction
 """
 
@@ -118,7 +127,7 @@ os.environ.setdefault('MKL_NUM_THREADS', '1')
 
 import numpy as np
 import rclpy
-from rclpy.node import Node
+from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from std_msgs.msg import Header
 import sounddevice as sd
 from scipy.signal import butter, sosfiltfilt
@@ -126,23 +135,39 @@ from scipy.signal import butter, sosfiltfilt
 from inmoov_msgs.msg import SoundDirection
 
 
-class SoundLocalizationNode(Node):
+class SoundLocalizationNode(LifecycleNode):
 
     def __init__(self):
         super().__init__('sound_localization_node')
 
-        self.declare_parameter('device_name', 'ICUSBAUDIO7D')
-        self.declare_parameter('sample_rate', 48000)
-        self.declare_parameter('block_size', 4096)       # ~85мс @ 48кГц
-        self.declare_parameter('bandpass_low_hz', 2000.0)
-        self.declare_parameter('bandpass_high_hz', 6000.0)
-        self.declare_parameter('mic_distance_m', 0.145)   # только для справки/поиска окна, НЕ используется в angle_deg
-        self.declare_parameter('search_window_sec', 0.005)  # ±5мс — заведомо шире физического предела, чтобы не резать сам пик
-        self.declare_parameter('vote_window_sec', 3.0)    # скользящее окно голосования по знаку; больше = надёжнее, но медленнее реагирует
-        self.declare_parameter('rms_gate_dbfs', -24.0)    # под гейн 60% и реальную дистанцию 1-3м (см. память)
-        self.declare_parameter('publish_silence', False)
-        self.declare_parameter('swap_channels', True)     # raw ch0=физически правый, ch1=физически левый — см. память
-        self.declare_parameter('watchdog_sec', 3.0)
+        self._stream = None
+        self._last_block_time = 0.0
+        self._error_streak = 0
+        self._timers = []
+        self._queue = None
+        self._stop_event = None
+        self._worker = None
+
+    def _dp(self, name, default=None):
+        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        if not self.has_parameter(name):
+            self.declare_parameter(name, default)
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    def on_configure(self, state):
+        self._dp('device_name', 'ICUSBAUDIO7D')
+        self._dp('sample_rate', 48000)
+        self._dp('block_size', 4096)       # ~85мс @ 48кГц
+        self._dp('bandpass_low_hz', 2000.0)
+        self._dp('bandpass_high_hz', 6000.0)
+        self._dp('mic_distance_m', 0.145)   # только для справки/поиска окна, НЕ используется в angle_deg
+        self._dp('search_window_sec', 0.005)  # ±5мс — заведомо шире физического предела, чтобы не резать сам пик
+        self._dp('vote_window_sec', 3.0)    # скользящее окно голосования по знаку; больше = надёжнее, но медленнее реагирует
+        self._dp('rms_gate_dbfs', -24.0)    # под гейн 60% и реальную дистанцию 1-3м (см. память)
+        self._dp('publish_silence', False)
+        self._dp('swap_channels', True)     # raw ch0=физически правый, ch1=физически левый — см. память
+        self._dp('watchdog_sec', 3.0)
 
         self._device_name       = self.get_parameter('device_name').value
         self.rate                = self.get_parameter('sample_rate').value
@@ -157,8 +182,8 @@ class SoundLocalizationNode(Node):
         self._swap_channels      = self.get_parameter('swap_channels').value
         self._watchdog_sec       = self.get_parameter('watchdog_sec').value
 
-        vote_window_blocks = max(1, int(self._vote_window_sec * self.rate / self.block_size))
-        self._vote_window = deque(maxlen=vote_window_blocks)
+        self._vote_window_blocks = max(1, int(self._vote_window_sec * self.rate / self.block_size))
+        self._vote_window = deque(maxlen=self._vote_window_blocks)
 
         self._sos = butter(4, [self._bandpass_low, self._bandpass_high],
                             btype='band', fs=self.rate, output='sos')
@@ -168,33 +193,64 @@ class SoundLocalizationNode(Node):
             self._n_fft *= 2
         self._hann = np.hanning(self.block_size)
 
-        self._pub = self.create_publisher(SoundDirection, 'sound_direction', 10)
+        self._pub = self.create_lifecycle_publisher(SoundDirection, 'sound_direction', 10)
 
-        self._stream = None
-        self._last_block_time = 0.0
-        self._error_streak = 0
+        self.get_logger().info(
+            f'SoundLocalization настроена (TDOA sign-vote): rate={self.rate} блок={self.block_size} '
+            f'({1000 * self.block_size / self.rate:.0f}мс) '
+            f'полоса={self._bandpass_low:.0f}-{self._bandpass_high:.0f}Гц '
+            f'окно_голосования={self._vote_window_sec}с ({self._vote_window_blocks} блоков) '
+            f'rms_gate={self._rms_gate_dbfs}дБFS')
+        return TransitionCallbackReturn.SUCCESS
 
-        # Очередь между realtime-колбэком PortAudio и тяжёлой обработкой
-        # (полосовой фильтр + FFT/PHAT) — колбэк должен возвращаться быстро,
-        # иначе PortAudio сообщает "input overflow" и данные теряются.
-        # Обнаружено 2026-08-22: под конкурентной CPU-нагрузкой от других
-        # нод (face_detection ~60%+/глаз) даже дешёвая обработка (~0.6мс)
-        # внутри колбэка периодически не укладывалась в тайминг — вынесена
-        # в отдельный поток, колбэк теперь только копирует блок в очередь.
+    def on_activate(self, state):
+        self._pub.on_activate(state)
+
+        self._vote_window.clear()
         self._queue = queue.Queue(maxsize=8)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
 
-        self._open_stream()
-        self._timers = [self.create_timer(self._watchdog_sec, self._watchdog)]
+        if not self._open_stream():
+            self._stop_worker()
+            self._pub.on_deactivate(state)
+            return TransitionCallbackReturn.FAILURE
 
-        self.get_logger().info(
-            f'SoundLocalization (TDOA sign-vote): rate={self.rate} блок={self.block_size} '
-            f'({1000 * self.block_size / self.rate:.0f}мс) '
-            f'полоса={self._bandpass_low:.0f}-{self._bandpass_high:.0f}Гц '
-            f'окно_голосования={self._vote_window_sec}с ({vote_window_blocks} блоков) '
-            f'rms_gate={self._rms_gate_dbfs}дБFS')
+        self._timers = [self.create_timer(self._watchdog_sec, self._watchdog)]
+        self.get_logger().info('SoundLocalization активна')
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_deactivate(self, state):
+        for t in self._timers:
+            self.destroy_timer(t)
+        self._timers = []
+        self._close_stream()
+        self._stop_worker()
+        self._pub.on_deactivate(state)
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_cleanup(self, state):
+        self._close_stream()
+        self._stop_worker()
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(self, state):
+        self._close_stream()
+        self._stop_worker()
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_error(self, state):
+        self._close_stream()
+        self._stop_worker()
+        return TransitionCallbackReturn.SUCCESS
+
+    def _stop_worker(self):
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._worker is not None:
+            self._worker.join(timeout=2.0)
+        self._worker = None
 
     # ── Открытие устройства ────────────────────────────────────────────────
 
@@ -343,14 +399,6 @@ class SoundLocalizationNode(Node):
         lo, hi = center - wide, center + wide
         lag = int(np.argmax(r[lo:hi])) + lo - center
         return lag / self.rate * 1e6
-
-    def destroy_node(self):
-        for t in getattr(self, '_timers', []):
-            self.destroy_timer(t)
-        self._close_stream()
-        self._stop_event.set()
-        self._worker.join(timeout=2.0)
-        super().destroy_node()
 
 
 def main():

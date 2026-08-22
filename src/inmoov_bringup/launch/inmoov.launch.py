@@ -228,6 +228,16 @@ def generate_launch_description():
         }],
     )
 
+    sound_localization = LifecycleNode(
+        package='inmoov_voice',
+        executable='sound_localization_node',
+        name='sound_localization_node',
+        namespace='',
+        output='screen',
+        respawn=True,
+        respawn_delay=2.0,
+    )
+
     # ── Тир 2: HW Consumers ──────────────────────────────────────────────────
     wakeword = LifecycleNode(
         package='inmoov_voice',
@@ -617,6 +627,7 @@ def generate_launch_description():
         arduino_left,
         face_capture,
         oak_node,
+        sound_localization,
         wakeword,
         voice_detector,
         tts_node,

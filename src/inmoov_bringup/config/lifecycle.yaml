@@ -33,10 +33,11 @@ lifecycle_manager:
           - arduino_right
           - face_capture_node
           - oak_node
+          - sound_localization_node
         critical:
           - arduino_left        # без Arduino нет движения
           - arduino_right
-        # face_capture_node, oak_node: retry → degraded (голосовой режим)
+        # face_capture_node, oak_node, sound_localization_node: retry → degraded
 
       # ── Тир 2: HW Consumers ─────────────────────────────────────────────
       - id: 2
