@@ -33,6 +33,7 @@ setup(
             'whisper_stt_node     = inmoov_voice.whisper_stt_node:main',
             'tts_node             = inmoov_voice.tts_node:main',
 'voice_emotion_node   = inmoov_voice.voice_emotion_node:main',
+            'sound_localization_node = inmoov_voice.sound_localization_node:main',
             'diagnose             = scripts.diagnose:main',
         ],
     },
