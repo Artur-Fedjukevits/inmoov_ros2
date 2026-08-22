@@ -38,7 +38,8 @@ Blackboard ключи (BehaviorManagerNode заполняет из подпис�
   ├── SocialBranch     — если человек в кадре:
   │     IntroducingBlock / GreetBranch / DialogueBranch / IdleGaze
   ├── FarewellBranch   — если человек только что ушёл: прощание
-  ├── PIRScanBranch    — PIR: голова влево→вправо→центр для поиска лица
+  ├── SoundScanBranch  — wake word: поворот КОРПУСА на голос (/sound_direction) до /human_detected
+  ├── PIRScanBranch    — чистое PIR-движение (без голоса): голова влево→вправо→центр
   └── GlobalIdle       — ничего не происходит (моргание)
 """
 
@@ -61,6 +62,7 @@ from geometry_msgs.msg import Twist
 import py_trees
 
 from inmoov_msgs.action import Speak
+from inmoov_msgs.msg import SoundDirection
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -619,6 +621,141 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
             self._node.get_logger().info('PIRScan: прерван (лицо найдено) — head_tracker включён')
 
 
+class SoundScanBehaviour(py_trees.behaviour.Behaviour):
+    """
+    По wake word — поворот КОРПУСА (midstom), а не головы, в сторону,
+    откуда пришёл голос (по /sound_direction — TDOA sign-vote, см.
+    sound_localization_node / project_sound_localization_gcc_phat.md).
+    Заменяет старый PIRScan-скан головой конкретно для случая "услышали
+    голос" (PIR-движение без голоса по-прежнему использует PIRScanBehaviour
+    — там нет направления, которое можно было бы использовать).
+
+    Останавливается РОВНО ТАМ, где стоит, как только OAK-D увидел
+    человека (/human_detected — быстрее и грубее, чем полное распознавание
+    лица /social/person_present) — корпус НЕ возвращается в центр, и
+    управление передаётся head_tracker (который читает face_tracker) для
+    точной визуальной доводки. Если человек не найден за DWELL_TIMEOUT —
+    возврат корпуса в центр, face_detection выключается, отказ (как у
+    старого PIRScan).
+
+    ВАЖНО — направление НЕ провалидировано физически на корпусе: знак
+    convention взят по аналогии с rothead (LEFT=120/RIGHT=60 — та же
+    схема, что подтверждена для головы). midstom мог быть собран/иметь
+    другую физическую ориентацию сервопривода — проверить руками перед
+    вводом в эксплуатацию (громкий голос слева должен поворачивать корпус
+    ВЛЕВО, не вправо; если наоборот — поменять местами _LEFT/_RIGHT).
+    """
+
+    _CENTER = 90.0   # midstom rest (arduino_left_node: midstom rest=90, min=60, max=120)
+    _LEFT   = 120.0
+    _RIGHT  = 60.0
+    _TURN_VEL = 1.0
+
+    _GO_DURATION    = 0.6   # ~30° при ~50°/с (см. _SCAN_VEL расчёт в PIRScanBehaviour)
+    _DWELL_TIMEOUT  = 8.0   # сколько ждать /human_detected после поворота, прежде чем сдаться
+    _MIN_CONFIDENCE = 0.15  # ниже — направление "неизвестно", не поворачиваем (остаёмся по центру)
+    _MIN_ANGLE_DEG  = 15.0  # |angle_deg| меньше — тоже "около центра", не поворачиваем
+
+    def __init__(self, node: Node):
+        super().__init__('SoundScan')
+        self._node      = node
+        self._torso_pub = node.create_publisher(JointState, '/joint_command', 10)
+        self._bb = py_trees.blackboard.Client(name='SoundScan')
+        self._bb.register_key(key='/sound/scan_active',
+                               access=py_trees.common.Access.WRITE)
+        self._phase      = 0     # 0=едем к цели, 1=ждём human_detected, 2=возврат в центр
+        self._phase_end  = 0.0
+        self._completed  = False
+        self._target     = self._CENTER
+
+    def _torso_cmd(self, midstom: float) -> None:
+        msg = JointState()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.name     = ['midstom']
+        msg.position = [(midstom - 90.0) * math.pi / 180.0]
+        msg.velocity = [self._TURN_VEL]
+        self._torso_pub.publish(msg)
+
+    def initialise(self) -> None:
+        self._completed = False
+        self._phase      = 0
+
+        angle      = getattr(self._node, '_last_sound_angle', 0.0)
+        confidence = getattr(self._node, '_last_sound_confidence', 0.0)
+
+        if confidence < self._MIN_CONFIDENCE or abs(angle) < self._MIN_ANGLE_DEG:
+            self._target = self._CENTER
+            self._node.get_logger().info(
+                f'SoundScan: направление неуверенное (angle={angle:.0f}° '
+                f'conf={confidence:.2f}) — остаюсь по центру')
+        elif angle > 0:
+            self._target = self._RIGHT
+            self._node.get_logger().info(
+                f'SoundScan: голос справа (angle={angle:.0f}° conf={confidence:.2f}) '
+                f'— поворот корпуса вправо')
+        else:
+            self._target = self._LEFT
+            self._node.get_logger().info(
+                f'SoundScan: голос слева (angle={angle:.0f}° conf={confidence:.2f}) '
+                f'— поворот корпуса влево')
+
+        self._node.enable_face_detection(True)
+        self._torso_cmd(self._target)
+        self._phase_end = time.monotonic() + self._GO_DURATION
+
+    def update(self) -> py_trees.common.Status:
+        if getattr(self._node, '_human_detected', False):
+            return self._found()
+
+        now = time.monotonic()
+        if self._phase == 0:
+            if now < self._phase_end:
+                return py_trees.common.Status.RUNNING
+            self._phase     = 1
+            self._phase_end = now + self._DWELL_TIMEOUT
+            self._node.get_logger().info('SoundScan: держу позицию, жду /human_detected')
+            return py_trees.common.Status.RUNNING
+        elif self._phase == 1:
+            if now < self._phase_end:
+                return py_trees.common.Status.RUNNING
+            self._phase = 2
+            self._torso_cmd(self._CENTER)
+            self._phase_end = now + self._GO_DURATION
+            self._node.get_logger().info('SoundScan: человек не найден за таймаут — возврат в центр')
+            return py_trees.common.Status.RUNNING
+        else:
+            if now < self._phase_end:
+                return py_trees.common.Status.RUNNING
+            return self._done()
+
+    def _found(self) -> py_trees.common.Status:
+        self._completed = True
+        self._bb.sound.scan_active = False
+        self._node.enable_head_tracker(True)
+        self._node.get_logger().info(
+            'SoundScan: OAK-D увидел человека — останавливаюсь, передаю управление head_tracker')
+        return py_trees.common.Status.SUCCESS
+
+    def _done(self) -> py_trees.common.Status:
+        self._completed = True
+        self._node.enable_face_detection(False)
+        self._bb.sound.scan_active = False
+        self._node.get_logger().info('SoundScan: завершён — человек не найден, face_detection выключена')
+        return py_trees.common.Status.SUCCESS
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        if new_status == py_trees.common.Status.INVALID:
+            self._bb.sound.scan_active = False
+            if self._completed:
+                # py_trees вызывает terminate(INVALID) при перетикивании Sequence(memory=False)
+                # сразу после нашего SUCCESS — игнорируем, уже обработано в _found()/_done().
+                return
+            # Настоящий preempt (например, /social/person_present стал True другим путём,
+            # SocialBranch перехватил раньше, чем мы сами увидели /human_detected).
+            self._node.enable_head_tracker(True)
+            self._node.get_logger().info('SoundScan: прерван (человек найден) — head_tracker включён')
+
+
 class IdleBlinkBehaviour(py_trees.behaviour.Behaviour):
     """Моргание глаз в состоянии ожидания. Всегда RUNNING."""
 
@@ -692,7 +829,9 @@ def build_tree(node: Node, tavily_key: str) -> py_trees.behaviour.Behaviour:
       4. WebSearch        — поиск в интернете
       5. SocialBranch     — социальное взаимодействие (gate: person_present)
       6. FarewellBranch   — прощание когда человек ушёл
-      7. GlobalIdle       — ожидание
+      7a. SoundScanBranch — wake word: поворот корпуса (midstom) на голос до /human_detected
+      7b. PIRScanBranch   — чистое PIR-движение (без голоса): скан головой
+      8. GlobalIdle       — ожидание
 
     Interrupt Buffer: SocialBranch — Sequence(no-memory):
       CheckPersonPresent → FAILURE если человек ушёл → Sequence прерывается
@@ -852,7 +991,16 @@ def build_tree(node: Node, tavily_key: str) -> py_trees.behaviour.Behaviour:
         ]
     )
 
-    # ── 7. PIR scan (поиск лица после срабатывания PIR) ──────────────────
+    # ── 7a. Sound scan (wake word → поворот КОРПУСА на голос) ─────────────
+    sound_scan = py_trees.composites.Sequence(
+        'SoundScanBranch', memory=False, children=[
+            CheckBB('IsSoundScanActive', '/sound/scan_active',
+                    check_fn=lambda v: v is True),
+            SoundScanBehaviour(node),
+        ]
+    )
+
+    # ── 7b. PIR scan (чистое движение без голоса — поиск лица головой) ────
     pir_scan = py_trees.composites.Sequence(
         'PIRScanBranch', memory=False, children=[
             CheckBB('IsPIRScanActive', '/pir/scan_active',
@@ -873,6 +1021,7 @@ def build_tree(node: Node, tavily_key: str) -> py_trees.behaviour.Behaviour:
             web_search,
             social_branch,
             farewell_branch,
+            sound_scan,
             pir_scan,
             global_idle,
         ]
@@ -891,6 +1040,12 @@ class BehaviorManagerNode(LifecycleNode):
         self._pir_cooldown     = 20.0  # будет перезаписан в on_configure
         self._pir_next_scan_at = 0.0
         self._pir_prev_state   = False
+
+        # Кэш последнего /sound_direction и /human_detected для SoundScanBehaviour
+        # (читает через getattr(node, ...), не через topic-подписку в самом behaviour)
+        self._last_sound_angle      = 0.0
+        self._last_sound_confidence = 0.0
+        self._human_detected        = False
 
         # ── Blackboard инициализация ──────────────────────────────────────
         self._bb = py_trees.blackboard.Client(name='BehaviorManager')
@@ -916,6 +1071,7 @@ class BehaviorManagerNode(LifecycleNode):
             '/search/query':            '',
             '/search/result':           {},
             '/pir/scan_active':         False,
+            '/sound/scan_active':       False,
             '/scene/person_count':      0,
             '/scene/objects_summary':   '',
             '/scene/location':          '',
@@ -943,6 +1099,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._bb.search.query            = ''
         self._bb.search.result           = {}
         self._bb.pir.scan_active         = False
+        self._bb.sound.scan_active       = False
         self._bb.scene.person_count      = 0
         self._bb.scene.objects_summary   = ''
         self._bb.scene.location          = ''
@@ -1148,11 +1305,23 @@ class BehaviorManagerNode(LifecycleNode):
         if not msg.data:
             self._bb.robot.sleep_requested = False
             self._pir_next_scan_at = 0.0  # сбрасываем cooldown — wake-word важнее
-            self._bb.pir.scan_active = True
-            self.get_logger().info('Пробуждение — запуск PIR-скана для поиска человека')
+            # Пробуждение всегда идёт через wake word (voice_detector публикует
+            # /robot_sleep False по нему) — значит есть направление, используем
+            # SoundScan (поворот корпуса), не старый PIR-скан головой.
+            self._bb.sound.scan_active = True
+            self.get_logger().info('Пробуждение (по wake word) — запуск SoundScan')
+
+    def _sound_direction_cb(self, msg: SoundDirection):
+        """Кэш последнего /sound_direction для SoundScanBehaviour."""
+        self._last_sound_angle      = msg.angle_deg
+        self._last_sound_confidence = msg.confidence
+
+    def _human_detected_cb(self, msg: Bool):
+        """Кэш последнего /human_detected (OAK-D) для SoundScanBehaviour."""
+        self._human_detected = msg.data
 
     def _wake_detected_cb(self, msg: Bool):
-        """Wake word в IDLE → запускаем PIR-скан для поиска лица собеседника."""
+        """Wake word в IDLE → запускаем SoundScan (поворот корпуса на голос)."""
         if not msg.data:
             return
         if self._bb.robot.sleep:
@@ -1175,11 +1344,11 @@ class BehaviorManagerNode(LifecycleNode):
                 pass
             return
 
-        if self._bb.pir.scan_active:
+        if self._bb.pir.scan_active or self._bb.sound.scan_active:
             return
         self._pir_next_scan_at = 0.0   # wake word важнее cooldown
-        self._bb.pir.scan_active = True
-        self.get_logger().info('Wake word в IDLE → запуск PIR-скана для поиска лица')
+        self._bb.sound.scan_active = True
+        self.get_logger().info('Wake word в IDLE → запуск SoundScan (поворот корпуса на голос)')
 
     def _pir_cb(self, msg: Bool):
         """PIR сигнал: реагируем только на передний фронт (False→True).
@@ -1253,6 +1422,8 @@ class BehaviorManagerNode(LifecycleNode):
         self.create_subscription(Bool,   '/pir_state',      self._pir_cb,             10)
         self.create_subscription(Bool,   'wake_detected',   self._wake_detected_cb,   10)
         self.create_subscription(Bool,   '/robot_sleep',    self._robot_sleep_cb,     lqos)
+        self.create_subscription(SoundDirection, '/sound_direction', self._sound_direction_cb, 10)
+        self.create_subscription(Bool,   '/human_detected', self._human_detected_cb,  10)
 
         self.get_logger().info('BehaviorManager настроен')
         return TransitionCallbackReturn.SUCCESS
@@ -1281,6 +1452,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._bb.llm.has_content     = False
         self._bb.social.person_present = False
         self._bb.pir.scan_active     = False
+        self._bb.sound.scan_active   = False
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
