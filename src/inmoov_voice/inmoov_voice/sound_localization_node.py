@@ -5,24 +5,28 @@ sound_localization_node.py
 ===========================
 Грубое направление на источник звука по паре микрофонов MAX9814 на
 звуковой карте CM6206 (USB 0d8c:0102, ALSA-имя "ICUSBAUDIO7D") —
-через межканальную разницу громкости (ILD), НЕ через время прихода
-(TDOA/GCC-PHAT).
+через голосование по ЗНАКУ полосового GCC-PHAT (TDOA), НЕ через
+межканальную разницу громкости (ILD) и НЕ через физический угол.
 
-Почему не TDOA — история (2026-08-19..22, см.
-project_sound_localization_gcc_phat.md): на открытом столе GCC-PHAT
-давал чистые и правильные ±90°. После установки капсюлей в уши робота
-результат стабильно уходил в 0° независимо от реального направления —
-оба капсюля на реальной голове акустически связаны через общую открытую
-полость черепа (сервоприводы, провода, шея — видно на фото сборки).
-Герметизация уха (силиконовый герметик вокруг капсюля) заметно снизила,
-но не убрала утечку: измеренная задержка регулярно ПРЕВЫШАЛА физически
-возможный максимум для базы между ушами — то есть алгоритм мерил не
-прямой путь звука, а переотражения внутри черепа. Проверили и
-электрическую наводку между каналами (перепаивали провод перед
-установкой) — низкая корреляция (0.04-0.06) её исключает, дело именно
-в акустике. Разница громкости оказалась единственным сигналом, который
-на реальной речи (10с, естественные паузы) стабильно смещался в нужную
-сторону (~2.7-3.4дБ) — на неё и переписано.
+История (см. project_sound_localization_gcc_phat.md за подробностями):
+1) Исходный широкополосный GCC-PHAT — чисто работал на открытом столе
+   (±90°, шипение), но на установленной в уши голове давал физически
+   невозможные задержки: открытый скелет черепа (сервоприводы, провода,
+   шея) пропускает звук напрямую между капсюлями, эта внутренняя утечка
+   доминирует над прямым путём через воздух снаружи.
+2) Пивот на ILD (разница громкости) — рабочий на 5-6см, но на реальной
+   дистанции разговора (1-3м, комната ~3x2.5м) деградировал почти до
+   случайного знака: отражения от стен перебивают слабую разницу
+   громкости от направления (проверено статистически 2026-08-22 —
+   несколько подряд идущих замеров дали неверный знак на 1м).
+3) 2026-08-22: полосовой фильтр (2-6кГц — где утечка через полость слабее,
+   чем на басах) перед GCC-PHAT НЕ убрал избыточную задержку (медианные
+   значения всё ещё в разы превышают физический предел для базы между
+   ушами), НО её ЗНАК стабильно коррелирует с реальным направлением на
+   всех проверенных дистанциях (0.2-2м, шипение и живая речь). Голосование
+   большинства по знаку за скользящее окно блоков подтверждено вслепую:
+   6/6 верных угадываний в реальном тесте (разные стороны, дистанции,
+   45°, центр).
 
 Микрофоны читаются НАПРЯМУЮ через raw ALSA, в обход PipeWire (карта
 исключена из WirePlumber правилом device.disabled в
@@ -35,70 +39,89 @@ alsa-restore срабатывает раньше, чем инициализир�
 `amixer -c ICUSBAUDIO7D contents | grep -A3 "Mic Capture Volume"` —
 должно быть **60% (4157/6928, +0.23дБ)**, а не максимум (6928/6928).
 Восстановить: `amixer -c ICUSBAUDIO7D sset Mic 60% cap`.
+(Пробовали асимметричный гейн по каналам для компенсации разной
+акустической связи капсюлей с внешним звуком — не получилось: слишком
+чувствительно к точному значению, при перекосе один канал теряет
+чувствительность к своему направлению полностью. Симметричный гейн проще
+и предсказуемее, конкретное значение (60%) для алгоритма TDOA не так
+критично, как было для ILD — это по-прежнему число дБ, симметрия важнее.)
 
-60% подобрано 2026-08-22 под реальную дистанцию разговора (1-3м, не
-5-6см калибровочных тестов) — на 70% пик речи почти клиппировал
-(-0.6дБFS, меньше 1дБ до потолка), на 50% медиана речи была ниже гейта.
-Пол комнаты на 60% гейне ~-30.5дБFS (стабильно, ±1дБ) — важно: подъём
-аналогового гейна усиливает и полезный сигнал, и акустический шум
-одновременно (SNR относительно акустического шума почти не меняется от
-гейна) — гейн двигали не ради SNR, а чтобы уровень речи с реальной
-дистанции попадал выше `rms_gate_dbfs` и не тонул в порогах ноды.
-
-Алгоритм на блок:
-  1. RMS каждого канала отдельно + средний RMS обоих (для гейта)
-  2. ild_db_raw = 20·log10(rms_right / rms_left)
-  3. ild_db = ild_db_raw - ild_bias_db  — компенсация систематического
-     перекоса: правый капсюль акустически связан с внешним звуком лучше
-     левого (плотнее сидит в ухе — левый переклеивали после щели, правый
-     не трогали), из-за чего сырой ild_db стабильно смещён в "право"
-     примерно на +4.5дБ независимо от реального направления. Замерено
-     2026-08-22: белый шум с телефона (5-6см) в ПОЛНОЙ ТИШИНЕ (без
-     фонового 3D-принтера, который в первой попытке дал ложную картину —
-     см. память) — источник у левого уха даёт ild_db_raw=-4.1дБ, у
-     правого +13.1дБ; симметричная компенсация даёт офсет 4.5дБ.
-  4. angle_deg = clip(ild_db / max_ild_db, -1, 1) · 90°
-     — ЛИНЕЙНОЕ отображение, не физическая модель (в отличие от старой
-     asin(tdoa·c/d) формулы GCC-PHAT-версии) — просто разумный масштаб
-     для совместимости с потребителями топика. max_ild_db — во сколько
-     дБ разницы считать "предельно в одну сторону", подбирается
-     эмпирически под конкретную голову.
+Алгоритм на блок (~85мс @ 48кГц):
+  1. RMS блока (оба канала) → energy-гейт (rms_gate_dbfs), как раньше.
+  2. Полосовой фильтр 2-6кГц (bandpass_low/high, Butterworth, sosfiltfilt
+     — нулевая фазовая задержка, важно для точности TDOA) на оба канала.
+  3. GCC-PHAT: Hann-окно → FFT → кросс-спектр XL·conj(XR) → PHAT-нормировка
+     (делим на модуль, оставляем только фазу) → IFFT → пик в широком
+     окне поиска (±5мс, НЕ ограничен физическим пределом — сам пик всё
+     равно окажется вне физических рамок, но его ЗНАК информативен).
+  4. Знак сырой задержки (мкс) добавляется в скользящее окно
+     (vote_window_sec, по умолчанию 3с) — НЕ усредняем сами задержки
+     (величина физически бессмысленна и хаотична), только считаем
+     большинство по знаку.
+  5. angle_deg = (голосов_право − голосов_лево) / всего_голосов · 90°,
+     confidence = |то же соотношение|. НЕ физическая модель.
 
 ВАЖНО — калибровка перед использованием на голове:
-Знак ild_db/angle_deg зависит от того, какой физический капсюль
-подключён в какой ALSA-канал (0=left/FL, 1=right/FR). Проверить руками
-(говорить/шипеть с известной стороны, смотреть знак angle_deg) и при
-необходимости выставить swap_channels:=true, а не лезть в код.
+Знак зависит от того, какой физический капсюль подключён в какой
+ALSA-канал (0=right/FL, 1=left/FR — да, "перевёрнуто" относительно
+интуиции, см. память). Проверить руками (говорить/шипеть с известной
+стороны, смотреть знак angle_deg) и при необходимости выставить
+swap_channels:=false (дефолт true подобран 2026-08-22, тот же маппинг,
+что и у ILD-версии — если карту/пайку не трогали после того теста,
+менять не нужно).
 
-Дефолт swap_channels=True подобран 2026-08-22 после перепайки провода
-(заделка щели левого уха задела и разводку) — каналы физически оказались
-перепутаны. Подтверждено на обоих ушах: левое (без swap) даёт
-отрицательный angle_deg на живой речи (-38.7°), правое (с swap) даёт
-устойчиво +90° на шипении (65/65 блоков). Если карту/мики/пайку ещё раз
-трогали — перекалибровать заново тем же способом, знак может опять
-измениться.
+Практический вывод для потребителей топика: полагаться нужно на
+`angle_deg`/`confidence` (уже агрегированы за окно), НЕ на `tdoa_us`
+(это медиана за окно чисто для отладки, физически нереалистична).
+Низкий confidence (<0.5) означает, что окно ещё не набралось или знак
+внутри окна колеблется — стоит подождать ещё немного речи, прежде чем
+принимать решение о повороте.
 
-Практический вывод для потребителей топика: одиночному блоку не
-доверять, громкость речи и так прыгает от слова к слову — агрегировать
-(медиана/EMA) по нескольким подряд идущим voiced=true блокам. Нода уже
-сглаживает ild_db через EMA (см. параметр ema_alpha) для базовой
-стабильности, но резкие скачки на паузах в речи всё равно возможны.
+Известные ограничения:
+  - Неоднозначность спереди/сзади (общая для любой пары микрофонов) —
+    не различает источник спереди и сзади под тем же углом. Разрешать
+    через зрение (OAK-D/face_detection) — грубый крен по звуку, точная
+    сторона и фронт/зад по камере.
+  - Голос заметно шумнее шипения на дистанции >1м (гласные/периодичность
+    хуже для PHAT, чем широкополосный шум) — окно голосования сглаживает
+    это, но короткие реплики (<1-2с) могут не успеть набрать уверенный
+    результат.
+  - При долгой тишине окно голосования не сбрасывается само — старое
+    направление "подвисает" до следующих голосов. Если после паузы
+    заговорил кто-то с другой стороны, первые ~vote_window_sec может
+    показывать прошлое направление.
+  - Нет on_set_parameters_callback — `ros2 param set` во время работы
+    не применяется, только перезапуск с -p.
 
 Топик:
   /sound_direction  (inmoov_msgs/SoundDirection)
 
 Отдельный запуск для теста (без launch-файла):
-  ros2 run inmoov_voice sound_localization_node --ros-args -p max_ild_db:=6.0
+  ros2 run inmoov_voice sound_localization_node
   ros2 topic echo /sound_direction
 """
 
 import math
+import os
+import queue
+import statistics
+import threading
+from collections import deque
+
+# Ограничить внутреннюю многопоточность BLAS/numpy ДО импорта numpy/scipy —
+# на этом NUC параллельно молотят тяжёлые ноды (face_detection ~60%+ CPU
+# на глаз), лишние потоки BLAS только добавляют конкуренцию за ядра и
+# затрудняют то, ради чего вообще нужна отдельная очередь (см. ниже).
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Header
 import sounddevice as sd
+from scipy.signal import butter, sosfiltfilt
 
 from inmoov_msgs.msg import SoundDirection
 
@@ -110,28 +133,40 @@ class SoundLocalizationNode(Node):
 
         self.declare_parameter('device_name', 'ICUSBAUDIO7D')
         self.declare_parameter('sample_rate', 48000)
-        self.declare_parameter('block_size', 4096)     # ~85мс @ 48кГц — ILD не нужна тонкая временная точность GCC-PHAT
-        self.declare_parameter('max_ild_db', 6.0)       # дБ разницы, соответствующие ±90°; подбирается под голову
-        self.declare_parameter('ild_bias_db', 4.5)      # системный сдвиг показаний в "право" (правый капсюль акустически связан лучше левого — см. память 2026-08-22), вычитается из сырого ild_db
-        self.declare_parameter('rms_gate_dbfs', -24.0)  # под гейн 60% и реальную дистанцию разговора 1-3м (см. память 2026-08-22, пол комнаты ~-30.5дБFS на этом гейне)
+        self.declare_parameter('block_size', 4096)       # ~85мс @ 48кГц
+        self.declare_parameter('bandpass_low_hz', 2000.0)
+        self.declare_parameter('bandpass_high_hz', 6000.0)
+        self.declare_parameter('mic_distance_m', 0.145)   # только для справки/поиска окна, НЕ используется в angle_deg
+        self.declare_parameter('search_window_sec', 0.005)  # ±5мс — заведомо шире физического предела, чтобы не резать сам пик
+        self.declare_parameter('vote_window_sec', 3.0)    # скользящее окно голосования по знаку; больше = надёжнее, но медленнее реагирует
+        self.declare_parameter('rms_gate_dbfs', -24.0)    # под гейн 60% и реальную дистанцию 1-3м (см. память)
         self.declare_parameter('publish_silence', False)
-        self.declare_parameter('swap_channels', True)   # каналы физически перепутаны после перепайки провода при заделке уха (2026-08-22, см. память)
-        self.declare_parameter('ema_alpha', 0.3)        # сглаживание ild_db между блоками, 0..1 (больше = быстрее реакция)
+        self.declare_parameter('swap_channels', True)     # raw ch0=физически правый, ch1=физически левый — см. память
         self.declare_parameter('watchdog_sec', 3.0)
 
-        self._device_name     = self.get_parameter('device_name').value
-        self.rate              = self.get_parameter('sample_rate').value
-        self.block_size        = self.get_parameter('block_size').value
-        self._max_ild_db       = self.get_parameter('max_ild_db').value
-        self._ild_bias_db      = self.get_parameter('ild_bias_db').value
-        self._rms_gate_dbfs    = self.get_parameter('rms_gate_dbfs').value
-        self._publish_silence  = self.get_parameter('publish_silence').value
-        self._swap_channels    = self.get_parameter('swap_channels').value
-        self._ema_alpha        = self.get_parameter('ema_alpha').value
-        self._watchdog_sec     = self.get_parameter('watchdog_sec').value
+        self._device_name       = self.get_parameter('device_name').value
+        self.rate                = self.get_parameter('sample_rate').value
+        self.block_size          = self.get_parameter('block_size').value
+        self._bandpass_low       = self.get_parameter('bandpass_low_hz').value
+        self._bandpass_high      = self.get_parameter('bandpass_high_hz').value
+        self._mic_distance_m     = self.get_parameter('mic_distance_m').value
+        self._search_window_sec  = self.get_parameter('search_window_sec').value
+        self._vote_window_sec    = self.get_parameter('vote_window_sec').value
+        self._rms_gate_dbfs      = self.get_parameter('rms_gate_dbfs').value
+        self._publish_silence    = self.get_parameter('publish_silence').value
+        self._swap_channels      = self.get_parameter('swap_channels').value
+        self._watchdog_sec       = self.get_parameter('watchdog_sec').value
 
-        self._ild_ema = 0.0
-        self._ema_initialized = False
+        vote_window_blocks = max(1, int(self._vote_window_sec * self.rate / self.block_size))
+        self._vote_window = deque(maxlen=vote_window_blocks)
+
+        self._sos = butter(4, [self._bandpass_low, self._bandpass_high],
+                            btype='band', fs=self.rate, output='sos')
+
+        self._n_fft = 1
+        while self._n_fft < 2 * self.block_size:
+            self._n_fft *= 2
+        self._hann = np.hanning(self.block_size)
 
         self._pub = self.create_publisher(SoundDirection, 'sound_direction', 10)
 
@@ -139,13 +174,27 @@ class SoundLocalizationNode(Node):
         self._last_block_time = 0.0
         self._error_streak = 0
 
+        # Очередь между realtime-колбэком PortAudio и тяжёлой обработкой
+        # (полосовой фильтр + FFT/PHAT) — колбэк должен возвращаться быстро,
+        # иначе PortAudio сообщает "input overflow" и данные теряются.
+        # Обнаружено 2026-08-22: под конкурентной CPU-нагрузкой от других
+        # нод (face_detection ~60%+/глаз) даже дешёвая обработка (~0.6мс)
+        # внутри колбэка периодически не укладывалась в тайминг — вынесена
+        # в отдельный поток, колбэк теперь только копирует блок в очередь.
+        self._queue = queue.Queue(maxsize=8)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
         self._open_stream()
         self._timers = [self.create_timer(self._watchdog_sec, self._watchdog)]
 
         self.get_logger().info(
-            f'SoundLocalization (ILD): rate={self.rate} блок={self.block_size} '
+            f'SoundLocalization (TDOA sign-vote): rate={self.rate} блок={self.block_size} '
             f'({1000 * self.block_size / self.rate:.0f}мс) '
-            f'max_ild_db={self._max_ild_db} rms_gate={self._rms_gate_dbfs}дБFS')
+            f'полоса={self._bandpass_low:.0f}-{self._bandpass_high:.0f}Гц '
+            f'окно_голосования={self._vote_window_sec}с ({vote_window_blocks} блоков) '
+            f'rms_gate={self._rms_gate_dbfs}дБFS')
 
     # ── Открытие устройства ────────────────────────────────────────────────
 
@@ -174,6 +223,7 @@ class SoundLocalizationNode(Node):
                 samplerate=self.rate,
                 blocksize=self.block_size,
                 dtype='float32',
+                latency=0.2,  # секунды, ЯВНО числом — строка 'high' у этого драйвера маппится всего на ~35мс (мало!), не помогала; 0.2с эмпирически чисто без overflow (2026-08-22, тест 0.1с ещё ловил overflow, 0.15с+ чисто)
                 callback=self._on_audio_block,
             )
             self._stream.start()
@@ -200,21 +250,42 @@ class SoundLocalizationNode(Node):
             self._open_stream()
 
     # ── Callback аудио-потока (реалтайм тред PortAudio, НЕ ROS executor) ────
+    # Должен быть максимально быстрым — только копия блока в очередь, вся
+    # тяжёлая обработка (полосовой фильтр, FFT/PHAT) в _worker_loop().
 
     def _on_audio_block(self, indata, frames, time_info, status):
         self._last_block_time = self.get_clock().now().nanoseconds / 1e9
         if status:
             self.get_logger().warn(f'Audio status: {status}')
         try:
-            left, right = indata[:, 0], indata[:, 1]
-            if self._swap_channels:
-                left, right = right, left
-            self._process_block(left, right)
-            self._error_streak = 0
-        except Exception as e:
-            self._error_streak += 1
-            if self._error_streak <= 3 or self._error_streak % 100 == 0:
-                self.get_logger().error(f'Ошибка обработки блока: {e}')
+            self._queue.put_nowait(indata.copy())
+        except queue.Full:
+            # Обработка не успевает — выкидываем самый старый блок и кладём
+            # новый, чтобы очередь не копила задержку бесконечно.
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(indata.copy())
+            except (queue.Empty, queue.Full):
+                pass
+
+    # ── Рабочий поток: тяжёлая обработка вне realtime-колбэка ───────────────
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                block = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                left, right = block[:, 0], block[:, 1]
+                if self._swap_channels:
+                    left, right = right, left
+                self._process_block(left, right)
+                self._error_streak = 0
+            except Exception as e:
+                self._error_streak += 1
+                if self._error_streak <= 3 or self._error_streak % 100 == 0:
+                    self.get_logger().error(f'Ошибка обработки блока: {e}')
 
     def _process_block(self, left: np.ndarray, right: np.ndarray):
         rms_l = float(np.sqrt(np.mean(left.astype(np.float64) ** 2)))
@@ -227,34 +298,58 @@ class SoundLocalizationNode(Node):
             return
 
         if voiced:
-            ild_db_raw = 20.0 * math.log10(max(rms_r, 1e-9) / max(rms_l, 1e-9))
-            ild_db = ild_db_raw - self._ild_bias_db   # компенсация систематического перекоса каналов (правый капсюль лучше акустически связан — см. память)
-            if not self._ema_initialized:
-                self._ild_ema = ild_db
-                self._ema_initialized = True
-            else:
-                self._ild_ema = self._ema_alpha * ild_db + (1.0 - self._ema_alpha) * self._ild_ema
-            ratio = max(-1.0, min(1.0, self._ild_ema / self._max_ild_db))
-            angle_deg = ratio * 90.0
-            confidence = max(0.0, min(1.0, (rms_dbfs - self._rms_gate_dbfs) / 20.0))
+            tdoa_us = self._gcc_phat_tdoa_us(left, right)
+            self._vote_window.append(tdoa_us)
+
+            total = len(self._vote_window)
+            pos = sum(1 for x in self._vote_window if x > 0)
+            neg = sum(1 for x in self._vote_window if x < 0)
+            score = (pos - neg) / total if total > 0 else 0.0
+            angle_deg = score * 90.0
+            confidence = abs(score)
+            tdoa_us_median = statistics.median(self._vote_window)
         else:
-            ild_db, angle_deg, confidence = 0.0, 0.0, 0.0
+            tdoa_us_median, angle_deg, confidence = 0.0, 0.0, 0.0
 
         msg = SoundDirection()
         msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'head'
         msg.angle_deg = float(angle_deg)
-        msg.ild_db = float(ild_db if voiced else 0.0)
+        msg.tdoa_us = float(tdoa_us_median)
         msg.confidence = float(confidence)
         msg.rms_dbfs = float(rms_dbfs)
         msg.voiced = bool(voiced)
         self._pub.publish(msg)
 
+    def _gcc_phat_tdoa_us(self, left: np.ndarray, right: np.ndarray) -> float:
+        """Полосовой GCC-PHAT, возвращает знаковую задержку в мкс (сырую,
+        физически нереалистичную по величине из-за утечки звука через
+        полость черепа — использовать только ЗНАК, см. докстринг модуля)."""
+        fl = sosfiltfilt(self._sos, left.astype(np.float64))
+        fr = sosfiltfilt(self._sos, right.astype(np.float64))
+
+        fl_w = fl * self._hann
+        fr_w = fr * self._hann
+
+        XL = np.fft.rfft(fl_w, n=self._n_fft)
+        XR = np.fft.rfft(fr_w, n=self._n_fft)
+        R = XL * np.conj(XR)
+        R_phat = R / (np.abs(R) + 1e-12)
+        r = np.fft.fftshift(np.fft.irfft(R_phat, n=self._n_fft))
+        center = self._n_fft // 2
+
+        wide = max(1, int(self._search_window_sec * self.rate))
+        lo, hi = center - wide, center + wide
+        lag = int(np.argmax(r[lo:hi])) + lo - center
+        return lag / self.rate * 1e6
+
     def destroy_node(self):
         for t in getattr(self, '_timers', []):
             self.destroy_timer(t)
         self._close_stream()
+        self._stop_event.set()
+        self._worker.join(timeout=2.0)
         super().destroy_node()
 
 
