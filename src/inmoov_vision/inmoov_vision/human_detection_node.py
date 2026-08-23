@@ -13,6 +13,14 @@ YOLO подтверждает что объект — человек.
   /ultrasonic_left_distance  (Int16, см)    ← arduino_left_node
   /ultrasonic_right_distance (Int16, см)    ← arduino_right_node
   /human_detected            (Bool)         → identity_manager / BT
+  /human_angle_deg           (Float32)      → BT (SoundScanBehaviour — наведение
+                              головы на ближайшего человека ДО того, как
+                              face_detection/head_tracker успеют его увидеть.
+                              atan2(x_mm, z_mm) из OAK-D, + = человек справа
+                              (конвенция DepthAI: X положительный вправо от
+                              камеры) — НЕ провалидировано физически, как и
+                              остальные знаковые конвенции в проекте, проверить
+                              руками при первом использовании)
 
 Параметры:
   max_distance_m      — макс. дальность (default 4.0м)
@@ -24,13 +32,14 @@ YOLO подтверждает что объект — человек.
 """
 
 import json
+import math
 import threading
 import time
 
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from std_msgs.msg import Bool, Int16, String
+from std_msgs.msg import Bool, Float32, Int16, String
 
 
 class HumanDetectionNode(LifecycleNode):
@@ -41,6 +50,8 @@ class HumanDetectionNode(LifecycleNode):
         self._timer        = None
         self._last_seen    = 0.0
         self._yolo_z_m     = 0.0
+        self._angle_deg    = 0.0
+        self._angle_pub    = None
         self._was_detected = False
         self._sleeping     = False
         self._us_left_m    = self._us_right_m  = 0.0
@@ -77,7 +88,8 @@ class HumanDetectionNode(LifecycleNode):
             self.create_subscription(Int16, '/ultrasonic_left_distance',  self._us_left_cb,  10)
             self.create_subscription(Int16, '/ultrasonic_right_distance', self._us_right_cb, 10)
 
-        self._pub = self.create_lifecycle_publisher(Bool, '/human_detected', 10)
+        self._pub       = self.create_lifecycle_publisher(Bool, '/human_detected', 10)
+        self._angle_pub = self.create_lifecycle_publisher(Float32, '/human_angle_deg', 10)
         self.get_logger().info(
             f'HumanDetection configured. '
             f'Дальность: {self._max_z_mm/1000:.1f}м, confidence: {self._min_conf}')
@@ -85,6 +97,7 @@ class HumanDetectionNode(LifecycleNode):
 
     def on_activate(self, state):
         self._pub.on_activate(state)
+        self._angle_pub.on_activate(state)
         self._timer = self.create_timer(1.0 / self._rate_hz, self._publish_state)
         return TransitionCallbackReturn.SUCCESS
 
@@ -93,6 +106,7 @@ class HumanDetectionNode(LifecycleNode):
             self.destroy_timer(self._timer)
             self._timer = None
         self._pub.on_deactivate(state)
+        self._angle_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
@@ -163,6 +177,10 @@ class HumanDetectionNode(LifecycleNode):
             with self._lock:
                 self._last_seen = time.time()
                 self._yolo_z_m  = closest['z_mm'] / 1000.0
+                x_mm = closest.get('x_mm', 0.0)
+                z_mm = closest.get('z_mm', 0.0)
+                if z_mm > 0:
+                    self._angle_deg = math.degrees(math.atan2(x_mm, z_mm))
 
     # ── Публикация ────────────────────────────────────────────────────────────
 
@@ -186,12 +204,18 @@ class HumanDetectionNode(LifecycleNode):
         with self._lock:
             if self._sleeping:
                 return
-            detected = (time.time() - self._last_seen) < self._lost_timeout
-            dist_m   = self._best_distance_m()
+            detected  = (time.time() - self._last_seen) < self._lost_timeout
+            dist_m    = self._best_distance_m()
+            angle_deg = self._angle_deg
 
         msg = Bool()
         msg.data = detected
         self._pub.publish(msg)
+
+        if detected:
+            angle_msg = Float32()
+            angle_msg.data = float(angle_deg)
+            self._angle_pub.publish(angle_msg)
 
         if detected != self._was_detected:
             if detected:

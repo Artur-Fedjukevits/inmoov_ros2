@@ -56,7 +56,7 @@ from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String, Bool
+from std_msgs.msg import String, Bool, Float32
 from geometry_msgs.msg import Twist
 
 import py_trees
@@ -653,6 +653,12 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     _MIN_CONFIDENCE = 0.15  # ниже — направление "неизвестно", не поворачиваем (остаёмся по центру)
     _MIN_ANGLE_DEG  = 15.0  # |angle_deg| меньше — тоже "около центра", не поворачиваем
 
+    # rothead: rest=90, min=30, max=140 (та же конвенция, что у PIRScanBehaviour: LEFT=120/RIGHT=60)
+    _ROTHEAD_CENTER = 90.0
+    _ROTHEAD_MIN    = 30.0
+    _ROTHEAD_MAX    = 140.0
+    _NECK_REST      = 40.0
+
     def __init__(self, node: Node):
         super().__init__('SoundScan')
         self._node      = node
@@ -672,6 +678,33 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
         msg.position = [(midstom - 90.0) * math.pi / 180.0]
         msg.velocity = [self._TURN_VEL]
         self._torso_pub.publish(msg)
+
+    def _aim_head_at_human(self) -> None:
+        """Одноразовое наведение головы (rothead) на человека по /human_angle_deg
+        (OAK-D atan2(x_mm,z_mm)) — ДО enable_head_tracker(). Идея из статьи
+        AIR2025 (Saini et al.): грубый SSL уже довёл корпус, но лицо может ещё
+        не попасть в кадр глазных камер (узкий FOV) пока не наведём голову
+        точнее по OAK-D, у которого более широкий обзор и реальная позиция.
+        Без этого шага vision_head_tracker может сдаться по таймауту "нет
+        трека 3с" раньше, чем face_detection вообще успеет увидеть лицо
+        (см. живой тест 2026-08-22/23 — задержка распознавания ~6с > 3с
+        терпения head_tracker).
+        Знак НЕ провалидирован физически (конвенция DepthAI: +x = вправо от
+        камеры, предполагаем что совпадает с знаком /sound_direction) —
+        проверить при первом реальном срабатывании."""
+        angle = getattr(self._node, '_last_human_angle', 0.0)
+        rothead = max(self._ROTHEAD_MIN, min(self._ROTHEAD_MAX, self._ROTHEAD_CENTER - angle))
+        msg = JointState()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.name     = ['rothead', 'neck']
+        msg.position = [
+            (rothead        - 90.0) * math.pi / 180.0,
+            (self._NECK_REST - 90.0) * math.pi / 180.0,
+        ]
+        msg.velocity = [self._TURN_VEL, self._TURN_VEL]
+        self._torso_pub.publish(msg)
+        self._node.get_logger().info(
+            f'SoundScan: навожу голову на человека (OAK-D angle={angle:.0f}° → rothead={rothead:.0f}°)')
 
     def initialise(self) -> None:
         self._completed = False
@@ -728,6 +761,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     def _found(self) -> py_trees.common.Status:
         self._completed = True
         self._bb.sound.scan_active = False
+        self._aim_head_at_human()   # сразу навести голову по OAK-D, не ждать пока её найдёт face_detection
         self._node.enable_head_tracker(True)
         self._node.get_logger().info(
             'SoundScan: OAK-D увидел человека — останавливаюсь, передаю управление head_tracker')
@@ -1043,6 +1077,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._last_sound_angle      = 0.0
         self._last_sound_confidence = 0.0
         self._human_detected        = False
+        self._last_human_angle      = 0.0   # /human_angle_deg (OAK-D, atan2(x_mm,z_mm)) — SoundScanBehaviour наводит голову перед enable_head_tracker
 
         # ── Blackboard инициализация ──────────────────────────────────────
         self._bb = py_trees.blackboard.Client(name='BehaviorManager')
@@ -1317,6 +1352,10 @@ class BehaviorManagerNode(LifecycleNode):
         """Кэш последнего /human_detected (OAK-D) для SoundScanBehaviour."""
         self._human_detected = msg.data
 
+    def _human_angle_cb(self, msg: Float32):
+        """Кэш последнего /human_angle_deg (OAK-D atan2(x_mm,z_mm)) для наведения головы."""
+        self._last_human_angle = msg.data
+
     def _wake_detected_cb(self, msg: Bool):
         """Wake word в IDLE → запускаем SoundScan (поворот корпуса на голос)."""
         if not msg.data:
@@ -1421,6 +1460,7 @@ class BehaviorManagerNode(LifecycleNode):
         self.create_subscription(Bool,   '/robot_sleep',    self._robot_sleep_cb,     lqos)
         self.create_subscription(SoundDirection, '/sound_direction', self._sound_direction_cb, 10)
         self.create_subscription(Bool,   '/human_detected', self._human_detected_cb,  10)
+        self.create_subscription(Float32, '/human_angle_deg', self._human_angle_cb,   10)
 
         self.get_logger().info('BehaviorManager настроен')
         return TransitionCallbackReturn.SUCCESS
