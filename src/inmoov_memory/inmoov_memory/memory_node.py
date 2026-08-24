@@ -98,8 +98,9 @@ class MemoryNode(LifecycleNode):
         self._dp('semantic_db_path',           '/home/artur/inmoov_semantic.db')
         self._dp('chroma_path',                '/home/artur/inmoov_chroma')
         self._dp('reminder_db_path',           '/home/artur/inmoov_reminders.db')
-        self._dp('ollama_url',                 'http://192.168.10.118:11434')
-        self._dp('ollama_model',               'qwen3.6:27b')
+        self._dp('llm_url',   'http://192.168.10.118:18020/v1/chat/completions')
+        self._dp('llm_model', 'qwen3.8-27b')
+        self._dp('bearer_token', '')
         self._dp('similarity_threshold',       0.55)
         self._dp('uncertain_threshold',        0.40)
         self._dp('context_publish_rate',       30.0)
@@ -112,8 +113,9 @@ class MemoryNode(LifecycleNode):
         semantic_db  = self.get_parameter('semantic_db_path').value
         chroma_path  = self.get_parameter('chroma_path').value
         reminder_db  = self.get_parameter('reminder_db_path').value
-        ollama_url   = self.get_parameter('ollama_url').value
-        ollama_model = self.get_parameter('ollama_model').value
+        llm_url      = self.get_parameter('llm_url').value
+        llm_model    = self.get_parameter('llm_model').value
+        bearer_token = self.get_parameter('bearer_token').value
         self.sim_threshold          = self.get_parameter('similarity_threshold').value
         self.uncertain_threshold    = self.get_parameter('uncertain_threshold').value
         self._tg_reminder_person_id = self.get_parameter('telegram_reminder_person_id').value
@@ -135,8 +137,9 @@ class MemoryNode(LifecycleNode):
             db_path=episodic_db,
             semantic_db_path=semantic_db,
             chroma_path=chroma_path,
-            ollama_url=ollama_url,
-            ollama_model=ollama_model,
+            llm_url=llm_url,
+            llm_model=llm_model,
+            bearer_token=bearer_token,
         )
         self.get_logger().info(
             f'MemoryManager: episodic={episodic_db} semantic={semantic_db}')
@@ -482,7 +485,7 @@ class MemoryNode(LifecycleNode):
             f'- Отвечай ТОЛЬКО JSON-массивом, никаких пояснений'
         )
         try:
-            raw = self._mm._call_ollama(prompt, system=system)
+            raw = self._mm._call_llm(prompt, system=system)
             raw = raw.strip().lstrip('```json').lstrip('```').rstrip('```').strip()
             items = json.loads(raw)
             count = 0

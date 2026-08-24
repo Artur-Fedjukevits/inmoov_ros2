@@ -12,7 +12,7 @@ voice.launch.py — запуск всего голосового пайплай�
 
 Использование:
   ros2 launch inmoov_voice voice.launch.py
-  ros2 launch inmoov_voice voice.launch.py ollama_url:=http://localhost:11434/api/chat
+  ros2 launch inmoov_voice voice.launch.py llm_url:=http://localhost:18020/v1/chat/completions
   ros2 launch inmoov_voice voice.launch.py tavily_api_key:=tvly-...
 """
 
@@ -36,14 +36,19 @@ def generate_launch_description():
     # ── Аргументы (переопределяются из командной строки) ──────────────────────
     args = [
         # Серверы
-        DeclareLaunchArgument('ollama_url',          default_value='http://192.168.10.118:11434/api/chat'),
-        DeclareLaunchArgument('ollama_fallback_url', default_value='http://localhost:11434/api/chat'),
+        # llm_url — OpenAI-совместимый chat.completions endpoint (сейчас vLLM).
+        DeclareLaunchArgument('llm_url',
+            default_value='http://192.168.10.118:18020/v1/chat/completions'),
+        DeclareLaunchArgument('llm_fallback_url',
+            default_value='http://localhost:11434/v1/chat/completions'),
+        DeclareLaunchArgument('llm_bearer_token',
+            default_value=os.environ.get('VLLM_BEARER_TOKEN', '')),
         DeclareLaunchArgument('tts_server_url',      default_value='http://192.168.10.118:8000'),
         DeclareLaunchArgument('tts_fallback_url',    default_value='http://localhost:8000'),
         DeclareLaunchArgument('openhab_url',         default_value='http://192.168.10.118:8080'),
 
         # Модель LLM
-        DeclareLaunchArgument('llm_model',           default_value='qwen3.6:27b'),
+        DeclareLaunchArgument('llm_model',           default_value='qwen3.8-27b'),
         DeclareLaunchArgument('llm_temperature',     default_value='0.1'),
         DeclareLaunchArgument('llm_max_tokens',      default_value='512'),
 
@@ -186,8 +191,9 @@ def generate_launch_description():
             output='screen',
     
             parameters=[{
-                'ollama_url':          LaunchConfiguration('ollama_url'),
-                'ollama_fallback_url': LaunchConfiguration('ollama_fallback_url'),
+                'llm_url':             LaunchConfiguration('llm_url'),
+                'llm_fallback_url':    LaunchConfiguration('llm_fallback_url'),
+                'bearer_token':        LaunchConfiguration('llm_bearer_token'),
                 'model':               LaunchConfiguration('llm_model'),
                 'temperature':         LaunchConfiguration('llm_temperature'),
                 'max_tokens':          LaunchConfiguration('llm_max_tokens'),

@@ -25,9 +25,14 @@ def generate_launch_description():
         DeclareLaunchArgument('bt_tick_rate_hz', default_value='10.0',
                               description='Частота тика Behavior Tree'),
         DeclareLaunchArgument('greet_cooldown_sec',  default_value='120.0'),
-        DeclareLaunchArgument('ollama_url',          default_value='http://192.168.10.118:11434/api/chat'),
-        DeclareLaunchArgument('ollama_fallback_url', default_value='http://localhost:11434/api/chat'),
-        DeclareLaunchArgument('name_extract_model',  default_value='qwen3.6:27b'),
+        # llm_url — OpenAI-совместимый chat.completions endpoint (сейчас vLLM).
+        DeclareLaunchArgument('llm_url',
+            default_value='http://192.168.10.118:18020/v1/chat/completions'),
+        DeclareLaunchArgument('llm_fallback_url',
+            default_value='http://localhost:11434/v1/chat/completions'),
+        DeclareLaunchArgument('llm_bearer_token',
+            default_value=os.environ.get('VLLM_BEARER_TOKEN', '')),
+        DeclareLaunchArgument('name_extract_model',  default_value='qwen3.8-27b'),
         DeclareLaunchArgument('openhab_url',         default_value='http://192.168.10.118:8080'),
     ]
 
@@ -53,8 +58,9 @@ def generate_launch_description():
             'no_human_timeout_sec':   30.0,
             'introduce_cooldown_sec': 120.0,
             'emotion_react_thresh':   0.70,
-            'ollama_url':             LaunchConfiguration('ollama_url'),
-            'ollama_fallback_url':    LaunchConfiguration('ollama_fallback_url'),
+            'llm_url':                LaunchConfiguration('llm_url'),
+            'llm_fallback_url':       LaunchConfiguration('llm_fallback_url'),
+            'bearer_token':           LaunchConfiguration('llm_bearer_token'),
             'name_extract_model':     LaunchConfiguration('name_extract_model'),
         }],
     )

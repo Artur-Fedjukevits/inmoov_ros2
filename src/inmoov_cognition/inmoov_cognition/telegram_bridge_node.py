@@ -670,7 +670,7 @@ class TelegramBridgeNode(LifecycleNode):
             loop.run_in_executor(
                 None, self._http_check, 'http://localhost:8000/health', 3.0),
             loop.run_in_executor(
-                None, self._http_check, 'http://192.168.10.118:11434/api/version', 3.0),
+                None, self._http_check, 'http://192.168.10.118:18020/health', 3.0),
         )
 
         def _srv(label, ok, lat, _err):
@@ -699,7 +699,7 @@ class TelegramBridgeNode(LifecycleNode):
             '🖥️ *Серверы*',
             _srv('TTS RTX 3090', *tts_primary_res),
             _srv('TTS ROCm лок', *tts_local_res),
-            _srv('LLM Ollama',   *llm_res),
+            _srv('LLM vLLM',     *llm_res),
             '',
         ] + ros_lines
 

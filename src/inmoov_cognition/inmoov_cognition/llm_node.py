@@ -3,7 +3,7 @@
 """
 llm_node.py  (v2 — Генератор Намерений)
 =========================================
-LLM нода с поддержкой Ollama function calling (tools API).
+LLM нода — OpenAI-совместимый chat.completions API (vLLM), function calling (tools API).
 
 Принцип: LLM НЕ управляет TTS и сервоприводами напрямую.
 Она публикует намерение в /llm_response (текст + голос + эмоция).
@@ -52,7 +52,7 @@ from inmoov_msgs.action import Speak
 from inmoov_msgs.srv import MemoryQuery
 
 
-# ── Инструменты (OpenAI-совместимый формат для Ollama) ────────────────────────
+# ── Инструменты (OpenAI tools API) ──────────────────────────────────────────
 TOOLS = [
     {
         'type': 'function',
@@ -774,8 +774,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
     # диалога, и все статичные блоки после неё (таблица OpenHAB и т.д.)
     # приходится пересчитывать заново.
     # Сначала статика, динамика — последней. См. project_llm_backend_bench.md.
-    return f"""/no_think
-Ты робот по имени Лёня. Ты член семьи. Твоя главная задача - общение. Стараться узнать о собеседнике или семье что-то новое и сохранять в базу данных с помощью инструментов. Так же твоя задача отвечать на любые вопросы, и выполнять команды. Ты можешь управлять умным домом через OpenHAB, двигаться и выражать эмоции.
+    return f"""Ты робот по имени Лёня. Ты член семьи. Твоя главная задача - общение. Стараться узнать о собеседнике или семье что-то новое и сохранять в базу данных с помощью инструментов. Так же твоя задача отвечать на любые вопросы, и выполнять команды. Ты можешь управлять умным домом через OpenHAB, двигаться и выражать эмоции.
 Используй инструменты (tools) для выполнения команд.
 ВАЖНО: Никогда не используй азиатские языки в ответах, никаких иероглифов!
 ВАЖНО: Никогда не повторяй и не перефразируй вопрос пользователя в начале ответа. Не начинай ответ со слов "Почему", "Почём", "Зачем", "О чём", "По поводу" или любого пересказа вопроса. Отвечай сразу по существу.
@@ -881,6 +880,13 @@ def _base_url(chat_url: str) -> str:
     return f'{p.scheme}://{p.netloc}'
 
 
+def _models_url(chat_url: str) -> str:
+    """.../v1/chat/completions → .../v1/models — health-check endpoint OpenAI API."""
+    if chat_url.endswith('/chat/completions'):
+        return chat_url[: -len('/chat/completions')] + '/models'
+    return _base_url(chat_url) + '/v1/models'
+
+
 class LLMNode(LifecycleNode):
     def __init__(self):
         super().__init__('llm_node')
@@ -920,114 +926,123 @@ class LLMNode(LifecycleNode):
     @property
     def model(self) -> str:
         """Модель выбирается в зависимости от активного сервера."""
-        return self.model_primary if self._active_url == self.ollama_primary else self.model_fallback
+        return self.model_primary if self._active_url == self.llm_url else self.model_fallback
 
     # ── Проверка серверов ──────────────────────────────────────────────────
 
     def _check_servers(self):
         """Проверяет оба сервера и устанавливает активный."""
-        primary_ok  = self._probe_ollama(self.ollama_primary,  self.model_primary)
-        fallback_ok = self._probe_ollama(self.ollama_fallback, self.model_fallback)
+        primary_ok  = self._probe_llm(self.llm_url,  self.model_primary, self.bearer_token)
+        fallback_ok = self._probe_llm(self.llm_fallback_url, self.model_fallback,
+                                       self.bearer_token_fallback)
 
         if primary_ok:
-            self._active_url = self.ollama_primary
-            self.get_logger().info(f'Ollama: основной сервер доступен ({self.ollama_primary})')
+            self._active_url = self.llm_url
+            self.get_logger().info(f'LLM: основной сервер доступен ({self.llm_url})')
         elif fallback_ok:
-            self._active_url = self.ollama_fallback
+            self._active_url = self.llm_fallback_url
             self.get_logger().warn(
-                f'Основной Ollama недоступен! Используем резервный: {self.ollama_fallback}')
+                f'Основной LLM-сервер недоступен! Используем резервный: {self.llm_fallback_url}')
         else:
-            self.get_logger().error('Оба Ollama сервера недоступны!')
+            self.get_logger().error('Оба LLM-сервера недоступны!')
 
-    def _probe_ollama(self, chat_url: str, model: str) -> bool:
-        """Проверяет доступность Ollama по /api/tags. Возвращает True если OK."""
+    def _probe_llm(self, chat_url: str, model: str, bearer: str) -> bool:
+        """Проверяет доступность LLM-сервера через GET /v1/models. Возвращает True если OK."""
         try:
-            base = _base_url(chat_url)
-            r = requests.get(f'{base}/api/tags', timeout=self.connect_timeout)
-            models = [m['name'] for m in r.json().get('models', [])]
+            headers = {'Authorization': f'Bearer {bearer}'} if bearer else {}
+            r = requests.get(_models_url(chat_url), headers=headers,
+                              timeout=self.connect_timeout)
+            r.raise_for_status()
+            models = [m['id'] for m in r.json().get('data', [])]
             model_base = model.split(':')[0]
             if any(model_base in m for m in models):
-                self.get_logger().info(f'  {base}: модель {model} найдена')
+                self.get_logger().info(f'  {chat_url}: модель {model} найдена')
             else:
                 self.get_logger().warn(
-                    f'  {base}: модель {model} не найдена. '
-                    f'Запусти: ollama pull {model}')
+                    f'  {chat_url}: модель {model} не найдена среди {models}')
             return True
         except Exception:
             return False
 
-    # ── Запрос к Ollama с fallback ─────────────────────────────────────────
-
-    def _post_ollama(self, payload: dict, read_timeout: float) -> requests.Response:
-        """
-        Отправляет POST запрос к активному Ollama. При ошибке соединения
-        переключается на резервный сервер и повторяет попытку.
-        """
-        urls = [self._active_url]
-        other = self.ollama_fallback if self._active_url == self.ollama_primary else self.ollama_primary
-        if other != self._active_url:
-            urls.append(other)
-
-        _DBG_LAST  = '/tmp/llm_last_payload.json'
-        _DBG_ERROR = '/tmp/llm_error_payload.json'
-        last_exc = None
-        for url in urls:
-            try:
-                # При переключении на другой сервер обновляем модель в payload
-                if url != self._active_url:
-                    self._active_url = url
-                    payload = dict(payload)
-                    payload['model'] = self.model
-                    self.get_logger().warn(
-                        f'Переключился на резервный Ollama: {url}, модель: {self.model}')
-                try:
-                    with open(_DBG_LAST, 'w', encoding='utf-8') as _f:
-                        json.dump(payload, _f, ensure_ascii=False, indent=2)
-                except OSError:
-                    pass
-                r = requests.post(
-                    url, json=payload,
-                    timeout=(self.connect_timeout, read_timeout),
-                )
-                r.raise_for_status()
-                return r
-            except requests.exceptions.ConnectionError as e:
-                self.get_logger().warn(f'Ollama {url} недоступен: {e}')
-                last_exc = e
-            except requests.exceptions.HTTPError as e:
-                status = e.response.status_code if e.response is not None else 0
-                if status in (404, 503):
-                    self.get_logger().warn(
-                        f'Ollama {url}: HTTP {status} — пробуем резервный')
-                    last_exc = e
-                else:
-                    try:
-                        shutil.copy2(_DBG_LAST, _DBG_ERROR)
-                        self.get_logger().warn(
-                            f'Ollama HTTP {status}: payload сохранён в {_DBG_ERROR}')
-                    except OSError:
-                        pass
-                    raise
-            except requests.exceptions.Timeout as e:
-                # Таймаут чтения — не переключаемся, это нормально для тяжёлой модели
-                raise
-        raise requests.exceptions.ConnectionError(
-            f'Оба Ollama сервера недоступны') from last_exc
-
     # ── Стриминг LLM → TTS ────────────────────────────────────────────────
 
-    def _stream_ollama(self, payload: dict, read_timeout: float):
+    @staticmethod
+    def _iter_sse_chunks(resp: requests.Response):
         """
-        Стримит ответ Ollama (stream=True). Yields (delta, done, api_tool_calls).
-        При ошибке соединения пробует резервный сервер (как _post_ollama).
+        Читает OpenAI/vLLM SSE-стрим (`data: {...}` построчно, конец — `data: [DONE]`).
+        tool_calls приходят фрагментами по чанкам (id/name отдельно от arguments,
+        arguments — по несколько символов за чанк, все привязаны к одному и тому же
+        index) — аккумулируем и отдаём наружу единым разом только когда поток
+        завершён (иначе вызывающий код получил бы недо-собранный JSON в arguments).
+        Финал стрима — отдельный чанк с пустым choices и заполненным usage
+        (из-за stream_options.include_usage), ПОСЛЕ чанка с finish_reason —
+        именно по нему считаем поток done для лог-статистики токенов.
+        Yields (delta_content, done, tool_calls, raw_line, log_chunk, ttft_signal).
+        ttft_signal=True на первом реальном токене активности (текст ИЛИ первый
+        фрагмент tool_call) — т.к. сами tool_calls копятся и отдаются только в
+        done-чанке, одного `tc` недостаточно для точного TTFT (см. ниже).
+        """
+        tc_acc: dict[int, dict] = {}
+        for line in resp.iter_lines():
+            if not line or not line.startswith(b'data:'):
+                continue
+            raw = line[len(b'data:'):].strip()
+            if raw == b'[DONE]':
+                return
+            try:
+                chunk = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get('choices') or []
+            if not choices:
+                # Финальный usage-чанк (пустой choices) — конец потока.
+                if chunk.get('usage'):
+                    yield '', True, [dict(v) for v in tc_acc.values()], line, chunk, False
+                continue
+            delta = choices[0].get('delta', {}) or {}
+            first_tc_fragment = False
+            for tcd in (delta.get('tool_calls') or []):
+                idx = tcd.get('index', 0)
+                if idx not in tc_acc:
+                    first_tc_fragment = True
+                slot = tc_acc.setdefault(idx, {'function': {'name': '', 'arguments': ''}})
+                fn = tcd.get('function') or {}
+                if fn.get('name'):
+                    slot['function']['name'] += fn['name']
+                if fn.get('arguments'):
+                    slot['function']['arguments'] += fn['arguments']
+            content = delta.get('content') or ''
+            if content:
+                yield content, False, [], line, chunk, True
+            elif first_tc_fragment:
+                # tool_calls собираются целиком и отдаются только в done-чанке (см.
+                # докстринг), но первый фрагмент — реальный момент первого токена:
+                # шлём пустой "пинг" (tc=[], ttft_signal=True) — иначе TTFT в
+                # _stream_llm залогируется как "время до конца генерации".
+                yield '', False, [], line, chunk, True
+        # Соединение закрылось без финального usage-чанка (сервер не прислал
+        # include_usage, либо оборвался) — отдаём то, что успели собрать.
+        if tc_acc:
+            yield '', True, [dict(v) for v in tc_acc.values()], b'', {}, False
+
+    def _stream_llm(self, payload: dict, read_timeout: float):
+        """
+        Стримит ответ LLM через OpenAI chat.completions (stream=True).
+        Yields (delta, done, api_tool_calls). При ошибке соединения пробует
+        резервный сервер.
+
+        `payload` — уже готовое тело OpenAI-запроса (model/messages/tools/
+        temperature/max_tokens/chat_template_kwargs), собранное вызывающим
+        кодом; здесь только форсируется stream=True и добавляется
+        stream_options для usage-статистики в done-чанке.
         """
         payload = dict(payload)
         payload['stream'] = True
         payload['stream_options'] = {'include_usage': True}
 
         urls = [self._active_url]
-        other = self.ollama_fallback if self._active_url == self.ollama_primary \
-                else self.ollama_primary
+        other = self.llm_fallback_url if self._active_url == self.llm_url \
+                else self.llm_url
         if other != self._active_url:
             urls.append(other)
 
@@ -1040,47 +1055,36 @@ class LLMNode(LifecycleNode):
                     self._active_url = url
                     payload = dict(payload)
                     payload['model'] = self.model
-                    self.get_logger().warn(f'Стриминг: переключился на резервный Ollama: {url}')
+                    self.get_logger().warn(f'Стриминг: переключился на резервный сервер: {url}')
+
+                bearer  = (self.bearer_token if url == self.llm_url
+                           else self.bearer_token_fallback)
+                headers = {'Authorization': f'Bearer {bearer}'} if bearer else {}
                 try:
                     with open(_DBG_LAST, 'w', encoding='utf-8') as _f:
                         json.dump(payload, _f, ensure_ascii=False, indent=2)
                 except OSError:
                     pass
                 r = requests.post(
-                    url, json=payload,
+                    url, json=payload, headers=headers,
                     stream=True,
                     timeout=(self.connect_timeout, read_timeout),
                 )
                 r.raise_for_status()
-                _line_count = 0
-                _first_line = None
-                _t_start = time.time()
-                _ttft_logged = False
+                _first_line    = None
+                _t_start       = time.time()
+                _t_first_token = None
                 try:
-                    for line in r.iter_lines():
-                        if not line:
-                            continue
-                        _line_count += 1
-                        if _first_line is None:
-                            _first_line = line[:300]
-                        chunk = json.loads(line)
-                        msg   = chunk.get('message', {})
-                        delta = msg.get('content', '')
-                        if not _ttft_logged and delta:
-                            self.get_logger().info(f'TTFT: {time.time() - _t_start:.2f}s')
-                            _ttft_logged = True
-                        if chunk.get('done', False):
-                            p_tok = chunk.get('prompt_eval_count', 0)
-                            c_tok = chunk.get('eval_count', 0)
-                            c_dur = chunk.get('eval_duration', 0)
-                            p_dur = chunk.get('prompt_eval_duration', 0)
-                            # OpenAI-compat usage field (stream_options: include_usage)
+                    for delta, done, tc, raw_line, chunk, ttft_signal in self._iter_sse_chunks(r):
+                        if _first_line is None and raw_line:
+                            _first_line = raw_line[:300]
+                        if _t_first_token is None and ttft_signal:
+                            _t_first_token = time.time()
+                            self.get_logger().info(f'TTFT: {_t_first_token - _t_start:.2f}s')
+                        if done:
                             usage = chunk.get('usage') or {}
-                            if not p_tok:
-                                p_tok = usage.get('prompt_tokens', 0)
-                            if not c_tok:
-                                c_tok = usage.get('completion_tokens', 0)
-                                c_dur = 0
+                            p_tok = usage.get('prompt_tokens', 0)
+                            c_tok = usage.get('completion_tokens', 0)
                             think_tok = (usage.get('completion_tokens_details') or {}).get(
                                 'reasoning_tokens', 0)
                             try:
@@ -1088,19 +1092,15 @@ class LLMNode(LifecycleNode):
                                     json.dump(chunk, _f, ensure_ascii=False, indent=2)
                             except OSError:
                                 pass
-                            gen_s = (c_tok / c_dur * 1e9) if c_dur > 0 else 0
-                            pp_s  = (p_tok / p_dur * 1e9) if p_dur > 0 else 0
-                            cached = (p_tok == 0 and p_dur == 0)
-                            p_str  = '[KV cached]' if cached else f'{p_tok} ({pp_s:.0f} tok/s)'
-                            c_str  = (f'{c_tok} ({gen_s:.1f} tok/s)' if c_tok and c_dur
-                                      else f'{c_tok} tok' if c_tok
-                                      else '? (not reporting)')
+                            decode_s = ((c_tok - 1) / (time.time() - _t_first_token)
+                                        if c_tok > 1 and _t_first_token else 0)
+                            c_str = (f'{c_tok} ({decode_s:.1f} tok/s)' if decode_s
+                                     else f'{c_tok} tok' if c_tok
+                                     else '? (not reporting)')
                             self.get_logger().info(
-                                f'Tokens: prompt={p_str}, completion={c_str}, think={think_tok}'
+                                f'Tokens: prompt={p_tok}, completion={c_str}, think={think_tok}'
                             )
-                        yield (delta,
-                               chunk.get('done', False),
-                               msg.get('tool_calls') or [])
+                        yield (delta, done, tc)
                 finally:
                     if _first_line and b'"error"' in _first_line:
                         self.get_logger().warn(
@@ -1113,23 +1113,23 @@ class LLMNode(LifecycleNode):
                             pass
                 return
             except requests.exceptions.ConnectionError as e:
-                self.get_logger().warn(f'Ollama stream {url} недоступен: {e}')
+                self.get_logger().warn(f'LLM stream {url} недоступен: {e}')
                 last_exc = e
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 0
                 if status in (404, 503):
-                    self.get_logger().warn(f'Ollama stream {url}: HTTP {status}')
+                    self.get_logger().warn(f'LLM stream {url}: HTTP {status}')
                     last_exc = e
                 else:
                     try:
                         shutil.copy2(_DBG_LAST, _DBG_ERROR)
                         self.get_logger().warn(
-                            f'Ollama stream HTTP {status}: payload сохранён в {_DBG_ERROR}')
+                            f'LLM stream HTTP {status}: payload сохранён в {_DBG_ERROR}')
                     except OSError:
                         pass
                     raise
         raise requests.exceptions.ConnectionError(
-            'Оба Ollama сервера недоступны') from last_exc
+            'Оба LLM сервера недоступны') from last_exc
 
     def _send_tts_chunk(self, text: str, voice_style: str = '') -> None:
         """Отправляет предложение в tts_node или в Telegram (в TG-режиме)."""
@@ -1194,7 +1194,7 @@ class LLMNode(LifecycleNode):
             ctrl.data = f'text:{clean}'
             self._bs_ctrl_pub.publish(ctrl)
 
-        for delta, done, tc in self._stream_ollama(payload, self.timeout_sec):
+        for delta, done, tc in self._stream_llm(payload, self.timeout_sec):
             buf += delta
             content_parts.append(delta)
 
@@ -1428,7 +1428,7 @@ class LLMNode(LifecycleNode):
         self.get_logger().info(
             f'telegram_ask: req_id={req_id[:8]}, text="{text[:60]}"')
 
-    # ── Основной запрос к Ollama ───────────────────────────────────────────
+    # ── Основной запрос к LLM ───────────────────────────────────────────────
 
     def _query_llm(self, user_text: str, person_ctx_override: dict | None = None):
         _t0 = time.time()
@@ -1472,16 +1472,13 @@ class LLMNode(LifecycleNode):
                         [{'role': 'user', 'content': user_text}]
 
             payload = {
-                'model':    self.model,
-                'messages': messages,
-                'tools':    TOOLS,
-                'stream':   False,
-                'think':    False,
-                'options':  {
-                    'temperature': self.temperature,
-                    'num_predict': self.max_tokens,
-                    'num_ctx':     self.num_ctx,
-                },
+                'model':       self.model,
+                'messages':    messages,
+                'tools':       TOOLS,
+                'stream':      False,
+                'temperature': self.temperature,
+                'max_tokens':  self.max_tokens,
+                'chat_template_kwargs': {'enable_thinking': False},
             }
 
             full_content, api_tool_calls_r1 = self._stream_with_tts(payload)
@@ -1624,11 +1621,11 @@ class LLMNode(LifecycleNode):
                             [{'role': 'system', 'content': system_prompt}]
                             + _flatten_tool_history(self.history, _r2_reminder)
                         ),
-                        'tools':    tools_r2,
-                        'stream':   False,
-                        'think':    False,
-                        'options':  {'temperature': self.temperature,
-                                     'num_predict': 128, 'num_ctx': self.num_ctx},
+                        'tools':       tools_r2,
+                        'stream':      False,
+                        'temperature': self.temperature,
+                        'max_tokens':  128,
+                        'chat_template_kwargs': {'enable_thinking': False},
                     }
                     r2_content, api_tc_r2 = self._stream_with_tts(payload2)
                     resp2 = {'role': 'assistant',
@@ -1710,11 +1707,11 @@ class LLMNode(LifecycleNode):
                                         'Обязательно ответь пользователю одним коротким '
                                         'разговорным предложением — молчать нельзя.')
                                 ),
-                                'tools':    [],
-                                'stream':   True,
-                                'think':    False,
-                                'options':  {'temperature': self.temperature,
-                                             'num_predict': 128, 'num_ctx': self.num_ctx},
+                                'tools':       [],
+                                'stream':      True,
+                                'temperature': self.temperature,
+                                'max_tokens':  128,
+                                'chat_template_kwargs': {'enable_thinking': False},
                             }
                             try:
                                 r3_content, _ = self._stream_with_tts(payload3)
@@ -1751,11 +1748,11 @@ class LLMNode(LifecycleNode):
                                             'Действие выполнено. Ответь пользователю одним коротким предложением — '
                                             'продолжи разговор естественно, не упоминая факт сохранения.')
                                     ),
-                                    'tools':    [],
-                                    'stream':   False,
-                                    'think':    False,
-                                    'options':  {'temperature': self.temperature,
-                                                 'num_predict': 64, 'num_ctx': self.num_ctx},
+                                    'tools':       [],
+                                    'stream':      False,
+                                    'temperature': self.temperature,
+                                    'max_tokens':  64,
+                                    'chat_template_kwargs': {'enable_thinking': False},
                                 }
                                 try:
                                     r3_content, _ = self._stream_with_tts(payload3)
@@ -1781,10 +1778,10 @@ class LLMNode(LifecycleNode):
                 self._publish_response('', streamed=True)
 
         except requests.exceptions.ConnectionError as e:
-            self.get_logger().error(f'Ollama недоступен (оба сервера): {e}')
+            self.get_logger().error(f'LLM недоступен (оба сервера): {e}')
             self._publish_response('Извини, не могу связаться с сервером обработки. Попробуй позже.')
         except requests.exceptions.Timeout:
-            self.get_logger().error(f'Таймаут Ollama после {time.time()-_t0:.1f}с (лимит={self.timeout_sec}с)')
+            self.get_logger().error(f'Таймаут LLM после {time.time()-_t0:.1f}с (лимит={self.timeout_sec}с)')
             self._publish_response('Извини, сервер слишком долго не отвечает. Попробуй задать вопрос покороче.')
         except Exception as e:
             self.get_logger().error(f'Ошибка LLM: {e}')
@@ -2335,7 +2332,7 @@ class LLMNode(LifecycleNode):
         # Переслать ответ в Telegram если запрос пришёл через /telegram_ask
         if tg_req_id:
             # streamed=True: текст уже доставлен через partial-чанки, шлём пустой сигнал "стоп"
-            # streamed=False: текст — это error-строка (недоступен Ollama и т.п.)
+            # streamed=False: текст — это error-строка (недоступен LLM и т.п.)
             tg_text = '' if streamed else text
             tg_resp = String()
             tg_resp.data = json.dumps(
@@ -2542,13 +2539,17 @@ class LLMNode(LifecycleNode):
             self.declare_parameter(name, default)
 
     def on_configure(self, state):
-        self._dp('ollama_url',          'http://192.168.10.118:11434/api/chat')
-        self._dp('ollama_fallback_url', 'http://localhost:11434/api/chat')
-        self._dp('model',               'qwen3.6:27b')
+        # llm_url — основной бэкенд, OpenAI-совместимый chat.completions endpoint
+        # (сейчас vLLM). bearer_token обязателен для него. llm_fallback_url — резервный
+        # (сейчас локальный NUC — станет OpenAI-совместимым позже, пока не рабочий).
+        self._dp('llm_url',             'http://192.168.10.118:18020/v1/chat/completions')
+        self._dp('llm_fallback_url',    'http://localhost:11434/v1/chat/completions')
+        self._dp('bearer_token',          '')  # для llm_url (vLLM)
+        self._dp('bearer_token_fallback', '')  # для llm_fallback_url, если понадобится
+        self._dp('model',               'qwen3.8-27b')
         self._dp('model_fallback',      'qwen2.5:7b')
         self._dp('temperature',         0.1)
         self._dp('max_tokens',          512)
-        self._dp('num_ctx',             8192)
         self._dp('connect_timeout_sec', 5.0)
         self._dp('timeout_sec',         120.0)
         self._dp('keep_history',        True)
@@ -2559,13 +2560,14 @@ class LLMNode(LifecycleNode):
         self._dp('cast_volume',         80)
         self._dp('cast_to_file_url',    'http://192.168.10.118:8000/tts/to_file')
 
-        self.ollama_primary    = self.get_parameter('ollama_url').value
-        self.ollama_fallback   = self.get_parameter('ollama_fallback_url').value
+        self.llm_url            = self.get_parameter('llm_url').value
+        self.llm_fallback_url   = self.get_parameter('llm_fallback_url').value
+        self.bearer_token          = self.get_parameter('bearer_token').value
+        self.bearer_token_fallback = self.get_parameter('bearer_token_fallback').value
         self.model_primary     = self.get_parameter('model').value
         self.model_fallback    = self.get_parameter('model_fallback').value
         self.temperature       = self.get_parameter('temperature').value
         self.max_tokens        = self.get_parameter('max_tokens').value
-        self.num_ctx           = self.get_parameter('num_ctx').value
         self.connect_timeout   = self.get_parameter('connect_timeout_sec').value
         self.timeout_sec       = self.get_parameter('timeout_sec').value
         self.keep_history      = self.get_parameter('keep_history').value
@@ -2575,7 +2577,7 @@ class LLMNode(LifecycleNode):
         self._tts_fallback_url = self.get_parameter('tts_fallback_url').value
         self._cast_volume      = self.get_parameter('cast_volume').value
         self._cast_to_file_url = self.get_parameter('cast_to_file_url').value
-        self._active_url       = self.ollama_primary
+        self._active_url       = self.llm_url
 
         _latched = QoSProfile(
             depth=1,
@@ -2631,21 +2633,18 @@ class LLMNode(LifecycleNode):
                 oh_schema = self._oh_schema
             sys_prompt = build_system_prompt(oh_schema, None, '')
             payload = {
-                'model':   self.model,
+                'model':    self.model,
                 'messages': [
                     {'role': 'system', 'content': sys_prompt},
                     {'role': 'user',   'content': 'Привет'},
                 ],
-                'tools':   TOOLS,
-                'stream':  False,
-                'think':   False,
-                'options': {
-                    'temperature': 0.0,
-                    'num_predict': 3,
-                    'num_ctx':     self.num_ctx,
-                },
+                'tools':       TOOLS,
+                'stream':      False,
+                'temperature': 0.0,
+                'max_tokens':  3,
+                'chat_template_kwargs': {'enable_thinking': False},
             }
-            for _ in self._stream_ollama(payload, read_timeout=120.0):
+            for _ in self._stream_llm(payload, read_timeout=120.0):
                 pass
             self.get_logger().info(f'LLM прогрев завершён за {time.time()-_t:.1f}с')
         except Exception as e:

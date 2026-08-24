@@ -37,10 +37,13 @@ def generate_launch_description():
 
     args = [
         # Серверы
-        DeclareLaunchArgument('ollama_url',
-            default_value='http://192.168.10.118:11434/api/chat'),
-        DeclareLaunchArgument('ollama_fallback_url',
-            default_value='http://localhost:11434/api/chat'),
+        # llm_url — OpenAI-совместимый chat.completions endpoint (сейчас vLLM).
+        DeclareLaunchArgument('llm_url',
+            default_value='http://192.168.10.118:18020/v1/chat/completions'),
+        DeclareLaunchArgument('llm_fallback_url',
+            default_value='http://localhost:11434/v1/chat/completions'),
+        DeclareLaunchArgument('llm_bearer_token',
+            default_value=os.environ.get('VLLM_BEARER_TOKEN', '')),
         DeclareLaunchArgument('tts_server_url',
             default_value='http://192.168.10.118:8000'),
         DeclareLaunchArgument('tts_fallback_url',
@@ -50,7 +53,7 @@ def generate_launch_description():
 
         # LLM
         DeclareLaunchArgument('llm_model',
-            default_value='qwen3.6:27b'),
+            default_value='qwen3.8-27b'),
 
         # Wake word
         DeclareLaunchArgument('wakeword_model',
@@ -121,8 +124,9 @@ def generate_launch_description():
             ])
         ]),
         launch_arguments={
-            'ollama_url':          LaunchConfiguration('ollama_url'),
-            'ollama_fallback_url': LaunchConfiguration('ollama_fallback_url'),
+            'llm_url':             LaunchConfiguration('llm_url'),
+            'llm_fallback_url':    LaunchConfiguration('llm_fallback_url'),
+            'llm_bearer_token':    LaunchConfiguration('llm_bearer_token'),
             'tts_server_url':      LaunchConfiguration('tts_server_url'),
             'tts_fallback_url':    LaunchConfiguration('tts_fallback_url'),
             'openhab_url':         LaunchConfiguration('openhab_url'),
@@ -145,8 +149,9 @@ def generate_launch_description():
         launch_arguments={
             'tavily_api_key':      LaunchConfiguration('tavily_api_key'),
             'greet_cooldown_sec':  LaunchConfiguration('greet_cooldown_sec'),
-            'ollama_url':          LaunchConfiguration('ollama_url'),
-            'ollama_fallback_url': LaunchConfiguration('ollama_fallback_url'),
+            'llm_url':             LaunchConfiguration('llm_url'),
+            'llm_fallback_url':    LaunchConfiguration('llm_fallback_url'),
+            'llm_bearer_token':    LaunchConfiguration('llm_bearer_token'),
             'name_extract_model':  LaunchConfiguration('llm_model'),
             'openhab_url':         LaunchConfiguration('openhab_url'),
         }.items(),
@@ -162,6 +167,9 @@ def generate_launch_description():
         parameters=[{
             'db_path':              LaunchConfiguration('memory_db_path'),
             'similarity_threshold': 0.55,
+            'llm_url':              LaunchConfiguration('llm_url'),
+            'llm_model':            LaunchConfiguration('llm_model'),
+            'bearer_token':         LaunchConfiguration('llm_bearer_token'),
         }],
     )
 

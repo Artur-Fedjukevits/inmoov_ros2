@@ -7,8 +7,8 @@ diagnose.py — Диагностика всех компонентов InMoov Vo
     python3 src/inmoov_voice/scripts/diagnose.py --quick   # без inference-тестов
 
 Проверяет:
-  - Сетевые сервисы (Ollama, TTS, OpenHAB)
-  - Модели (загружены ли в Ollama, LLM inference)
+  - Сетевые сервисы (vLLM, TTS, OpenHAB)
+  - Модели (загружены ли в vLLM, LLM inference)
   - Файловую систему (wake word модель)
   - Аудио устройства
   - Python пакеты
@@ -58,12 +58,13 @@ class Check:
 # ── Конфиг ────────────────────────────────────────────────────────────────────
 
 PRIMARY_HOST    = '192.168.10.118'
-OLLAMA_PRIMARY  = f'http://{PRIMARY_HOST}:11434'
-OLLAMA_LOCAL    = 'http://localhost:11434'
+LLM_PRIMARY     = f'http://{PRIMARY_HOST}:18020'   # vLLM, OpenAI-совместимый API
+LLM_LOCAL       = 'http://localhost:18020'
+LLM_BEARER      = os.environ.get('VLLM_BEARER_TOKEN', '')
 TTS_PRIMARY     = f'http://{PRIMARY_HOST}:8000'
 TTS_LOCAL       = 'http://localhost:8000'
 OPENHAB_URL     = f'http://{PRIMARY_HOST}:8080'
-LLM_MODEL       = 'qwen2.5:14b-instruct-q8_0'
+LLM_MODEL       = 'qwen3.8-27b'
 WAKEWORD_MODEL  = '/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'
 TIMEOUT         = 4.0
 
@@ -89,10 +90,11 @@ def _probe(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
-def _ollama_models(base_url: str) -> list[str]:
+def _llm_models(base_url: str) -> list[str]:
     try:
-        r = _get(f'{base_url}/api/tags')
-        return [m['name'] for m in r.json().get('models', [])]
+        headers = {'Authorization': f'Bearer {LLM_BEARER}'} if LLM_BEARER else {}
+        r = _get(f'{base_url}/v1/models', headers=headers)
+        return [m['id'] for m in r.json().get('data', [])]
     except Exception:
         return []
 
@@ -108,17 +110,17 @@ def _tts_health(url: str) -> Optional[dict]:
 # СЕКЦИИ ПРОВЕРОК
 # ══════════════════════════════════════════════════════════════════════════════
 
-def check_ollama(quick: bool) -> list[Check]:
+def check_llm(quick: bool) -> list[Check]:
     checks = []
 
-    for label, base_url in [('Основной (RTX 3090)', OLLAMA_PRIMARY),
-                              ('Локальный (CPU/ROCm)', OLLAMA_LOCAL)]:
-        name = f'Ollama {label}'
-        if not _probe(base_url):
+    for label, base_url in [('Основной (vLLM, RTX 3090)', LLM_PRIMARY),
+                              ('Локальный (NUC)', LLM_LOCAL)]:
+        name = f'LLM {label}'
+        if not _probe(f'{base_url}/health'):
             checks.append(Check(name, 'fail', f'Недоступен ({base_url})'))
             continue
 
-        models = _ollama_models(base_url)
+        models = _llm_models(base_url)
         model_base = LLM_MODEL.split(':')[0]
         found = [m for m in models if model_base in m]
 
@@ -126,31 +128,35 @@ def check_ollama(quick: bool) -> list[Check]:
             checks.append(Check(name, 'ok', f'{base_url}', f'Модель: {found[0]}'))
         else:
             checks.append(Check(
-                name, 'warn', f'{base_url} — сервер ОК, но модель не загружена',
-                f'Запусти: ollama pull {LLM_MODEL}\nДоступные: {models[:5]}'
+                name, 'warn', f'{base_url} — сервер ОК, но модель не найдена',
+                f'Ожидалась: {LLM_MODEL}\nДоступные: {models[:5]}'
             ))
 
     # Inference тест (только основного, не quick)
-    if not quick and _probe(OLLAMA_PRIMARY):
-        models = _ollama_models(OLLAMA_PRIMARY)
+    if not quick and _probe(f'{LLM_PRIMARY}/health'):
+        models = _llm_models(LLM_PRIMARY)
         model_base = LLM_MODEL.split(':')[0]
         if any(model_base in m for m in models):
-            name = 'Ollama inference'
+            name = 'LLM inference'
             try:
                 t0 = time.time()
                 import requests as req
+                headers = {'Authorization': f'Bearer {LLM_BEARER}'} if LLM_BEARER else {}
                 r = req.post(
-                    f'{OLLAMA_PRIMARY}/api/chat',
+                    f'{LLM_PRIMARY}/v1/chat/completions',
+                    headers=headers,
                     json={
                         'model': LLM_MODEL,
                         'messages': [{'role': 'user', 'content': 'Привет.'}],
                         'stream': False,
-                        'options': {'num_predict': 5},
+                        'max_tokens': 5,
+                        'chat_template_kwargs': {'enable_thinking': False},
                     },
                     timeout=30.0,
                 )
                 dt = time.time() - t0
-                text = r.json().get('message', {}).get('content', '').strip()
+                choices = r.json().get('choices') or []
+                text = (choices[0].get('message', {}).get('content', '') if choices else '').strip()
                 checks.append(Check(
                     name, 'ok', f'Ответ за {dt:.1f}с', f'Текст: "{text}"'
                 ))
@@ -482,7 +488,7 @@ def main():
         ('🔌  ROS2 окружение',   check_ros2_env()),
         ('📦  Python пакеты',    check_python_packages()),
         ('📁  Файловая система', check_filesystem()),
-        ('🧠  Ollama LLM',       check_ollama(args.quick)),
+        ('🧠  vLLM',             check_llm(args.quick)),
         ('🔊  TTS Server',       check_tts(args.quick)),
         ('🏠  OpenHAB',          check_openhab()),
     ]

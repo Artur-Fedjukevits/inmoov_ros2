@@ -1,7 +1,7 @@
 """
 test_nodes.py — тесты запуска ROS2 нод и передачи сообщений.
 
-HTTP-запросы к Ollama/TTS мокаются, поэтому тесты работают без сервисов.
+HTTP-запросы к LLM (vLLM/OpenAI API)/TTS мокаются, поэтому тесты работают без сервисов.
 Для запуска нужен sourced workspace:
 
     source install/setup.bash
@@ -55,19 +55,20 @@ def wait_for(condition, timeout: float = 5.0, interval: float = 0.05) -> bool:
 
 # ── Моки для HTTP-ответов ──────────────────────────────────────────────────────
 
-def _make_ollama_mock(model: str = 'qwen2.5'):
-    """Мок requests для LLMNode: _probe_ollama → ОК, _post_ollama → текстовый ответ."""
+def _make_llm_mock(model: str = 'qwen3.8-27b'):
+    """Мок requests для LLMNode (OpenAI chat.completions API, vLLM):
+    _probe_llm → ОК (/v1/models), обычный POST → текстовый ответ."""
     mock = MagicMock()
-    # GET /api/tags
-    tags_resp = MagicMock()
-    tags_resp.json.return_value = {'models': [{'name': model}]}
-    # POST /api/chat
+    # GET /v1/models
+    models_resp = MagicMock()
+    models_resp.json.return_value = {'data': [{'id': model}]}
+    # POST /v1/chat/completions
     chat_resp = MagicMock()
     chat_resp.status_code = 200
     chat_resp.json.return_value = {
-        'message': {'role': 'assistant', 'content': 'Тестовый ответ.', 'tool_calls': []}
+        'choices': [{'message': {'role': 'assistant', 'content': 'Тестовый ответ.'}}]
     }
-    mock.get.return_value  = tags_resp
+    mock.get.return_value  = models_resp
     mock.post.return_value = chat_resp
     mock.Session.return_value = MagicMock()
     mock.exceptions.ConnectionError = ConnectionError
@@ -110,9 +111,9 @@ class TestROS2Init:
 @pytest.mark.nodes
 class TestLLMNode:
     def test_startup(self, ros):
-        """LLMNode запускается без ошибок (Ollama замокан)."""
+        """LLMNode запускается без ошибок (LLM замокан)."""
         from inmoov_cognition.llm_node import LLMNode
-        with patch('inmoov_cognition.llm_node.requests', _make_ollama_mock()):
+        with patch('inmoov_cognition.llm_node.requests', _make_llm_mock()):
             node = LLMNode()
         assert node is not None
         node.destroy_node()
@@ -120,7 +121,7 @@ class TestLLMNode:
     def test_subscriptions_exist(self, ros):
         """LLMNode подписан на нужные топики."""
         from inmoov_cognition.llm_node import LLMNode
-        with patch('inmoov_cognition.llm_node.requests', _make_ollama_mock()):
+        with patch('inmoov_cognition.llm_node.requests', _make_llm_mock()):
             node = LLMNode()
 
         # get_subscriptions_info_by_topic возвращает список TopicEndpointInfo объектов
@@ -134,7 +135,7 @@ class TestLLMNode:
     def test_has_action_client(self, ros):
         """LLMNode создаёт ActionClient для speak."""
         from inmoov_cognition.llm_node import LLMNode
-        with patch('inmoov_cognition.llm_node.requests', _make_ollama_mock()):
+        with patch('inmoov_cognition.llm_node.requests', _make_llm_mock()):
             node = LLMNode()
         assert hasattr(node, '_tts_client'), 'Нет атрибута _tts_client'
         assert isinstance(node._tts_client, ActionClient)
@@ -143,7 +144,7 @@ class TestLLMNode:
     def test_pending_speech_queue(self, ros):
         """_pending_speech — очередь размером 1, старое значение заменяется."""
         from inmoov_cognition.llm_node import LLMNode
-        with patch('inmoov_cognition.llm_node.requests', _make_ollama_mock()):
+        with patch('inmoov_cognition.llm_node.requests', _make_llm_mock()):
             node = LLMNode()
 
         node._publish_response('первый текст')
@@ -156,7 +157,7 @@ class TestLLMNode:
     def test_empty_text_ignored(self, ros):
         """Пустой текст не попадает в очередь."""
         from inmoov_cognition.llm_node import LLMNode
-        with patch('inmoov_cognition.llm_node.requests', _make_ollama_mock()):
+        with patch('inmoov_cognition.llm_node.requests', _make_llm_mock()):
             node = LLMNode()
 
         node._publish_response('')
@@ -167,7 +168,7 @@ class TestLLMNode:
     def test_history_trimming(self, ros):
         """История разговора не превышает history_max * 2 сообщений."""
         from inmoov_cognition.llm_node import LLMNode
-        with patch('inmoov_cognition.llm_node.requests', _make_ollama_mock()):
+        with patch('inmoov_cognition.llm_node.requests', _make_llm_mock()):
             node = LLMNode()
         max_turns = node.history_max
 

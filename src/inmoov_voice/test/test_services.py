@@ -10,19 +10,26 @@ test_services.py — проверка доступности всех внешн
     pytest src/inmoov_voice/test/test_services.py -v --tb=short
 """
 
+import os
+
 import pytest
 import requests
 
 # ── Адреса сервисов ────────────────────────────────────────────────────────────
-PRIMARY_HOST   = '192.168.10.118'
-OLLAMA_PRIMARY = f'http://{PRIMARY_HOST}:11434'
-OLLAMA_LOCAL   = 'http://localhost:11434'
-TTS_PRIMARY    = f'http://{PRIMARY_HOST}:8000'
-TTS_LOCAL      = 'http://localhost:8000'
-OPENHAB_URL    = f'http://{PRIMARY_HOST}:8080'
+PRIMARY_HOST = '192.168.10.118'
+LLM_PRIMARY  = f'http://{PRIMARY_HOST}:18020'   # vLLM, OpenAI-совместимый API
+LLM_LOCAL    = 'http://localhost:18020'
+LLM_BEARER   = os.environ.get('VLLM_BEARER_TOKEN', '')
+TTS_PRIMARY  = f'http://{PRIMARY_HOST}:8000'
+TTS_LOCAL    = 'http://localhost:8000'
+OPENHAB_URL  = f'http://{PRIMARY_HOST}:8080'
 
-LLM_MODEL = 'qwen2.5:14b-instruct-q8_0'
+LLM_MODEL = 'qwen3.8-27b'
 TIMEOUT   = 5.0
+
+
+def _llm_headers():
+    return {'Authorization': f'Bearer {LLM_BEARER}'} if LLM_BEARER else {}
 
 
 def _get(url, **kwargs):
@@ -38,76 +45,77 @@ def _server_available(base_url: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Ollama
+# LLM (vLLM, OpenAI-совместимый API)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.services
-class TestOllama:
+class TestLLM:
     def test_primary_reachable(self):
-        """Основной сервер 192.168.10.118:11434 доступен."""
-        if not _server_available(OLLAMA_PRIMARY):
-            pytest.skip(f'Ollama primary недоступен ({OLLAMA_PRIMARY})')
-        r = _get(f'{OLLAMA_PRIMARY}/api/tags')
+        """Основной сервер 192.168.10.118:18020 (vLLM) доступен."""
+        if not _server_available(LLM_PRIMARY):
+            pytest.skip(f'LLM primary недоступен ({LLM_PRIMARY})')
+        r = _get(f'{LLM_PRIMARY}/v1/models', headers=_llm_headers())
         assert r.status_code == 200, f'Ожидался 200, получен {r.status_code}'
 
     def test_primary_has_llm_model(self):
-        """Модель qwen2.5:14b-instruct-q8_0 загружена на основном сервере."""
-        if not _server_available(OLLAMA_PRIMARY):
-            pytest.skip(f'Ollama primary недоступен ({OLLAMA_PRIMARY})')
-        r = _get(f'{OLLAMA_PRIMARY}/api/tags')
-        models = [m['name'] for m in r.json().get('models', [])]
+        """Модель qwen3.8-27b загружена на основном сервере."""
+        if not _server_available(LLM_PRIMARY):
+            pytest.skip(f'LLM primary недоступен ({LLM_PRIMARY})')
+        r = _get(f'{LLM_PRIMARY}/v1/models', headers=_llm_headers())
+        models = [m['id'] for m in r.json().get('data', [])]
         model_base = LLM_MODEL.split(':')[0]
         found = any(model_base in m for m in models)
         assert found, (
-            f'Модель {LLM_MODEL} не найдена на {OLLAMA_PRIMARY}.\n'
-            f'Доступные: {models}\n'
-            f'Запусти: ollama pull {LLM_MODEL}'
+            f'Модель {LLM_MODEL} не найдена на {LLM_PRIMARY}.\n'
+            f'Доступные: {models}'
         )
 
     def test_primary_inference(self):
-        """Ollama primary отвечает на простой запрос (проверка GPU/inference)."""
-        if not _server_available(OLLAMA_PRIMARY):
-            pytest.skip(f'Ollama primary недоступен ({OLLAMA_PRIMARY})')
-        models = _get(f'{OLLAMA_PRIMARY}/api/tags').json().get('models', [])
+        """vLLM primary отвечает на простой запрос (проверка GPU/inference)."""
+        if not _server_available(LLM_PRIMARY):
+            pytest.skip(f'LLM primary недоступен ({LLM_PRIMARY})')
+        models = _get(f'{LLM_PRIMARY}/v1/models', headers=_llm_headers()).json().get('data', [])
         model_base = LLM_MODEL.split(':')[0]
-        if not any(model_base in m['name'] for m in models):
+        if not any(model_base in m['id'] for m in models):
             pytest.skip(f'Модель {LLM_MODEL} не загружена')
 
         r = requests.post(
-            f'{OLLAMA_PRIMARY}/api/chat',
+            f'{LLM_PRIMARY}/v1/chat/completions',
+            headers=_llm_headers(),
             json={
                 'model': LLM_MODEL,
                 'messages': [{'role': 'user', 'content': 'Привет, скажи одно слово.'}],
                 'stream': False,
-                'options': {'num_predict': 5},
+                'max_tokens': 5,
+                'chat_template_kwargs': {'enable_thinking': False},
             },
             timeout=30.0,
         )
         assert r.status_code == 200
-        text = r.json().get('message', {}).get('content', '')
-        assert len(text) > 0, 'Ollama вернул пустой ответ'
-        print(f'\n  Ollama ответ: "{text}"')
+        choices = r.json().get('choices') or []
+        text = choices[0].get('message', {}).get('content', '') if choices else ''
+        assert len(text) > 0, 'LLM вернул пустой ответ'
+        print(f'\n  LLM ответ: "{text}"')
 
     def test_local_reachable(self):
-        """Локальный Ollama (localhost:11434) доступен как fallback."""
-        if not _server_available(OLLAMA_LOCAL):
-            pytest.skip(f'Локальный Ollama недоступен ({OLLAMA_LOCAL})')
-        r = _get(f'{OLLAMA_LOCAL}/api/tags')
+        """Локальный LLM (localhost:18020) доступен как fallback."""
+        if not _server_available(LLM_LOCAL):
+            pytest.skip(f'Локальный LLM недоступен ({LLM_LOCAL})')
+        r = _get(f'{LLM_LOCAL}/v1/models', headers=_llm_headers())
         assert r.status_code == 200
 
     def test_local_has_llm_model(self):
-        """Модель загружена на локальном Ollama (fallback)."""
-        if not _server_available(OLLAMA_LOCAL):
-            pytest.skip(f'Локальный Ollama недоступен ({OLLAMA_LOCAL})')
-        r = _get(f'{OLLAMA_LOCAL}/api/tags')
-        models = [m['name'] for m in r.json().get('models', [])]
+        """Модель загружена на локальном LLM (fallback)."""
+        if not _server_available(LLM_LOCAL):
+            pytest.skip(f'Локальный LLM недоступен ({LLM_LOCAL})')
+        r = _get(f'{LLM_LOCAL}/v1/models', headers=_llm_headers())
+        models = [m['id'] for m in r.json().get('data', [])]
         model_base = LLM_MODEL.split(':')[0]
         found = any(model_base in m for m in models)
         if not found:
             pytest.fail(
-                f'Локальный Ollama работает, но модель {LLM_MODEL} не загружена.\n'
-                f'Доступные: {models}\n'
-                f'Запусти: ollama pull {LLM_MODEL}'
+                f'Локальный LLM работает, но модель {LLM_MODEL} не загружена.\n'
+                f'Доступные: {models}'
             )
 
 

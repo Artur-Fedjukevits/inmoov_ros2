@@ -44,12 +44,14 @@ class MemoryManager:
         self,
         db_path: str = "memory.db",
         chroma_path: str = "./chroma",
-        ollama_url: str = "http://localhost:11434",
-        ollama_model: str = "qwen2.5:14b",
+        llm_url: str = "http://192.168.10.118:18020/v1/chat/completions",
+        llm_model: str = "qwen3.8-27b",
+        bearer_token: str = "",
         semantic_db_path: Optional[str] = None,
     ) -> None:
-        self.ollama_url = ollama_url
-        self.ollama_model = ollama_model
+        self.llm_url = llm_url
+        self.llm_model = llm_model
+        self.bearer_token = bearer_token
 
         # Три слоя памяти (episodic и semantic могут использовать разные БД)
         self.working = WorkingMemory()
@@ -94,7 +96,7 @@ class MemoryManager:
     # ------------------------------------------------------------------
 
     def get_tool_definitions(self) -> list[dict]:
-        """Возвращает описание инструментов для передачи в LLM (Ollama format)."""
+        """Возвращает описание инструментов для передачи в LLM (OpenAI tools format)."""
         return [
             {
                 "type": "function",
@@ -227,7 +229,7 @@ class MemoryManager:
     def after_conversation(self, dialogue_text: str, participants: list[str] | None = None) -> None:
         """
         Сохраняет эпизод и извлекает факты из завершённого диалога.
-        Использует Ollama для генерации резюме и извлечения фактов.
+        Использует LLM (OpenAI chat.completions API) для генерации резюме и извлечения фактов.
         """
         participants = participants or []
 
@@ -258,11 +260,11 @@ class MemoryManager:
             logger.info("Извлечено %d фактов, сохранено %d", len(facts), saved)
 
     # ------------------------------------------------------------------
-    # Вспомогательные LLM-вызовы (Ollama)
+    # Вспомогательные LLM-вызовы (OpenAI chat.completions API — vLLM)
     # ------------------------------------------------------------------
 
-    def _call_ollama(self, prompt: str, system: str = "") -> str:
-        """Синхронный вызов через /api/chat (совместим с llama.cpp и Ollama)."""
+    def _call_llm(self, prompt: str, system: str = "") -> str:
+        """Синхронный нестриминговый вызов OpenAI-совместимого chat.completions."""
         import urllib.request
 
         messages = []
@@ -271,30 +273,23 @@ class MemoryManager:
         messages.append({"role": "user", "content": prompt})
 
         payload = {
-            "model": self.ollama_model,
+            "model": self.llm_model,
             "messages": messages,
-            "stream": True,
-            "options": {"temperature": 0.1, "num_predict": 512},
+            "stream": False,
+            "temperature": 0.1,
+            "max_tokens": 512,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         data = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            f"{self.ollama_url}/api/chat",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        parts = []
+        headers = {"Content-Type": "application/json"}
+        if self.bearer_token:
+            headers["Authorization"] = f"Bearer {self.bearer_token}"
+        req = urllib.request.Request(self.llm_url, data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as resp:
-            for raw_line in resp:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                chunk = json.loads(line)
-                content = chunk.get("message", {}).get("content", "")
-                if content:
-                    parts.append(content)
-                if chunk.get("done"):
-                    break
-        return "".join(parts).strip()
+            result = json.loads(resp.read())
+        choices = result.get("choices") or []
+        content = choices[0].get("message", {}).get("content", "") if choices else ""
+        return content.strip()
 
     def _summarize(self, dialogue_text: str) -> str:
         """Генерирует краткое (1–2 предложения) резюме диалога."""
@@ -303,7 +298,7 @@ class MemoryManager:
             f"Отвечай только резюме, без лишних слов.\n\n{dialogue_text}"
         )
         try:
-            return self._call_ollama(prompt)
+            return self._call_llm(prompt)
         except Exception:
             # Fallback: первые 200 символов
             return dialogue_text[:200].replace("\n", " ")
@@ -338,7 +333,7 @@ class MemoryManager:
             f"{dialogue_text}"
         )
         try:
-            raw = self._call_ollama(prompt, system=system)
+            raw = self._call_llm(prompt, system=system)
             # Убираем возможные markdown-обёртки
             raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
             facts = json.loads(raw)

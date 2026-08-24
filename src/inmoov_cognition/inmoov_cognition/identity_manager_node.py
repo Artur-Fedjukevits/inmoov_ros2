@@ -858,7 +858,8 @@ class IdentityManagerNode(LifecycleNode):
                 self.get_logger().info(f'Имя из regex (короткая фраза): "{names[0]}"')
                 return names[0]
 
-        # Резерв — LLM для сложных случаев (используем ту же модель что уже загружена)
+        # Резерв — LLM для сложных случаев (используем ту же модель что уже загружена).
+        # Короткий нестриминговый запрос — не нужна SSE-задержка ради 10 токенов.
         payload = {
             'model': self._name_model,
             'messages': [
@@ -872,22 +873,18 @@ class IdentityManagerNode(LifecycleNode):
                 },
                 {'role': 'user', 'content': text},
             ],
-            'stream':  True,
-            'options': {'temperature': 0.0, 'num_predict': 10},
+            'stream':      False,
+            'temperature': 0.0,
+            'max_tokens':  10,
+            'chat_template_kwargs': {'enable_thinking': False},
         }
-        for url in [self._ollama_primary, self._ollama_fallback]:
+        headers = {'Authorization': f'Bearer {self._bearer_token}'} if self._bearer_token else {}
+        for url in [self._llm_url, self._llm_fallback_url]:
             try:
-                r = requests.post(url, json=payload, stream=True, timeout=(3.0, 25.0))
+                r = requests.post(url, json=payload, headers=headers, timeout=(3.0, 25.0))
                 r.raise_for_status()
-                parts = []
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    chunk = json.loads(line)
-                    parts.append(chunk.get('message', {}).get('content', ''))
-                    if chunk.get('done'):
-                        break
-                name = ''.join(parts).strip()
+                choices = r.json().get('choices') or []
+                name = (choices[0].get('message', {}).get('content', '') if choices else '').strip()
                 if name.upper() == 'UNKNOWN' or not name:
                     return None
                 name = name.split()[0].strip('.,!?"\'')
@@ -1671,11 +1668,12 @@ class IdentityManagerNode(LifecycleNode):
         self._dp('track_eye_fallback_sec',        2.0)
         self._dp('post_goodbye_ignore_sec',    1800.0)
         self._dp('post_goodbye_track_block_sec', 30.0)
-        self._dp('ollama_url', 'http://192.168.10.118:11434/api/chat')
+        self._dp('llm_url', 'http://192.168.10.118:18020/v1/chat/completions')
         self._dp('voice_high_threshold',    0.62)
         self._dp('voice_uncertain_threshold', 0.50)
-        self._dp('ollama_fallback_url', 'http://localhost:11434/api/chat')
-        self._dp('name_extract_model', 'qwen3.6:27b')
+        self._dp('llm_fallback_url', 'http://localhost:11434/v1/chat/completions')
+        self._dp('bearer_token', '')
+        self._dp('name_extract_model', 'qwen3.8-27b')
         self._dp('gaze_yaw_threshold',  0.30)
         self._dp('gaze_frontal_fraction', 0.50)
 
@@ -1691,8 +1689,9 @@ class IdentityManagerNode(LifecycleNode):
         self._track_eye_fallback_sec       = self.get_parameter('track_eye_fallback_sec').value
         self._post_goodbye_ignore_sec      = self.get_parameter('post_goodbye_ignore_sec').value
         self._post_goodbye_track_block_sec = self.get_parameter('post_goodbye_track_block_sec').value
-        self._ollama_primary               = self.get_parameter('ollama_url').value
-        self._ollama_fallback              = self.get_parameter('ollama_fallback_url').value
+        self._llm_url                      = self.get_parameter('llm_url').value
+        self._llm_fallback_url             = self.get_parameter('llm_fallback_url').value
+        self._bearer_token                 = self.get_parameter('bearer_token').value
         self._name_model                   = self.get_parameter('name_extract_model').value
         self._voice_high_threshold         = self.get_parameter('voice_high_threshold').value
         self._voice_uncertain_threshold    = self.get_parameter('voice_uncertain_threshold').value
