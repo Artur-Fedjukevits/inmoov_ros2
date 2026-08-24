@@ -479,7 +479,7 @@ def generate_launch_description():
             'dead_zone_px':       20,
             'head_dead_zone_px':  80,
             'eye_limit_deg':      8.0,
-            'return_timeout_sec': 3.0,
+            'return_timeout_sec': 7.0,  # было 3.0 — слишком мало для догона после наведения по OAK-D (2026-08-24)
             'track_hz':           15.0,
             'max_step_deg':       2.0,
             'bbox_ema_alpha':     0.4,

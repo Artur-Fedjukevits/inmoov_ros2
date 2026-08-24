@@ -1421,7 +1421,17 @@ class BehaviorManagerNode(LifecycleNode):
             person_present = self._bb.social.person_present
         except Exception:
             person_present = False
-        if person_present or self._bb.pir.scan_active:
+        # sound.scan_active закрывает только окно самого SoundScan; human_detected
+        # закрывает более широкое окно "OAK-D уже нашёл тело, head_tracker уже
+        # ведёт" — между передачей управления и тем, как person_present реально
+        # станет True после распознавания (может занимать несколько секунд).
+        # Без этой проверки PIR-движение (человек просто стоит/двигается перед
+        # роботом) успевает запустить ВТОРОЙ, конкурирующий скан головой поверх
+        # уже работающего head_tracker — оба дерутся за rothead/neck.
+        # Найдено 2026-08-24: PIRScan стартовал через 100мс после успешного
+        # SoundScan._found(), голова металась между двумя источниками команд.
+        if person_present or self._bb.pir.scan_active or self._bb.sound.scan_active \
+                or self._human_detected:
             return
         now = time.monotonic()
         if now < self._pir_next_scan_at:
