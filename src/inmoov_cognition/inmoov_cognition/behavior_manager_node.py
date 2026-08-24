@@ -534,13 +534,16 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
     """
 
     # rothead: rest=90, min=30, max=140 (arduino); rest_rothead=90 (vision_head_tracker)
+    # ВАЖНО 2026-08-24: старая пометка LEFT=120/RIGHT=60 была НЕВЕРНОЙ (никогда
+    # физически не проверялась как следует) — проверено руками, rothead=120
+    # физически поворачивает ВПРАВО, та же конвенция что и у midstom (LEFT=60/RIGHT=120).
     _CENTER   = 90.0   # смотрит вперёд (hardware rest arduino_left_node: rothead rest=90)
-    _LEFT     = 120.0  # крайнее левое
-    _RIGHT    = 60.0   # крайнее правое
+    _LEFT     = 60.0   # крайнее левое (проверено руками 2026-08-24)
+    _RIGHT    = 120.0  # крайнее правое (проверено руками 2026-08-24)
     _NECK     = 40.0   # neck hardware rest (arduino_left_node: neck rest=40)
 
     # vel=1.0 rad/s → deg_per_sec_to_step(57°/s) = step=3 → ~50°/s
-    # CENTER(90)→LEFT(120): 30°/50°/s≈0.6s, LEFT→RIGHT(60): 60°/50°/s≈1.2s, RIGHT→CENTER: 30°/50°/s≈0.6s
+    # CENTER(90)→LEFT(60): 30°/50°/s≈0.6s, LEFT→RIGHT(120): 60°/50°/s≈1.2s, RIGHT→CENTER: 30°/50°/s≈0.6s
     _SCAN_VEL = 1.0
 
     # (name, target_rothead | None=dwell, duration_sec)
@@ -658,6 +661,10 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     _ROTHEAD_MIN    = 30.0
     _ROTHEAD_MAX    = 140.0
     _NECK_REST      = 40.0
+    _AIM_GAIN       = 1.4  # 2026-08-24: 1:1 недокручивал — голова поймала лицо на мгновение
+                            # на краю кадра и тут же потеряла (OAK-D физически смещён от
+                            # оси глаз, параллакс требует небольшого перебора угла).
+                            # Подобрано эмпирически, не из геометрии — уточнить по факту.
 
     def __init__(self, node: Node):
         super().__init__('SoundScan')
@@ -689,11 +696,20 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
         трека 3с" раньше, чем face_detection вообще успеет увидеть лицо
         (см. живой тест 2026-08-22/23 — задержка распознавания ~6с > 3с
         терпения head_tracker).
-        Знак НЕ провалидирован физически (конвенция DepthAI: +x = вправо от
-        камеры, предполагаем что совпадает с знаком /sound_direction) —
-        проверить при первом реальном срабатывании."""
+        Первая версия (`90 - angle`) дала rothead=123° для человека слева
+        (angle=-33°) — по документированной конвенции rothead
+        (LEFT=120/RIGHT=60) это должно было быть верно, но пользователь
+        по факту увидел поворот НЕ в ту сторону 2026-08-24 (аналогично
+        истории с midstom, где документированная конвенция тоже оказалась
+        перепутанной). Формула перевёрнута на `90 + angle` — ЕЩЁ НЕ
+        перепроверено вживую после правки, нужен повторный тест. Если
+        опять не туда — под вопросом уже не формула, а либо знак самого
+        /human_angle_deg (OAK-D x_mm), либо истинная физическая конвенция
+        rothead (возможно, документация "LEFT=120/RIGHT=60" сама неверна
+        несмотря на старую пометку [x] в памяти) — тогда сверять оба по
+        отдельности, не гадать формулой."""
         angle = getattr(self._node, '_last_human_angle', 0.0)
-        rothead = max(self._ROTHEAD_MIN, min(self._ROTHEAD_MAX, self._ROTHEAD_CENTER - angle))
+        rothead = max(self._ROTHEAD_MIN, min(self._ROTHEAD_MAX, self._ROTHEAD_CENTER + angle * self._AIM_GAIN))
         msg = JointState()
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.name     = ['rothead', 'neck']
