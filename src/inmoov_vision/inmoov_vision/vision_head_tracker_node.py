@@ -55,6 +55,10 @@ def _deg_to_rad(deg: float, center: float = 90.0) -> float:
     return (deg - center) * math.pi / 180.0
 
 
+def _rad_to_deg(rad: float, center: float = 90.0) -> float:
+    return rad * 180.0 / math.pi + center
+
+
 class VisionHeadTrackerNode(LifecycleNode):
     def __init__(self):
         super().__init__('vision_head_tracker_node')
@@ -138,6 +142,13 @@ class VisionHeadTrackerNode(LifecycleNode):
         self.create_subscription(Bool,   '/head_tracker/enable', self._enable_cb, latched_qos)
         self.create_subscription(String, '/face/identity',       self._identity_cb,     10)
         self.create_subscription(String, '/social_context',      self._social_context_cb, 10)
+        # Синхронизация с внешними разовыми командами головы (например,
+        # SoundScanBehaviour._aim_head_at_human() наводит rothead по OAK-D
+        # ПЕРЕД enable_head_tracker) — без этого self._rothead/_neck остаются
+        # устаревшими (90°/40° с прошлого _return_to_rest), и первый шаг
+        # P-регулятора считается от неверной базы, дёргая голову обратно
+        # к центру прежде чем поймать реальный трек. Обнаружено 2026-08-24.
+        self.create_subscription(JointState, '/joint_command', self._external_joint_cb, 10)
         self._head_pub = self.create_lifecycle_publisher(JointState, '/joint_command', 10)
         self._face_pub = self.create_lifecycle_publisher(JointState, '/face_command',  10)
         return TransitionCallbackReturn.SUCCESS
@@ -182,6 +193,19 @@ class VisionHeadTrackerNode(LifecycleNode):
             self.get_logger().info('HeadTracker: выключен → покой')
         else:
             self.get_logger().info('HeadTracker: включён')
+
+    def _external_joint_cb(self, msg: JointState):
+        """Подхватывает rothead/neck из ЛЮБОГО источника на /joint_command
+        (включая наши же _publish_head() — безвредно, то же значение) —
+        держит внутреннее состояние синхронным с реальным положением, чтобы
+        P-регулятор не считал шаг от устаревшей базы после чужой разовой
+        команды (см. комментарий у подписки)."""
+        with self._lock:
+            for name, pos in zip(msg.name, msg.position):
+                if name == 'rothead':
+                    self._rothead = _rad_to_deg(pos, center=90.0)
+                elif name == 'neck':
+                    self._neck = _rad_to_deg(pos, center=90.0)
 
     # ── Целевой собеседник ────────────────────────────────────────────────
 
