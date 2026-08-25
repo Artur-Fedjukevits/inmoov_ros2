@@ -577,6 +577,29 @@ def _extract_text_tool_calls(text: str) -> list[dict]:
     return calls
 
 
+def _normalize_tool_calls(tool_calls: list[dict]) -> list[dict]:
+    """
+    Гарантирует OpenAI-schema поля `id`/`type` у каждого tool call.
+
+    vLLM строго валидирует историю сообщений: assistant-сообщение с
+    tool_calls, отправленное обратно в следующем запросе (self.history
+    реплеится как есть в R1 нового хода), обязано иметь `id` (str) и
+    `type: "function"` на каждом элементе — иначе 400 Bad Request
+    (ChatCompletionMessageFunctionToolCallParam.id/type: Field required).
+    Текстовый fallback (_extract_text_tool_calls) этих полей не даёт вовсе,
+    а SSE-парсер (_iter_sse_chunks) сохраняет id только если сервер его
+    прислал — на случай пропажи подставляем синтетический.
+    """
+    out = []
+    for tc in tool_calls:
+        out.append({
+            'id':       tc.get('id') or f'call_{uuid.uuid4().hex[:24]}',
+            'type':     'function',
+            'function': tc['function'],
+        })
+    return out
+
+
 def _strip_tool_blocks(text: str) -> str:
     """Удаляет блоки tool calls из текста перед отправкой в TTS."""
     text = _TOOLS_BLOCK_RE.sub('', text)
@@ -1005,7 +1028,14 @@ class LLMNode(LifecycleNode):
                 idx = tcd.get('index', 0)
                 if idx not in tc_acc:
                     first_tc_fragment = True
-                slot = tc_acc.setdefault(idx, {'function': {'name': '', 'arguments': ''}})
+                    # id обычно приходит только в первом фрагменте этого index —
+                    # сохраняем сразу; _normalize_tool_calls подставит синтетический,
+                    # если сервер id не прислал (нужен для истории — см. её докстринг).
+                    tc_acc[idx] = {'id': tcd.get('id') or '',
+                                   'function': {'name': '', 'arguments': ''}}
+                slot = tc_acc[idx]
+                if tcd.get('id') and not slot['id']:
+                    slot['id'] = tcd['id']
                 fn = tcd.get('function') or {}
                 if fn.get('name'):
                     slot['function']['name'] += fn['name']
@@ -1498,6 +1528,14 @@ class LLMNode(LifecycleNode):
                     self.get_logger().info(
                         f'Fallback: извлечено {len(tool_calls)} tool call(s) из текста')
             if tool_calls:
+                # id/type обязательны у каждого tool call, когда это сообщение
+                # попадёт в self.history и уедет в следующем запросе (см.
+                # докстринг _normalize_tool_calls). Тем же вызовом чиним и
+                # response_msg['tool_calls'] на случай текстового fallback выше —
+                # иначе в history попал бы assistant с пустыми tool_calls
+                # прямо перед tool-результатами.
+                tool_calls = _normalize_tool_calls(tool_calls)
+                response_msg['tool_calls'] = tool_calls
                 self.history.append(response_msg)
 
                 tool_results    = []
@@ -1522,7 +1560,7 @@ class LLMNode(LifecycleNode):
                     self.get_logger().info(f'Tool call: {fn}({args})')
                     res  = self._execute_tool(fn, args)
                     self.get_logger().info(f'Tool result: {res}')
-                    return fn, st, res
+                    return fn, st, res, tc['id']
 
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(len(tool_calls), 4),
@@ -1531,7 +1569,7 @@ class LLMNode(LifecycleNode):
                     # Результаты в оригинальном порядке tool_calls
                     _tc_results = list(_pool.map(_exec_one, tool_calls))
 
-                for fn_name, speak_text, result in _tc_results:
+                for fn_name, speak_text, result, tc_id in _tc_results:
                     if speak_text and speak_text.strip():
                         speak_texts.append(speak_text.strip())
                     if fn_name in _QUERY_FNS:
@@ -1539,8 +1577,9 @@ class LLMNode(LifecycleNode):
                     if isinstance(result, dict) and result.get('success') is False:
                         any_tool_failed = True
                     tool_results.append({
-                        'role':    'tool',
-                        'content': json.dumps(result, ensure_ascii=False),
+                        'role':         'tool',
+                        'tool_call_id': tc_id,
+                        'content':      json.dumps(result, ensure_ascii=False),
                     })
 
                 self.history.extend(tool_results)
@@ -1647,13 +1686,23 @@ class LLMNode(LifecycleNode):
                         # Выполняем только мета-инструменты и items_control.
                         # Собираем speak_text: если R2 вызвал express_emotion только с speak_text
                         # и без content — используем speak_text напрямую, без R3.
+                        # id/type + пара 'tool' сообщений на каждый tool_call обязательны —
+                        # см. докстринг _normalize_tool_calls и R1 выше (тот же класс бага).
+                        tool_calls2 = _normalize_tool_calls(tool_calls2)
+                        resp2['tool_calls'] = tool_calls2
                         self.history.append(resp2)
                         _r2_speak: list[str] = []
+                        _tool_results2: list[dict] = []
                         for tc in tool_calls2:
                             fn2   = tc['function']['name']
                             if fn2 not in _R2_ALLOWED:
                                 self.get_logger().warn(
                                     f'R2 text-fallback: пропускаем запрещённый инструмент {fn2}')
+                                _tool_results2.append({
+                                    'role': 'tool', 'tool_call_id': tc['id'],
+                                    'content': json.dumps(
+                                        {'success': False, 'error': 'not allowed in R2'}),
+                                })
                                 continue
                             args2 = tc['function'].get('arguments', {})
                             if isinstance(args2, str):
@@ -1665,6 +1714,11 @@ class LLMNode(LifecycleNode):
                             self.get_logger().info(f'Tool call R2: {fn2}({args2})')
                             res2 = self._execute_tool(fn2, args2)
                             self.get_logger().info(f'Tool result R2: {res2}')
+                            _tool_results2.append({
+                                'role': 'tool', 'tool_call_id': tc['id'],
+                                'content': json.dumps(res2, ensure_ascii=False),
+                            })
+                        self.history.extend(_tool_results2)
                         # Текстовый ответ: сначала content, fallback — speak_text мета-инструментов
                         final_text = _strip_tool_blocks(resp2.get('content', '').strip())
                         _r2_from_speak = False
