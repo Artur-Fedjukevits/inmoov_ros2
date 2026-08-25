@@ -34,6 +34,7 @@ class VoiceDetectorNode(LifecycleNode):
         self._dp('silence_duration_sec',  2.5)
         self._dp('min_phrase_sec',        0.3)
         self._dp('min_speech_sec',        1.0)
+        self._dp('min_speech_sec_introducing', 0.4)
         self._dp('max_phrase_sec',        20.0)
         self._dp('no_speech_timeout_sec', 8.0)
         self._dp('pipeline_timeout_sec',  90.0)
@@ -45,6 +46,7 @@ class VoiceDetectorNode(LifecycleNode):
         self.vad_threshold     = self.get_parameter('vad_threshold').value
         self.min_phrase_sec    = self.get_parameter('min_phrase_sec').value
         self.min_speech_sec    = self.get_parameter('min_speech_sec').value
+        self.min_speech_sec_introducing = self.get_parameter('min_speech_sec_introducing').value
         self.max_phrase_sec    = self.get_parameter('max_phrase_sec').value
         self.no_speech_timeout = self.get_parameter('no_speech_timeout_sec').value
         self.pipeline_timeout  = self.get_parameter('pipeline_timeout_sec').value
@@ -675,8 +677,13 @@ class VoiceDetectorNode(LifecycleNode):
         if self._sv_buf:
             self._sv_decide(log_reject=False)
 
+        # Во время знакомства ожидаются короткие ответы (имя, "Ника", "да") —
+        # порог минимальной длины речи снижается, чтобы их не отбрасывать.
+        effective_min_speech_sec = (
+            self.min_speech_sec_introducing if self._introducing else self.min_speech_sec
+        )
         min_chunks        = int(self.min_phrase_sec * self.rate / self._chunk_size)
-        min_speech_chunks = int(self.min_speech_sec * self.rate / self._chunk_size)
+        min_speech_chunks = int(effective_min_speech_sec * self.rate / self._chunk_size)
         speech_sec        = self.speech_chunks * self._chunk_size / self.rate
 
         if len(self.audio_buffer) > min_chunks and self.speech_chunks >= min_speech_chunks:
@@ -691,7 +698,8 @@ class VoiceDetectorNode(LifecycleNode):
             self._publish(full_audio)
         else:
             self.get_logger().info(
-                f'Фраза отброшена: речи {speech_sec:.1f}с < {self.min_speech_sec:.1f}с — игнорирую'
+                f'Фраза отброшена: речи {speech_sec:.1f}с < {effective_min_speech_sec:.1f}с'
+                f'{" (знакомство)" if self._introducing else ""} — игнорирую'
             )
             if self._is_person_present() and not self._sleeping:
                 import threading
