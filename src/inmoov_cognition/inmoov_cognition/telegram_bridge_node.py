@@ -35,6 +35,7 @@ Actions:
 """
 
 import asyncio
+import base64
 import difflib
 import json
 import os
@@ -410,18 +411,22 @@ class TelegramBridgeNode(LifecycleNode):
 
     # ── Запрос к llm_node ────────────────────────────────────────────────────
 
-    def _publish_ask(self, req_id: str, text: str, telegram_id: int | None) -> None:
+    def _publish_ask(self, req_id: str, text: str, telegram_id: int | None,
+                      image_base64: str | None = None) -> None:
         """Публикует /telegram_ask; person_ctx инжектируется из БД по telegram_id."""
         person_ctx = self._lookup_person(telegram_id) if telegram_id else None
         payload: dict = {'request_id': req_id, 'text': text}
         if person_ctx:
             payload['person_ctx'] = person_ctx
+        if image_base64:
+            payload['image_base64'] = image_base64
         pub_msg = String()
         pub_msg.data = json.dumps(payload, ensure_ascii=False)
         self._ask_pub.publish(pub_msg)
         self.get_logger().info(
             f'TG ask req={req_id[:8]}'
             + (f' person={person_ctx["name"]}' if person_ctx else ' (анонимно)')
+            + (' +фото' if image_base64 else '')
         )
 
     # ── Вспомогательные ─────────────────────────────────────────────────────
@@ -767,9 +772,29 @@ class TelegramBridgeNode(LifecycleNode):
             return
         await self._ask_and_reply(update, text)
 
-    async def _ask_and_reply(self, update: Update, text: str):
+    async def _photo_handler(self, update: Update, context):
+        """Фото от пользователя — скачиваем, кодируем в base64, отдаём в LLM
+        (vision через ту же qwen3.8-27b/vLLM, см. llm_node._query_llm)."""
+        if not self._auth(update.effective_chat.id):
+            return
+        caption = (update.message.caption or '').strip()
+        photo = update.message.photo[-1]  # наибольшее доступное разрешение
+        try:
+            tg_file = await context.bot.get_file(photo.file_id)
+            raw = await tg_file.download_as_bytearray()
+        except Exception as e:
+            self.get_logger().warn(f'TG photo: не удалось скачать файл: {e}')
+            await update.message.reply_text('❌ Не смог скачать фото')
+            return
+        image_b64 = base64.b64encode(bytes(raw)).decode()
+        text = caption or 'Что на этой фотографии?'
+        await self._ask_and_reply(update, text, image_base64=image_b64)
+
+    async def _ask_and_reply(self, update: Update, text: str,
+                              image_base64: str | None = None):
         """Отправляет запрос через llm_node и стримит ответ редактированием сообщения."""
-        sent = await update.message.reply_text('⏳ Думаю...')
+        sent = await update.message.reply_text(
+            '👀 Смотрю...' if image_base64 else '⏳ Думаю...')
 
         req_id = str(uuid.uuid4())
         q: asyncio.Queue = asyncio.Queue()
@@ -780,7 +805,7 @@ class TelegramBridgeNode(LifecycleNode):
         # Публикуем запрос в llm_node (синхронно, быстро)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
-            None, self._publish_ask, req_id, text, update.effective_chat.id)
+            None, self._publish_ask, req_id, text, update.effective_chat.id, image_base64)
 
         accumulated = ''
         last_edit = 0.0
@@ -868,6 +893,7 @@ class TelegramBridgeNode(LifecycleNode):
         app.add_handler(CommandHandler('sleep',       self._cmd_sleep))
         app.add_handler(CommandHandler('where',       self._cmd_where))
         app.add_handler(CommandHandler('restart_tts', self._cmd_restart_tts))
+        app.add_handler(MessageHandler(filters.PHOTO, self._photo_handler))
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._msg_handler))
 

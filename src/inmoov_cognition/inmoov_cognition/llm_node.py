@@ -577,6 +577,19 @@ def _extract_text_tool_calls(text: str) -> list[dict]:
     return calls
 
 
+def _build_user_content(text: str, image_b64: str | None):
+    """Content для user-сообщения: строка если без картинки, иначе OpenAI
+    vision content-array (text + image_url data URI). Картинка передаётся
+    только в ИСХОДЯЩЕМ запросе — в self.history остаётся текстовый плейсхолдер
+    (см. _query_llm), иначе base64 раздувал бы токены каждого следующего хода."""
+    if not image_b64:
+        return text
+    return [
+        {'type': 'text', 'text': text or 'Что на этой фотографии?'},
+        {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{image_b64}'}},
+    ]
+
+
 def _normalize_tool_calls(tool_calls: list[dict]) -> list[dict]:
     """
     Гарантирует OpenAI-schema поля `id`/`type` у каждого tool call.
@@ -1421,10 +1434,13 @@ class LLMNode(LifecycleNode):
         ).start()
 
     def _telegram_ask_cb(self, msg: String):
-        """Запрос от telegram_bridge_node: JSON {request_id, text, person_ctx?}.
+        """Запрос от telegram_bridge_node: JSON {request_id, text, person_ctx?, image_base64?}.
 
         Использует тот же _query_llm пайплайн что и voice_command — все tool calls,
         память и контекст SmartHome работают. person_ctx инжектируется из Telegram-профиля.
+        image_base64 (опционально) — фото, присланное пользователем в Telegram;
+        уходит в LLM только текущим ходом (см. _build_user_content/_query_llm),
+        в self.history остаётся текстовый плейсхолдер.
         """
         try:
             data = json.loads(msg.data)
@@ -1434,10 +1450,13 @@ class LLMNode(LifecycleNode):
         req_id     = data.get('request_id', '').strip()
         text       = data.get('text', '').strip()
         person_ctx = data.get('person_ctx') or None
+        image_b64  = data.get('image_base64') or None
         if not req_id or not text:
             return
         if person_ctx and not isinstance(person_ctx, dict):
             person_ctx = None
+        if image_b64 and not isinstance(image_b64, str):
+            image_b64 = None
 
         with self._lock:
             if self._introducing or self._processing:
@@ -1454,15 +1473,17 @@ class LLMNode(LifecycleNode):
         threading.Thread(
             target=self._query_llm,
             args=(text,),
-            kwargs={'person_ctx_override': person_ctx},
+            kwargs={'person_ctx_override': person_ctx, 'image_b64': image_b64},
             daemon=True,
         ).start()
         self.get_logger().info(
-            f'telegram_ask: req_id={req_id[:8]}, text="{text[:60]}"')
+            f'telegram_ask: req_id={req_id[:8]}, text="{text[:60]}"'
+            + (f', +фото ({len(image_b64)} b64 chars)' if image_b64 else ''))
 
     # ── Основной запрос к LLM ───────────────────────────────────────────────
 
-    def _query_llm(self, user_text: str, person_ctx_override: dict | None = None):
+    def _query_llm(self, user_text: str, person_ctx_override: dict | None = None,
+                    image_b64: str | None = None):
         _t0 = time.time()
         try:
             with self._lock:
@@ -1502,6 +1523,12 @@ class LLMNode(LifecycleNode):
             messages = [{'role': 'system', 'content': system_prompt}]
             messages += self.history if self.keep_history else \
                         [{'role': 'user', 'content': user_text}]
+            if image_b64:
+                # self.history хранит текстовый плейсхолдер (см. append выше) —
+                # картинка подставляется только в исходящий messages, последним
+                # user-сообщением всегда является именно этот ход.
+                messages[-1] = {**messages[-1],
+                                 'content': _build_user_content(user_text, image_b64)}
 
             payload = {
                 'model':       self.model,
