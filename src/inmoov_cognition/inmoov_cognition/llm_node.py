@@ -30,6 +30,7 @@ Tools:
   - broadcast_message     — синтез WAV через TTS + трансляция на Chromecast в гостиной
 """
 
+import base64
 import concurrent.futures
 import datetime
 import json
@@ -48,6 +49,7 @@ from rclpy.action import ActionClient
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String, Bool
+from sensor_msgs.msg import CompressedImage
 from inmoov_msgs.action import Speak
 from inmoov_msgs.srv import MemoryQuery
 
@@ -499,6 +501,35 @@ TOOLS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'look_and_describe',
+            'description': (
+                'Сделать снимок с камеры в глазу робота ПРЯМО СЕЙЧАС и проанализировать его через '
+                'vision-модель — для вопросов, требующих реально посмотреть и понять, что в кадре '
+                '(YOLO-детекция в блоке "Сцена ПРЯМО СЕЙЧАС" знает только ограниченный набор '
+                'предметов и не годится для этого). Используй для: "что это?", "что у меня в '
+                'руках?", "посмотри", "что ты видишь?", "что за окном?", "что там на столе?" '
+                'и любых похожих вопросов, где нужно распознать конкретный предмет/сцену. '
+                'НЕ используй robot_control(action="status") для таких вопросов.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'query': {
+                        'type': 'string',
+                        'description': (
+                            'Что именно нужно рассмотреть — конкретная формулировка вопроса '
+                            'пользователя, например "что у меня в руках" или "что за окном". '
+                            'Если неясно — оставь пустым, будет общее описание кадра.'
+                        ),
+                    },
+                },
+                'required': [],
+            },
+        },
+    },
 ]
 
 
@@ -831,7 +862,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
   (объяснение → медленно и чётко; срочное сообщение → быстро и энергично)
 - Если просто разговор — отвечай текстом без tool call
 - Если пользователь просит "передай на колонку", "скажи в гостиной", "объяви" — используй broadcast_message. НЕ используй items_control для LivingRoom_Chromecast.
-- Если спрашивают "что ты видишь", "кто перед тобой", "что вокруг", "опиши что рядом" — отвечай ТЕКСТОМ БЕЗ tool call, используя блок "Сцена ПРЯМО СЕЙЧАС" ниже. НЕ вызывай robot_control(action="status") для таких вопросов — status предназначен ТОЛЬКО для батареи/позиции сервоприводов, он не знает о зрении и ничего не расскажет о сцене.
+- Если спрашивают "что ты видишь", "что это", "что у меня в руках", "посмотри", "что за окном", "кто перед тобой", "опиши что рядом" и подобное — ОБЯЗАТЕЛЬНО вызывай look_and_describe (query = суть вопроса). Блок "Сцена ПРЯМО СЕЙЧАС" ниже — это только фоновый YOLO-контекст (кто рядом, сколько человек) для твоей ОБЩЕЙ ориентации, а не источник ответа на прямой вопрос "что ты видишь" — YOLO распознаёт ограниченный набор предметов и часто ошибается. НЕ вызывай robot_control(action="status") для таких вопросов — status только для батареи/позиции сервоприводов.
 
 ВАЖНО — управление устройствами:
 - НИКОГДА не придумывай имена устройств — используй только точные имена из таблицы ниже.
@@ -941,6 +972,8 @@ class LLMNode(LifecycleNode):
         # Кэш OpenHAB от openhab_bridge_node
         self._oh_schema      = ''        # JSON-строка схемы (name/label/type/options)
         self._oh_items       = []        # Список dict с актуальными state
+        # Последний кадр с левой глазной камеры (JPEG bytes) — для look_and_describe
+        self._latest_eye_jpeg: bytes | None = None
         # Стиль голоса и эмоция — буферизуются инструментами, включаются в /llm_response
         self._voice_style    = {'instruct': ''}
         self._pending_emotion: str | None = None
@@ -1577,7 +1610,8 @@ class LLMNode(LifecycleNode):
                 # HTTP-инструменты (items_control × N, get_weather) могут идти
                 # одновременно — экономит время при N > 1 action-инструментах.
                 _QUERY_FNS = frozenset(('get_openhab_states', 'search_openhab_items',
-                                        'web_search', 'get_weather', 'search_memory'))
+                                        'web_search', 'get_weather', 'search_memory',
+                                        'look_and_describe'))
 
                 def _exec_one(tc):
                     fn   = tc['function']['name']
@@ -1904,8 +1938,49 @@ class LLMNode(LifecycleNode):
             return self._tool_broadcast_message(args)
         elif fn_name == 'merge_persons':
             return self._tool_merge_persons(args)
+        elif fn_name == 'look_and_describe':
+            return self._tool_look_and_describe(args)
         else:
             return {'error': f'Unknown function: {fn_name}'}
+
+    def _tool_look_and_describe(self, args: dict) -> dict:
+        """Снимок с глазной камеры (последний закэшированный кадр) → анализ через ту же
+        vision-модель (vLLM). Отдельный, лёгкий запрос к LLM — вне self.history
+        и без tools, чтобы не тянуть за собой весь диалоговый контекст."""
+        query = (args.get('query') or '').strip() or 'Опиши коротко и по делу, что видишь.'
+        with self._lock:
+            jpeg = self._latest_eye_jpeg
+        if not jpeg:
+            return {'success': False,
+                    'error': 'Камера недоступна или кадр ещё не пришёл'}
+        image_b64 = base64.b64encode(jpeg).decode()
+        payload = {
+            'model':    self.model,
+            'messages': [
+                {'role': 'system', 'content':
+                    'Отвечай кратко и по делу, простым текстом без markdown-разметки, '
+                    'списков и заголовков — 2-3 предложения максимум.'},
+                {'role': 'user', 'content': _build_user_content(query, image_b64)},
+            ],
+            'stream':      False,
+            'temperature': 0.3,
+            'max_tokens':  200,
+            'chat_template_kwargs': {'enable_thinking': False},
+        }
+        try:
+            parts = []
+            for delta, done, _tc in self._stream_llm(payload, read_timeout=20.0):
+                if delta:
+                    parts.append(delta)
+                if done:
+                    break
+            description = ''.join(parts).strip()
+        except Exception as e:
+            self.get_logger().warn(f'look_and_describe: ошибка vision-запроса: {e}')
+            return {'success': False, 'error': str(e)}
+        if not description:
+            return {'success': False, 'error': 'Vision-модель не дала ответа'}
+        return {'success': True, 'description': description}
 
     # Координаты по умолчанию — Bødalen, Asker, Норвегия
     _DEFAULT_LAT  = 59.835
@@ -2303,6 +2378,12 @@ class LLMNode(LifecycleNode):
         except json.JSONDecodeError as e:
             self.get_logger().warn(f'Невалидный openhab_items JSON: {e}')
 
+    def _eye_camera_cb(self, msg: CompressedImage):
+        """Кэширует последний кадр с левой глазной камеры для look_and_describe
+        (снимок по запросу, не стрим — просто держим самый свежий JPEG)."""
+        with self._lock:
+            self._latest_eye_jpeg = bytes(msg.data)
+
     def _social_context_cb(self, msg: String):
         """Перехватываем looking_at_robot из social_context."""
         try:
@@ -2676,6 +2757,8 @@ class LLMNode(LifecycleNode):
         self.create_subscription(String, '/scene/objects',  self._scene_context_cb,        10)
         self.create_subscription(String, 'openhab_schema',  self._oh_schema_callback,      10)
         self.create_subscription(String, 'openhab_items',   self._oh_items_callback,       10)
+        self.create_subscription(CompressedImage, '/camera/eye_left/compressed',
+                                  self._eye_camera_cb, 5)
         self.create_subscription(Bool,   '/introducing',    self._introducing_cb,          10)
         self.create_subscription(Bool,   '/go_idle',        self._go_idle_cb,              10)
         self.create_subscription(Bool,   '/robot_sleep',    self._robot_sleep_cb,          _latched)
