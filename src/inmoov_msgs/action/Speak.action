@@ -1,6 +1,6 @@
 # Goal — что сказать
 string text
-string voice        # instruct_text для CosyVoice3 ("говори радостно", "" = по умолчанию)
+string voice        # имя голосового пресета OmniVoice ("neutral"/"happy"/"sad"/"surprise", "" = neutral)
 float32 rate        # скорость: 0.0/1.0 = нормальная, 0.5 = медленно, 2.0 = быстро
 ---
 # Result

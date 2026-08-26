@@ -417,24 +417,19 @@ TOOLS = [
         'function': {
             'name': 'set_voice_style',
             'description': (
-                'Set voice style for the next speech response. '
-                'Call BEFORE generating text when context warrants a different voice. '
-                'Examples: joke/good news → "говори радостно и энергично"; '
-                'sad topic → "говори тихо и грустно, медленно"; '
-                'explaining → "говори чётко и спокойно, неторопливо"; '
-                'urgent → "говори срочно и чётко, быстро"; '
-                'reset to normal → "".'
+                'Set voice preset for the next speech response, independent of face expression. '
+                'The TTS server (OmniVoice) uses cloned-voice presets recorded in advance — '
+                'free-form tone instructions are NOT supported (voice cloning overrides them). '
+                'Only 4 presets exist. Use this for a tone-only change when express_emotion '
+                '(which also drives the face) is not appropriate. Reset to normal → "" or "neutral".'
             ),
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'instruct': {
+                    'style': {
                         'type': 'string',
-                        'description': (
-                            'Natural language voice instruction in Russian. '
-                            'Describe tone, emotion, pace, manner of speaking. '
-                            'Empty string = server default (natural pace).'
-                        ),
+                        'enum': ['neutral', 'happy', 'sad', 'surprise', ''],
+                        'description': 'Voice preset name. Empty string = "neutral" (default).',
                     },
                 },
                 'required': [],
@@ -563,6 +558,12 @@ _TOOL_START_TOKENS = ('<tool_call>', '<tools>')
 _TOOL_CALL_AE_RE = re.compile(r'ᐈ.{0,10}\{', re.DOTALL)
 _MIN_SENT_CHARS   = 12    # минимум символов до sentence split
 _MAX_CHUNK_CHARS  = 80    # максимум символов до принудительного split по запятой (~5-6с TTS)
+# Блок TTS-запроса (см. MIGRATION_NOTES.md): OmniVoice звучит менее стабильно
+# на очень коротких изолированных фразах — копим предложения до ~80-120 символов
+# ИЛИ 2 предложений (что раньше наступит), а не шлём буквально по одному короткому
+# предложению за раз. Замер: TTFA ≈1.1-1.2с, итог на 7-19% дольше чем одним запросом.
+_TTS_CHUNK_MIN_CHARS     = 80
+_TTS_CHUNK_MAX_SENTENCES = 2
 # Qwen3 иногда начинает ответ с переформулировки вопроса вида "Почему X?" — фильтруем
 _ECHO_QUESTION_RE = re.compile(
     r'^(?:Почему|Почём|Почем|О\s+чём|Зачем|По\s+поводу)\b.{0,120}\?\s*',
@@ -574,6 +575,32 @@ _CJK_RE = re.compile(
     '豈-﫿\U00020000-\U0002A6DF\U0002A700-\U0002CEAF]+',
     re.UNICODE,
 )
+
+# Инлайн-теги неречевых звуков OmniVoice (см. MIGRATION_NOTES.md) — LLM
+# вставляет их прямо в текст ответа, в квадратных скобках, в любом месте
+# фразы. Список — весь набор, поддерживаемый сервером; system prompt
+# (build_system_prompt) даёт LLM ровно этот же список дословно. Любой
+# другой "[...]" в ответе — вероятная галлюцинация модели, а не реальный
+# тег сервера — вырезаем его, чтобы не улетел в TTS как есть.
+_INLINE_TAGS = frozenset({
+    'laughter', 'sigh', 'confirmation-en', 'question-en', 'question-ah',
+    'question-oh', 'question-ei', 'question-yi', 'surprise-ah',
+    'surprise-oh', 'surprise-wa', 'surprise-yo', 'dissatisfaction-hnn',
+})
+# Любое короткое "[...]" — не только латиница: LLM может "перевести" тег на
+# русский (напр. "[смеётся]") или выдумать что-то не из списка — такое тоже
+# должно вырезаться, а не проскакивать в TTS как есть.
+_INLINE_TAG_RE = re.compile(r'\[([^\[\]]{1,40})\]')
+
+
+def _filter_inline_tags(text: str) -> str:
+    """Оставляет только известные OmniVoice-теги (нормализует регистр —
+    сервер ожидает точное написание в нижнем регистре), остальные "[...]"
+    вырезает."""
+    def _sub(m):
+        tag = m.group(1).strip().lower()
+        return f'[{tag}]' if tag in _INLINE_TAGS else ''
+    return _INLINE_TAG_RE.sub(_sub, text)
 
 
 def _strip_cjk(text: str) -> str:
@@ -652,9 +679,11 @@ def _strip_tool_blocks(text: str) -> str:
 
 
 def _clean_llm_text(text: str) -> str:
-    """Strip stage directions, CJK and decorative markers that LLM injects."""
+    """Strip stage directions, CJK, decorative markers and unrecognized inline
+    tags that LLM injects."""
     cleaned = _STAGE_DIR_RE.sub('', text)
     cleaned = _CJK_RE.sub('', cleaned)
+    cleaned = _filter_inline_tags(cleaned)
     cleaned = re.sub(r'  +', ' ', cleaned).strip()
     cleaned = re.sub(r'^[ᐈ,.\s]+', '', cleaned).strip()  # leading ᐈ bullets
     return cleaned
@@ -846,6 +875,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
 ВАЖНО: Никогда не используй азиатские языки в ответах, никаких иероглифов!
 ВАЖНО: Никогда не повторяй и не перефразируй вопрос пользователя в начале ответа. Не начинай ответ со слов "Почему", "Почём", "Зачем", "О чём", "По поводу" или любого пересказа вопроса. Отвечай сразу по существу.
 ВАЖНО: Текстовый ответ озвучивается напрямую TTS. НЕ добавляй ремарки или сценические указания в скобках — например, (Тихо), (С улыбкой), (Шёпотом). Для изменения стиля голоса используй инструмент set_voice_style или express_emotion. Не используй URL в ответе - TTS их плохо произносит.
+ВАЖНО: TTS понимает неречевые теги ПРЯМО ВНУТРИ текста ответа, в квадратных скобках, в любом месте фразы (это НЕ ремарка из строки выше — те в круглых скобках запрещены полностью, а эти теги — фиксированный список звуков TTS). Разрешены ТОЛЬКО эти, дословно: [laughter] [sigh] [confirmation-en] [question-en] [question-ah] [question-oh] [question-ei] [question-yi] [surprise-ah] [surprise-oh] [surprise-wa] [surprise-yo] [dissatisfaction-hnn]. Вставляй умеренно и только когда это естественно усиливает фразу — например «[laughter] Ну ты даёшь!», «[sigh] Ладно, попробую ещё раз», «[surprise-ah] Ого, не ожидал!». НЕ придумывай свои теги и не переводи их на русский — неизвестные теги будут вырезаны из речи. Это дополняет express_emotion/set_voice_style, а не заменяет их.
 ВАЖНО: Ответы — РАЗГОВОРНЫЕ и КРАТКИЕ, 1-2 предложения максимум. Отвечай ТОЛЬКО на то, что спросили — не пересказывай все данные из инструмента. Примеры: вопрос «будет ли дождь?» → «Да, завтра ожидается небольшой дождь, около трёх миллиметров» (не надо перечислять почасовой прогноз и скорость ветра). Вопрос «какая температура?» → «Завтра от пяти до тринадцати градусов, пасмурно». Если хотят подробности — спросят.
 ВАЖНО: При вызове save_memory, items_control, robot_control, express_emotion — всегда включай параметр speak_text с ответом пользователю (1-2 предложения, естественное продолжение разговора). express_emotion НИКОГДА не заменяет текстовый ответ — это дополнение к нему. При save_memory НЕ говори "Запомнил/Сохранил" — просто продолжай диалог как будто ты это уже знаешь. При get_openhab_states, search_openhab_items — speak_text не нужен, ответ формируй после получения данных.
 
@@ -858,8 +888,8 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
 - Используй express_emotion когда контекст разговора вызывает эмоциональную реакцию
   (услышал хорошую новость → happy, сложный вопрос → thinking, и т.д.)
   express_emotion автоматически задаёт стиль голоса под эмоцию
-- Используй set_voice_style для тонкой настройки голоса без смены мимики
-  (объяснение → медленно и чётко; срочное сообщение → быстро и энергично)
+- Используй set_voice_style для смены голосового пресета без смены мимики
+  (доступны только 4 пресета: neutral/happy/sad/surprise — не описывай тон текстом)
 - Если просто разговор — отвечай текстом без tool call
 - Если пользователь просит "передай на колонку", "скажи в гостиной", "объяви" — используй broadcast_message. НЕ используй items_control для LivingRoom_Chromecast.
 - Если спрашивают "что ты видишь", "что это", "что у меня в руках", "посмотри", "что за окном", "кто перед тобой", "опиши что рядом" и подобное — ОБЯЗАТЕЛЬНО вызывай look_and_describe (query = суть вопроса). Блок "Сцена ПРЯМО СЕЙЧАС" ниже — это только фоновый YOLO-контекст (кто рядом, сколько человек) для твоей ОБЩЕЙ ориентации, а не источник ответа на прямой вопрос "что ты видишь" — YOLO распознаёт ограниченный набор предметов и часто ошибается. НЕ вызывай robot_control(action="status") для таких вопросов — status только для батареи/позиции сервоприводов.
@@ -975,7 +1005,7 @@ class LLMNode(LifecycleNode):
         # Последний кадр с левой глазной камеры (JPEG bytes) — для look_and_describe
         self._latest_eye_jpeg: bytes | None = None
         # Стиль голоса и эмоция — буферизуются инструментами, включаются в /llm_response
-        self._voice_style    = {'instruct': ''}
+        self._voice_style    = {'emotion': ''}
         self._pending_emotion: str | None = None
         # Взгляд собеседника: True/False/None (None = нет данных от детектора)
         # Используется для фильтрации речи, не адресованной роботу.
@@ -1210,7 +1240,8 @@ class LLMNode(LifecycleNode):
             'Оба LLM сервера недоступны') from last_exc
 
     def _send_tts_chunk(self, text: str, voice_style: str = '') -> None:
-        """Отправляет предложение в tts_node или в Telegram (в TG-режиме)."""
+        """Отправляет блок текста (одно-два предложения, см. _TTS_CHUNK_*)
+        в tts_node как отдельный Speak-goal, либо в Telegram (в TG-режиме)."""
         text = text.strip()
         if not text:
             return
@@ -1241,36 +1272,42 @@ class LLMNode(LifecycleNode):
 
     def _stream_with_tts(self, payload: dict) -> tuple[str, list]:
         """
-        Стримит ответ LLM через WebSocket bistream к TTS (один сеанс на весь ответ).
+        Стримит ответ LLM и озвучивает по мере готовности через action 'speak'
+        (POST /tts/stream на TTS-сервере, см. MIGRATION_NOTES.md — OmniVoice
+        не предоставляет WS bistream, поэтому один Speak-goal на блок текста,
+        а не один WS-сеанс на весь ответ).
         Возвращает (полный_контент, api_tool_calls).
         При обнаружении маркера tool call прекращает отправку в TTS.
         """
         with self._lock:
-            voice_style = self._voice_style.get('instruct', '')
+            voice_style = self._voice_style.get('emotion', '')
             tg_req_id   = self._tg_req_id
 
-        buf: str               = ''
-        content_parts: list[str] = []
-        api_tool_calls: list   = []
-        tool_call_detected     = False
-        first_chunk_sent       = False
-        bs_started             = False  # bistream сессия открыта
+        buf: str                  = ''
+        content_parts: list[str]  = []
+        api_tool_calls: list      = []
+        tool_call_detected        = False
+        first_chunk_sent          = False
+        chunk_buf: list[str]      = []  # предложения, ждущие отправки одним TTS-запросом
+        chunk_chars                = 0
 
-        def _bs_send(sentence: str):
-            """Публикует предложение в bistream (открывает сессию при первом вызове).
-            Всё в одном топике stream_ctrl для гарантированного FIFO-порядка."""
-            nonlocal bs_started
-            clean = _clean_llm_text(sentence)
-            if not clean:
+        def _flush_chunk(force: bool = False):
+            """Отправляет накопленный блок как один Speak-goal.
+            По умолчанию ждёт _TTS_CHUNK_MIN_CHARS или _TTS_CHUNK_MAX_SENTENCES —
+            OmniVoice звучит менее стабильно на очень коротких изолированных
+            фразах (см. MIGRATION_NOTES.md), поэтому не шлём по одному
+            предложению за раз. force=True — конец ответа, шлём остаток как есть."""
+            nonlocal chunk_buf, chunk_chars
+            if not chunk_buf:
                 return
-            ctrl = String()
-            if not bs_started:
-                ctrl.data = f'start:{voice_style}'
-                self._bs_ctrl_pub.publish(ctrl)
-                bs_started = True
-                ctrl = String()
-            ctrl.data = f'text:{clean}'
-            self._bs_ctrl_pub.publish(ctrl)
+            if not force and chunk_chars < _TTS_CHUNK_MIN_CHARS \
+                    and len(chunk_buf) < _TTS_CHUNK_MAX_SENTENCES:
+                return
+            clean = _clean_llm_text(' '.join(chunk_buf))
+            chunk_buf   = []
+            chunk_chars = 0
+            if clean:
+                self._send_tts_chunk(clean, voice_style)
 
         for delta, done, tc in self._stream_llm(payload, self.timeout_sec):
             buf += delta
@@ -1288,11 +1325,11 @@ class LLMNode(LifecycleNode):
                     detected = bool(_TOOL_CALL_AE_RE.search(buf))
                 if detected:
                     tool_call_detected = True
-                    if bs_started:
-                        ctrl = String()
-                        ctrl.data = 'cancel'
-                        self._bs_ctrl_pub.publish(ctrl)
-                    self.get_logger().debug('Стриминг: tool call — bistream отменён')
+                    # Уже собранные, но не отправленные предложения — отбрасываем,
+                    # они не должны звучать (относятся к части ответа с tool call).
+                    chunk_buf   = []
+                    chunk_chars = 0
+                    self.get_logger().debug('Стриминг: tool call — TTS остановлен')
 
             if not tool_call_detected:
                 while True:
@@ -1309,7 +1346,9 @@ class LLMNode(LifecycleNode):
                             elif tg_req_id:
                                 self._tg_stream_partial(sentence, tg_req_id)
                             else:
-                                _bs_send(sentence)
+                                chunk_buf.append(sentence)
+                                chunk_chars += len(sentence)
+                                _flush_chunk()
                             first_chunk_sent = True
                     else:
                         break
@@ -1335,13 +1374,12 @@ class LLMNode(LifecycleNode):
                     if tg_req_id:
                         self._tg_stream_partial(tail, tg_req_id)
                     else:
-                        _bs_send(tail)
+                        chunk_buf.append(tail)
+                        chunk_chars += len(tail)
 
-        # Закрываем bistream сессию (только если не был отменён из-за tool call)
-        if bs_started and not tool_call_detected:
-            ctrl = String()
-            ctrl.data = 'end'
-            self._bs_ctrl_pub.publish(ctrl)
+        # Финальный флаш: то, что осталось в буфере, отправляем как есть,
+        # даже если оно короче обычного порога (это конец ответа, ждать нечего).
+        _flush_chunk(force=True)
 
         return ''.join(content_parts), api_tool_calls
 
@@ -1382,7 +1420,7 @@ class LLMNode(LifecycleNode):
             person_ctx            = self._person_context
             self.history          = []
             self._dialogue_lines  = []
-            self._voice_style     = {'instruct': ''}
+            self._voice_style     = {'emotion': ''}
             self._pending_emotion = None
             self._person_context  = None
         if history_snapshot:
@@ -1399,7 +1437,7 @@ class LLMNode(LifecycleNode):
                     f'robot_sleep={msg.data} — сброс истории ({len(self.history)} сообщ.)')
             self.history          = []
             self._dialogue_lines  = []
-            self._voice_style     = {'instruct': ''}
+            self._voice_style     = {'emotion': ''}
             self._pending_emotion = None
         # При засыпании — публикуем завершение диалога (если было что-то)
         if msg.data and history_snapshot:
@@ -1667,23 +1705,13 @@ class LLMNode(LifecycleNode):
                     self.get_logger().info(
                         f'Ответ из speak_text за {time.time()-_t0:.1f}с: "{final_text}"')
                     with self._lock:
-                        _vs = self._voice_style.get('instruct', '')
+                        _vs = self._voice_style.get('emotion', '')
                         _tg = self._tg_req_id
                     if _tg:
                         for st in speak_texts:
                             self._tg_stream_partial(st, _tg)
                     else:
-                        # Bistream вместо action server: ниже задержка, нет goal-handshake
-                        ctrl = String()
-                        ctrl.data = f'start:{_vs}'
-                        self._bs_ctrl_pub.publish(ctrl)
-                        for st in speak_texts:
-                            ctrl = String()
-                            ctrl.data = f'text:{st}'
-                            self._bs_ctrl_pub.publish(ctrl)
-                        ctrl = String()
-                        ctrl.data = 'end'
-                        self._bs_ctrl_pub.publish(ctrl)
+                        self._send_tts_chunk(final_text, _vs)
                     self._publish_response('', streamed=True)
                 elif any_bt_speech_tool and not needs_llm_reply and not any_tool_failed:
                     # BT обрабатывает речь через robot_events — R2 не нужен.
@@ -1795,22 +1823,14 @@ class LLMNode(LifecycleNode):
                             self.get_logger().info(
                                 f'Финальный ответ R2 за {time.time()-_t0:.1f}с: "{final_text}"')
                             if _r2_from_speak:
-                                # Текст ещё не был в bistream — отправляем
+                                # Текст ещё не был отправлен в TTS — отправляем
                                 with self._lock:
-                                    _vs2 = self._voice_style.get('instruct', '')
+                                    _vs2 = self._voice_style.get('emotion', '')
                                     _tg2 = self._tg_req_id
                                 if _tg2:
                                     self._tg_stream_partial(final_text, _tg2)
                                 else:
-                                    _ctrl = String()
-                                    _ctrl.data = f'start:{_vs2}'
-                                    self._bs_ctrl_pub.publish(_ctrl)
-                                    _ctrl = String()
-                                    _ctrl.data = f'text:{final_text}'
-                                    self._bs_ctrl_pub.publish(_ctrl)
-                                    _ctrl = String()
-                                    _ctrl.data = 'end'
-                                    self._bs_ctrl_pub.publish(_ctrl)
+                                    self._send_tts_chunk(final_text, _vs2)
                         else:
                             # LLM вернул пустой R2 даже без speak_text — редкий случай, нужен R3
                             self.get_logger().warn(
@@ -2213,43 +2233,50 @@ class LLMNode(LifecycleNode):
             return {'success': True, 'result': result_text, 'query': query}
         return {'success': False, 'error': 'поиск не вернул результат за 30 секунд', 'query': query}
 
-    # Маппинг эмоции → инструкция голоса для CosyVoice3
-    # Лицо и голос меняются одновременно при старте TTS
-    _EMOTION_VOICE = {
-        'neutral':    '',
-        'happy':      'говори радостно и энергично, с улыбкой в голосе',
-        'smile':      'говори тепло и дружелюбно, мягко',
-        'sad':        'говори тихо и с грустью, медленно',
-        'angry':      'говори строго и напряжённо, уверенно',
-        'surprise':   'говори удивлённо и с восхищением',
-        'fear':       'говори испуганно и тревожно',
-        'disgust':    'говори с явным недовольством и отвращением',
-        'thinking':   'говори задумчиво и неторопливо, с паузами',
-        'sorry':      'говори с искренним сожалением и виновато',
-        'suspicious': 'говори настороженно и подозрительно',
-        'unamused':   'говори скучно и без энтузиазма, монотонно',
-        'sigh':       'говори устало, как после долгого вздоха',
-        'wink':       'говори игриво и с хитринкой',
-        'sleeping':   'говори тихо и сонно',
+    # Маппинг 14 эмоций → 1 из 4 голосовых пресетов OmniVoice (server.json →
+    # voice_presets). Клонирование голоса доминирует над instruct-текстом
+    # (наследие CosyVoice3), поэтому свободных инструкций больше нет —
+    # только заранее записанные пресеты. Пресетов под angry/fear/thinking и
+    # т.п. пока нет — откатываются на neutral (лицо всё равно меняется).
+    # Лицо и голос меняются одновременно при старте TTS.
+    _EMOTION_PRESET = {
+        'neutral':    'neutral',
+        'happy':      'happy',
+        'smile':      'happy',
+        'wink':       'happy',
+        'surprise':   'surprise',
+        'sad':        'sad',
+        'sorry':      'sad',
+        'sigh':       'sad',
+        'angry':      'neutral',
+        'fear':       'neutral',
+        'disgust':    'neutral',
+        'thinking':   'neutral',
+        'suspicious': 'neutral',
+        'unamused':   'neutral',
+        'sleeping':   'neutral',
     }
 
     def _tool_express_emotion(self, args: dict) -> dict:
-        emotion  = args.get('emotion', 'neutral').lower()
-        instruct = self._EMOTION_VOICE.get(emotion, '')
+        emotion = args.get('emotion', 'neutral').lower()
+        preset  = self._EMOTION_PRESET.get(emotion, 'neutral')
         with self._lock:
-            # Голос применится при отправке TTS goal (_tts_dispatch)
-            self._voice_style    = {'instruct': instruct}
+            # Голос применится при отправке TTS goal (_send_tts_chunk / _tts_dispatch)
+            self._voice_style    = {'emotion': preset}
             # Лицо — откладываем до старта TTS, чтобы запустить синхронно
             self._pending_emotion = emotion
-        self.get_logger().info(f'Эмоция запланирована: {emotion} | голос: "{instruct}"')
+        self.get_logger().info(f'Эмоция запланирована: {emotion} → голосовой пресет "{preset}"')
         return {'success': True, 'emotion': emotion}
 
     def _tool_set_voice_style(self, args: dict) -> dict:
-        instruct = args.get('instruct', '')
+        style = (args.get('style') or 'neutral').lower()
+        if style not in ('neutral', 'happy', 'sad', 'surprise', ''):
+            self.get_logger().warn(f'set_voice_style: неизвестный пресет "{style}" → neutral')
+            style = 'neutral'
         with self._lock:
-            self._voice_style = {'instruct': instruct}
-        self.get_logger().info(f'Стиль голоса: "{instruct}"')
-        return {'success': True, 'instruct': instruct}
+            self._voice_style = {'emotion': style or 'neutral'}
+        self.get_logger().info(f'Голосовой пресет: "{style or "neutral"}"')
+        return {'success': True, 'style': style or 'neutral'}
 
     def _tool_get_openhab_states(self, args: dict) -> dict:
         names = args.get('names', [])
@@ -2461,16 +2488,20 @@ class LLMNode(LifecycleNode):
                 return
 
         with self._lock:
-            instruct          = self._voice_style.get('instruct', '')
+            voice_preset      = self._voice_style.get('emotion', '')
             emotion           = self._pending_emotion or 'neutral'
             self._pending_emotion = None
-            self._voice_style     = {'instruct': ''}
+            self._voice_style     = {'emotion': ''}
             tg_req_id         = self._tg_req_id
             self._tg_req_id   = ''
 
         payload = {
             'text':           '' if streamed else text,
-            'voice_instruct': instruct,
+            # Поле сохранило старое имя (voice_instruct) для совместимости с
+            # behavior_manager_node.py: раньше содержало instruct-фразу для
+            # CosyVoice3, теперь — имя голосового пресета OmniVoice
+            # (neutral/happy/sad/surprise), см. MIGRATION_NOTES.md.
+            'voice_instruct': voice_preset,
             'emotion':        emotion,
             'streamed':       streamed,
             'telegram':       bool(tg_req_id),
@@ -2483,14 +2514,14 @@ class LLMNode(LifecycleNode):
                 '→ BT: (streamed)'
                 + (' [TG]' if tg_req_id else '')
                 + (f' [{emotion}]' if emotion != 'neutral' else '')
-                + (f' voice="{instruct}"' if instruct else '')
+                + (f' voice="{voice_preset}"' if voice_preset else '')
             )
         else:
             self.get_logger().info(
                 f'→ BT: "{text[:70]}{"..." if len(text)>70 else ""}"'
                 + (' [TG]' if tg_req_id else '')
                 + (f' [{emotion}]' if emotion != 'neutral' else '')
-                + (f' voice="{instruct}"' if instruct else '')
+                + (f' voice="{voice_preset}"' if voice_preset else '')
             )
 
         # Переслать ответ в Telegram если запрос пришёл через /telegram_ask
@@ -2769,7 +2800,6 @@ class LLMNode(LifecycleNode):
         self._tg_resp_pub        = self.create_lifecycle_publisher(String, '/telegram_response', 10)
         self._tts_cancel_pub     = self.create_lifecycle_publisher(Bool,   '/tts_cancel_queue',  10)
         self._conv_end_pub       = self.create_lifecycle_publisher(String, '/conversation_end',  10)
-        self._bs_ctrl_pub        = self.create_lifecycle_publisher(String, '/tts/stream_ctrl',   50)
 
         self._mem_client         = self.create_client(MemoryQuery, '/memory/query')
         self._tts_direct_client  = ActionClient(self, Speak, 'speak')
@@ -2782,7 +2812,6 @@ class LLMNode(LifecycleNode):
         self._tg_resp_pub.on_activate(state)
         self._tts_cancel_pub.on_activate(state)
         self._conv_end_pub.on_activate(state)
-        self._bs_ctrl_pub.on_activate(state)
         self._check_servers()
         # Фоновый прогрев: ждём схему от openhab_bridge (10-15с), затем
         # отправляем минимальный запрос — загружаем модель и наполняем KV-cache.
@@ -2822,7 +2851,6 @@ class LLMNode(LifecycleNode):
         self._tg_resp_pub.on_deactivate(state)
         self._tts_cancel_pub.on_deactivate(state)
         self._conv_end_pub.on_deactivate(state)
-        self._bs_ctrl_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
