@@ -57,10 +57,6 @@ def generate_launch_description():
         DeclareLaunchArgument('llm_temperature',    default_value='0.1'),
         DeclareLaunchArgument('llm_max_tokens',     default_value='512'),
 
-        # Whisper STT
-        DeclareLaunchArgument('whisper_server_url', default_value='http://127.0.0.1:8765'),
-        DeclareLaunchArgument('whisper_language',   default_value='ru'),
-
         # Wake word
         DeclareLaunchArgument('wakeword_model',
             default_value='/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'),
@@ -405,20 +401,18 @@ def generate_launch_description():
         }],
     )
 
-    whisper_stt = LifecycleNode(
+    # STT: Parakeet-TDT-0.6b-v3 (ONNX/CPU) — заменил whisper.cpp 2026-08-27,
+    # 2-4x быстрее вживую. См. project_stt_parakeet_eval.md
+    parakeet_stt = LifecycleNode(
         package='inmoov_voice',
-        executable='whisper_stt_node',
-        name='whisper_stt_node',
+        executable='parakeet_stt_node',
+        name='parakeet_stt_node',
         namespace='',
         output='screen',
         respawn=True,
         respawn_delay=2.0,
         parameters=[{
-            'server_url':          LaunchConfiguration('whisper_server_url'),
-            'language':            LaunchConfiguration('whisper_language'),
-            'min_confidence':      0.6,
-            'no_speech_threshold': 0.9,
-            'request_timeout_sec': 30.0,
+            'language': 'ru',
         }],
     )
 
@@ -648,7 +642,7 @@ def generate_launch_description():
         face_tracker_left,
         face_tracker_right,
         voice_emotion,
-        whisper_stt,
+        parakeet_stt,
         face_recognition,
         face_gallery,
         emotion_recognition,

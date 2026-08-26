@@ -6,7 +6,7 @@ voice.launch.py — запуск всего голосового пайплай�
   audio_source_node  → raw_audio
   openwakeword_node  → wake_detected
   voice_detector_node → audio_to_whisper
-  whisper_stt_node   → voice_command
+  parakeet_stt_node  → voice_command
   tts_node           (action server /speak)
   llm_node           (intent generator — пакет behavior_manager_node)
 
@@ -51,10 +51,6 @@ def generate_launch_description():
         DeclareLaunchArgument('llm_model',           default_value='qwen3.8-27b'),
         DeclareLaunchArgument('llm_temperature',     default_value='0.1'),
         DeclareLaunchArgument('llm_max_tokens',      default_value='512'),
-
-        # Whisper STT (whisper.cpp HTTP server)
-        DeclareLaunchArgument('whisper_server_url',  default_value='http://127.0.0.1:8765'),
-        DeclareLaunchArgument('whisper_language',    default_value='ru'),
 
         # Wake word
         DeclareLaunchArgument('wakeword_model',      default_value='/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'),
@@ -162,21 +158,17 @@ def generate_launch_description():
         }],
     )
 
-    # 5. Whisper STT — HTTP-клиент к whisper.cpp серверу (запускать сервер отдельно: ~/start_whisper_server.sh)
-    whisper = TimerAction(
+    # 5. STT — Parakeet-TDT-0.6b-v3 (CPU, ONNX), заменил whisper.cpp 2026-08-27
+    parakeet = TimerAction(
         period=2.0,
         actions=[Node(
             package='inmoov_voice',
-            executable='whisper_stt_node',
-            name='whisper_stt_node',
+            executable='parakeet_stt_node',
+            name='parakeet_stt_node',
             output='screen',
 
             parameters=[{
-                'server_url':          LaunchConfiguration('whisper_server_url'),
-                'language':            LaunchConfiguration('whisper_language'),
-                'min_confidence':      0.6,
-                'no_speech_threshold': 0.9,
-                'request_timeout_sec': 30.0,
+                'language': 'ru',
             }],
         )],
     )
@@ -212,6 +204,6 @@ def generate_launch_description():
         voice_detector,
         voice_emotion,
         tts,
-        whisper,
+        parakeet,
         llm,
     ])
