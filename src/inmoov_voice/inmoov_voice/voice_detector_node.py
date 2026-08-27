@@ -120,6 +120,7 @@ class VoiceDetectorNode(LifecycleNode):
         self._sv_seg_samples    = 0
         self._sv_gallery        = []
         self._sv_gallery_times  = []
+        self._sv_anchor_person_id = None  # чей якорь сейчас в _sv_gallery (None = живая сессия без анкора из БД)
         self._SV_GALLERY_MAX    = 10
         self._sv_last_gallery_add      = 0.0
         self._SV_GALLERY_ADD_INTERVAL  = 30.0
@@ -199,6 +200,7 @@ class VoiceDetectorNode(LifecycleNode):
             if not person_active:
                 self._sv_gallery.clear()
                 self._sv_gallery_times.clear()
+                self._sv_anchor_person_id = None
                 self._sv_last_gallery_add = 0.0
             return
 
@@ -215,6 +217,7 @@ class VoiceDetectorNode(LifecycleNode):
         if not person_active:
             self._sv_gallery.clear()
             self._sv_gallery_times.clear()
+            self._sv_anchor_person_id = None
             self._sv_last_gallery_add = 0.0
 
     def _stt_done_callback(self, msg: String):
@@ -256,6 +259,7 @@ class VoiceDetectorNode(LifecycleNode):
             self._sv_buf.clear()
         self._sv_gallery.clear()
         self._sv_gallery_times.clear()
+        self._sv_anchor_person_id = None
         self._sv_last_gallery_add = 0.0
         self._introducing = False
         self.get_logger().info('go_idle: прекращаю запись, возвращаюсь к wake word')
@@ -277,6 +281,7 @@ class VoiceDetectorNode(LifecycleNode):
             self._stt_sent_time = 0.0
             self._sv_gallery.clear()
             self._sv_gallery_times.clear()
+            self._sv_anchor_person_id = None
             self._sv_last_gallery_add = 0.0
             self._introducing = False
             self.get_logger().info('Спящий режим: авто-активация отключена')
@@ -369,16 +374,34 @@ class VoiceDetectorNode(LifecycleNode):
     def _voice_anchor_cb(self, msg: String):
         """Загружаем голосовую галерею из БД (identity_manager → voice_detector).
 
-        Галерея устанавливается только если текущая галерея пуста (нет живых данных).
         Получаем полный JSON: {person_id, name, gallery: [{embedding, timestamp}]}
+
+        Если текущая живая галерея уже принадлежит ЭТОМУ ЖЕ person_id — не
+        перезаписываем (живые записи сессии точнее старого снимка из БД).
+        Но если анкор для ДРУГОГО человека (собеседник сменился, а живая
+        галерея не была сброшена — напр. тихий IDLE без /go_idle в грейс-окне
+        person_present) — заменяем гарантированно, иначе SV будет сверять
+        новый голос со старым и отбрасывать его как чужой (инцидент 2026-08-25).
         """
         if not self._sv_enabled or self._sv_encoder is None:
             return
-        if self._sv_gallery:
-            return  # живая галерея уже есть — не перезаписываем
         try:
             import json as _json
             data = _json.loads(msg.data)
+            anchor_person_id = data.get('person_id')
+        except Exception as e:
+            self.get_logger().warn(f'SV: ошибка парсинга голосовой галереи: {e}')
+            return
+        if self._sv_gallery:
+            if anchor_person_id is not None and anchor_person_id == self._sv_anchor_person_id:
+                return  # живая галерея уже принадлежит этому же человеку — не перезаписываем
+            self.get_logger().info(
+                f'SV: якорь сменился (было person_id={self._sv_anchor_person_id}, '
+                f'стало {anchor_person_id}) — заменяю живую галерею ({len(self._sv_gallery)} записей)')
+            self._sv_gallery.clear()
+            self._sv_gallery_times.clear()
+        self._sv_anchor_person_id = anchor_person_id
+        try:
             gallery = data.get('gallery', [])
             if not gallery:
                 # Fallback: legacy single-embedding формат
