@@ -10,6 +10,15 @@ face_detection_node.py
 insightface запускается в фоновом потоке.
 Частота анализа регулируется параметром detection_hz (default 1.5 Hz).
 
+Fallback-по-требованию (параметр fallback_for):
+  Если задан непустым (топик другого глаза, напр. '/face/detections/left'),
+  нода не гоняет insightface постоянно — она слушает этот топик как heartbeat
+  primary-камеры и запускает собственную детекцию только когда primary не
+  публиковал дольше primary_timeout_sec (default 1.5с). Экономит CPU: правый
+  глаз (fallback) не молотит insightface параллельно с левым (primary) 24/7,
+  а включается только когда левый реально пропал (камера отвалилась/процесс
+  упал) — то есть настоящий fallback, а не постоянное дублирование.
+
 Подписки:
   /camera/eye_{camera_side}/compressed  (sensor_msgs/CompressedImage)
 
@@ -36,6 +45,7 @@ import time
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
@@ -57,6 +67,10 @@ class FaceDetectionNode(LifecycleNode):
         self._busy         = False
         self._enabled      = False
         self._last_frame_t = self._last_detect_t = self._no_face_since = 0.0
+        self._fallback_for       = ''
+        self._primary_timeout    = 1.5
+        self._last_primary_t     = 0.0
+        self._fallback_active    = False
 
     def _dp(self, name, default=None):
         """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
@@ -69,15 +83,34 @@ class FaceDetectionNode(LifecycleNode):
         self._dp('det_size',     640)
         self._dp('det_thresh',   0.4)
         self._dp('model_name',   'buffalo_l')
+        self._dp('intra_op_threads', 2)
+        self._dp('inter_op_threads', 1)
+        self._dp('fallback_for',        '')
+        self._dp('primary_timeout_sec', 1.5)
 
         self._side   = self.get_parameter('camera_side').value
         self._det_hz = self.get_parameter('detection_hz').value
         det_size     = self.get_parameter('det_size').value
         det_thresh   = self.get_parameter('det_thresh').value
         model_name   = self.get_parameter('model_name').value
+        intra_op     = self.get_parameter('intra_op_threads').value
+        inter_op     = self.get_parameter('inter_op_threads').value
+        self._fallback_for    = self.get_parameter('fallback_for').value
+        self._primary_timeout = self.get_parameter('primary_timeout_sec').value
+
+        # По умолчанию ORT разворачивает пул потоков под все логические ядра
+        # для КАЖДОЙ из ~5 моделей buffalo_l (intra_op_num_threads=0 = auto).
+        # При двух процессах (left+right) на 16 логических ядрах это даёт
+        # конкуренцию за потоки и ~350-370% CPU на процесс. Ограничиваем пул
+        # явно — insightface.FaceAnalysis(**kwargs) прокидывает sess_options
+        # до onnxruntime.InferenceSession без изменений.
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = intra_op
+        sess_options.inter_op_num_threads = inter_op
 
         self.get_logger().info(f'Загрузка insightface ({model_name}, side={self._side})...')
-        self._app = FaceAnalysis(name=model_name, providers=['CPUExecutionProvider'])
+        self._app = FaceAnalysis(
+            name=model_name, providers=['CPUExecutionProvider'], sess_options=sess_options)
         self._app.prepare(ctx_id=0, det_size=(det_size, det_size), det_thresh=det_thresh)
         self.get_logger().info('insightface загружен')
 
@@ -91,9 +124,15 @@ class FaceDetectionNode(LifecycleNode):
         )
         self.create_subscription(CompressedImage, cam_topic, self._frame_callback, 5)
         self.create_subscription(_Bool, '/face_detection/enable', self._enable_cb, latched_qos)
+        if self._fallback_for:
+            self.create_subscription(
+                String, self._fallback_for, self._primary_heartbeat_cb, 5)
         self._pub = self.create_lifecycle_publisher(String, det_topic, 10)
+        fb_note = f', fallback_for={self._fallback_for} (timeout={self._primary_timeout}с)' \
+            if self._fallback_for else ''
         self.get_logger().info(
-            f'FaceDetection configured (side={self._side}, hz={self._det_hz}, det_size={det_size})')
+            f'FaceDetection configured (side={self._side}, hz={self._det_hz}, '
+            f'det_size={det_size}{fb_note})')
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
@@ -135,11 +174,28 @@ class FaceDetectionNode(LifecycleNode):
         self._no_face_since = 0.0
         self.get_logger().info(f'FaceDetection: {"включена" if msg.data else "выключена"}')
 
+    def _primary_heartbeat_cb(self, msg) -> None:
+        """Приход ЛЮБОГО сообщения от primary-камеры = она жива, не важно нашла ли лицо."""
+        self._last_primary_t = time.time()
+
     def _trigger_detection(self):
         if not self._enabled:
             return
         if self._busy:
             return
+        if self._fallback_for:
+            primary_alive = (time.time() - self._last_primary_t) < self._primary_timeout
+            if primary_alive:
+                if self._fallback_active:
+                    self.get_logger().info(
+                        f'Primary ({self._fallback_for}) восстановилась — fallback ({self._side}) в резерв')
+                self._fallback_active = False
+                return
+            if not self._fallback_active:
+                self._fallback_active = True
+                self.get_logger().warn(
+                    f'Primary ({self._fallback_for}) молчит >{self._primary_timeout}с — '
+                    f'активирую fallback-детекцию на {self._side}')
         with self._frame_lock:
             if self._latest_frame is None:
                 return
@@ -197,8 +253,9 @@ class FaceDetectionNode(LifecycleNode):
                 f'Камера молчит {now - self._last_frame_t:.1f}с — нет кадров с /camera/eye_{self._side}/compressed')
         elif self._last_frame_t == 0.0:
             self.get_logger().warn('Кадры с камеры ещё не получены')
-        # Детекция не запускается?
-        if self._last_detect_t > 0.0 and (now - self._last_detect_t) > 3.0:
+        # Детекция не запускается? (fallback-нода в резерве не детектит — это норма, не варним)
+        in_standby = bool(self._fallback_for) and not self._fallback_active
+        if not in_standby and self._last_detect_t > 0.0 and (now - self._last_detect_t) > 3.0:
             self.get_logger().warn(
                 f'Детекция не запускается {now - self._last_detect_t:.1f}с (busy={self._busy})')
         # Лицо давно не найдено

@@ -37,7 +37,7 @@ def generate_launch_description():
         DeclareLaunchArgument('cam_right',
             default_value='/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0'),
         DeclareLaunchArgument('fps',                  default_value='15'),
-        DeclareLaunchArgument('detection_hz',         default_value='5.0'),
+        DeclareLaunchArgument('detection_hz',         default_value='2.5'),
         DeclareLaunchArgument('det_thresh',           default_value='0.5'),
         DeclareLaunchArgument('analysis_hz',          default_value='2.0'),
         DeclareLaunchArgument('gain_head',            default_value='0.3'),
@@ -84,6 +84,9 @@ def generate_launch_description():
     )
 
     # 2b. Детекция лиц — правый глаз (buffalo_l: bbox + embedding для fallback/redundancy)
+    # Настоящий fallback-по-требованию: insightface на правом включается только
+    # когда левый (primary) реально не публикует >1.5с, а не гоняется постоянно
+    # параллельно с левым — экономия CPU.
     face_detection_right = Node(
         package='inmoov_vision',
         executable='face_detection_node',
@@ -95,6 +98,8 @@ def generate_launch_description():
             'det_size':     640,
             'det_thresh':   LaunchConfiguration('det_thresh'),
             'model_name':   'buffalo_l',
+            'fallback_for':        '/face/detections/left',
+            'primary_timeout_sec': 1.5,
         }],
     )
 
