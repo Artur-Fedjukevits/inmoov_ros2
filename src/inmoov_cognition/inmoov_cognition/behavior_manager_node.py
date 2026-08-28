@@ -26,6 +26,7 @@ Blackboard ключи (BehaviorManagerNode заполняет из подпис�
   /social/introducing      bool  — идёт сбор имени
   /social/introduce_pending bool — IdentityManager просит произнести фразу знакомства
   /social/introduce_text   str   — текст для произнесения в режиме знакомства
+  /social/face_search_pending bool — пора попробовать повторный поиск лица (см. FaceSearchAttempt)
   /search/query            str   — запрос для поиска
   /search/result           dict  — результат поиска
 
@@ -36,7 +37,10 @@ Blackboard ключи (BehaviorManagerNode заполняет из подпис�
   ├── RobotCommand     — pending физическая команда от LLM (move/arm/head)
   ├── WebSearch        — pending поисковый запрос от LLM
   ├── SocialBranch     — если человек в кадре:
-  │     IntroducingBlock / GreetBranch / DialogueBranch / IdleGaze
+  │     IntroducingBlock / GreetBranch / FaceSearchBranch / DialogueBranch / IdleGaze
+  │     (FaceSearchBranch — повторный поиск лица по звуку/голосовой подсказке
+  │      на каждой реплике, пока head_tracker не поймал лицо; живёт здесь, а
+  │      не в SoundScanBranch ниже, т.к. та не тикается, пока идёт диалог)
   ├── FarewellBranch   — если человек только что ушёл: прощание
   ├── SoundScanBranch  — wake word: поворот КОРПУСА на голос (/sound_direction) до /human_detected
   ├── PIRScanBranch    — чистое PIR-движение (без голоса): голова влево→вправо→центр
@@ -130,6 +134,17 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
     _REST_ROTHEAD = 90.0
     _REST_NECK    = 40.0
 
+    # Корпус (midstom): rest=90, min=60, max=120 (arduino_left_node) — та же конвенция
+    # знака, что и у rothead: LEFT=60/RIGHT=120 (проверено руками 2026-08-24, см. память
+    # project_sound_localization_gcc_phat.md). scope='partial' добавляет часть этого
+    # диапазона в ту же сторону, что и pan — используется когда одной головы не хватает,
+    # чтобы навести камеру на собеседника, стоящего сбоку.
+    _REST_MIDSTOM           = 90.0
+    _TORSO_MIN              = 60.0
+    _TORSO_MAX              = 120.0
+    _TORSO_HALF_RANGE       = 30.0   # _REST_MIDSTOM ± это = _TORSO_MIN/_TORSO_MAX
+    _TORSO_PARTIAL_FRACTION = 0.3    # scope='partial'
+
     def __init__(self, node: Node):
         super().__init__('ExecuteRobotCommand')
         self._node       = node
@@ -139,6 +154,20 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         self._pub_stat   = node.create_publisher(String,     'status_request',   10)
         self._timer      = None   # таймер остановки движения
         self._head_timer = None   # таймер возврата head_tracker после ручной команды
+        self._last_scope = 'head'  # scope последней head-команды — нужно ли вернуть корпус в центр
+
+        # Отслеживаем текущее rothead/neck по ЛЮБЫМ сообщениям /joint_command (в т.ч.
+        # от самого head_tracker, пока он ведёт лицо) — чтобы перед ручной командой
+        # (robot_control/look_direction) знать, ГДЕ было лицо, и после неё вернуть
+        # голову туда же, а не в REST. Тот же паттерн, что и
+        # vision_head_tracker_node._external_joint_cb.
+        self._known_rothead     = self._REST_ROTHEAD
+        self._known_neck        = self._REST_NECK
+        self._pre_turn_rothead  = self._REST_ROTHEAD
+        self._pre_turn_neck     = self._REST_NECK
+        self._override_active   = False   # True между ручной командой и resume
+        self._sub_joint = node.create_subscription(
+            JointState, '/joint_command', self._track_joint_cb, 10)
 
         self._bb = py_trees.blackboard.Client(name='ExecCmd')
         self._bb.register_key(key='/robot/command',
@@ -171,26 +200,59 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
 
         self._bb.robot.command = {}
 
+    def _track_joint_cb(self, msg: JointState):
+        for name, pos in zip(msg.name, msg.position):
+            if name == 'rothead':
+                self._known_rothead = pos * 180.0 / math.pi + 90.0
+            elif name == 'neck':
+                self._known_neck    = pos * 180.0 / math.pi + 90.0
+
     def _do_head(self, cmd: dict):
-        pan  = float(cmd.get('pan',  0))
-        tilt = float(cmd.get('tilt', 0))
+        pan   = float(cmd.get('pan',  0))
+        tilt  = float(cmd.get('tilt', 0))
+        scope = str(cmd.get('scope') or 'head').strip().lower()
+        if scope not in ('head', 'partial', 'full'):
+            scope = 'head'
+
+        if not self._override_active:
+            # Первая ручная команда в серии — запоминаем, где было лицо ДО нас,
+            # чтобы после resume вернуть голову туда (а не в REST). Если команд
+            # несколько подряд (посмотри направо, потом налево) — не перезаписываем
+            # снимок промежуточной повёрнутой позицией.
+            self._pre_turn_rothead = self._known_rothead
+            self._pre_turn_neck    = self._known_neck
+            self._override_active  = True
 
         rothead = max(30.0, min(140.0, self._REST_ROTHEAD + pan))
         neck    = max(0.0,  min(100.0, self._REST_NECK    + tilt))
 
-        msg = JointState()
-        msg.name     = ['rothead', 'neck']
-        msg.position = [
+        names     = ['rothead', 'neck']
+        positions = [
             (rothead - 90.0) * math.pi / 180.0,
             (neck    - 90.0) * math.pi / 180.0,
         ]
+
+        midstom = None
+        if scope in ('partial', 'full') and pan != 0:
+            fraction = self._TORSO_PARTIAL_FRACTION if scope == 'partial' else 1.0
+            offset   = math.copysign(self._TORSO_HALF_RANGE * fraction, pan)
+            midstom  = max(self._TORSO_MIN, min(self._TORSO_MAX, self._REST_MIDSTOM + offset))
+            names.append('midstom')
+            positions.append((midstom - 90.0) * math.pi / 180.0)
+
+        msg = JointState()
+        msg.name     = names
+        msg.position = positions
 
         # Выключаем head_tracker ПЕРВЫМ — он опубликует REST(rothead=90,neck=40) на /joint_command.
         # Публикуем нашу команду через 200мс: REST гарантированно придёт в arduino раньше,
         # наша команда придёт позже и перезапишет его. Без задержки REST перезаписывает нас.
         self._node.enable_head_tracker(False)
+        self._last_scope = scope
+        torso_log = f' midstom={midstom:.0f}°' if midstom is not None else ''
         self._node.get_logger().info(
-            f'Head: pan={pan:+.0f}° tilt={tilt:+.0f}° → rothead={rothead:.0f}° neck={neck:.0f}°')
+            f'Head: pan={pan:+.0f}° tilt={tilt:+.0f}° scope={scope} → '
+            f'rothead={rothead:.0f}° neck={neck:.0f}°{torso_log}')
 
         if self._head_timer:
             self._head_timer.cancel()
@@ -200,6 +262,8 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
 
     def _send_head_cmd(self, msg: JointState):
         msg.header.stamp = self._node.get_clock().now().to_msg()
+        if 'midstom' in msg.name:
+            self._node.note_own_torso_move()
         self._pub_joint.publish(msg)
         # Через 5с возвращаем управление head_tracker (возобновит слежение за лицом)
         self._head_timer = threading.Timer(5.0, self._resume_head_tracker)
@@ -207,6 +271,40 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         self._head_timer.start()
 
     def _resume_head_tracker(self):
+        # Сначала физически возвращаем голову (и корпус, если двигали) туда, где
+        # было лицо ДО ручной команды — иначе head_tracker включится там, куда мы
+        # повернули (например, крайне вправо), не найдёт там лицо в течение
+        # return_timeout_sec (7с) и сам уедет в REST, теряя собеседника.
+        back = JointState()
+        back.header.stamp = self._node.get_clock().now().to_msg()
+        back.name     = ['rothead', 'neck']
+        back.position = [
+            (self._pre_turn_rothead - 90.0) * math.pi / 180.0,
+            (self._pre_turn_neck    - 90.0) * math.pi / 180.0,
+        ]
+        if self._last_scope != 'head':
+            # Корпус двигали ручной командой (scope=partial/full) — head_tracker
+            # управляет только головой, поэтому корпус сам не вернётся в центр.
+            back.name.append('midstom')
+            back.position.append(0.0)
+            self._node.note_own_torso_move()
+        self._pub_joint.publish(back)
+        self._node.get_logger().info(
+            f'Head: возврат к позиции до команды rothead={self._pre_turn_rothead:.0f}° '
+            f'neck={self._pre_turn_neck:.0f}°')
+        self._last_scope       = 'head'
+        self._override_active  = False
+
+        # Даём серво время физически довернуться (обратный путь может быть до ~70°,
+        # столько же, сколько исходный поворот — берём тот же порядок величины),
+        # потом включаем head_tracker — он подхватывает слежение уже с правильной
+        # позиции (или, если лицо действительно ушло, спокойно уедет в REST по
+        # своему таймауту).
+        self._head_timer = threading.Timer(1.5, self._enable_tracker_now)
+        self._head_timer.daemon = True
+        self._head_timer.start()
+
+    def _enable_tracker_now(self):
         self._node.enable_head_tracker(True)
         self._head_timer = None
         self._node.get_logger().info('Head: возврат управления head_tracker')
@@ -679,6 +777,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
         self._target     = self._CENTER
 
     def _torso_cmd(self, midstom: float) -> None:
+        self._node.note_own_torso_move()
         msg = JointState()
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.name     = ['midstom']
@@ -764,6 +863,12 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
         elif self._phase == 1:
             if now < self._phase_end:
                 return py_trees.common.Status.RUNNING
+            if self._target == self._CENTER:
+                # Уже стояли по центру (направление было неуверенным с самого
+                # начала, никуда не поворачивались) — возвращать нечего, лишний
+                # _torso_cmd и confusing лог "возврат в центр". Живой баг
+                # 2026-08-28 (замечено пользователем).
+                return self._done()
             self._phase = 2
             self._torso_cmd(self._CENTER)
             self._phase_end = now + self._GO_DURATION
@@ -787,6 +892,15 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
         self._completed = True
         self._node.enable_face_detection(False)
         self._bb.sound.scan_active = False
+        # Первая неудача сессии (сразу после wake word) — засчитываем как
+        # попытку #1 в общем счётчике face-search retry, чтобы "второй раз"
+        # (сформулировано пользователем) естественно совпал с первой попыткой
+        # уже во время диалога (см. FaceSearchAttempt/record_face_search_attempt).
+        self._node._face_search_attempts = 1
+        self._node._face_search_pending_check = {
+            'direction': None if self._target == self._CENTER else self._target
+        }
+        self._node._publish_face_search_status(active=True, attempts=1, ask_now=False)
         self._node.get_logger().info('SoundScan: завершён — человек не найден, face_detection выключена')
         return py_trees.common.Status.SUCCESS
 
@@ -801,6 +915,55 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
             # SocialBranch перехватил раньше, чем мы сами увидели /human_detected).
             self._node.enable_head_tracker(True)
             self._node.get_logger().info('SoundScan: прерван (человек найден) — head_tracker включён')
+
+
+class FaceSearchAttempt(py_trees.behaviour.Behaviour):
+    """Один быстрый НЕБЛОКИРУЮЩИЙ поворот корпуса за реплику диалога, пока
+    head_tracker не поймал лицо (см. project memory: face search retry).
+
+    В отличие от SoundScanBehaviour (одноразовый скан сразу после wake word,
+    который перестаёт тикаться, как только начался диалог — SocialBranch
+    стоит выше SoundScanBranch по приоритету) — этот лист живёт ВНУТРИ
+    social_selector, поэтому продолжает получать шанс на каждой реплике,
+    пока идёт разговор.
+
+    НЕ ждёт /human_detected (нет dwell) — возвращает SUCCESS в том же тике,
+    чтобы не задерживать речь дольше одного тика BT (~100мс @ 10Гц).
+    Приоритет направления: голосовая подсказка собеседника (/voice/direction_hint,
+    разобрана в llm_node) > /sound_direction > ничего (просто ждём следующую
+    реплику). Логику выбора направления/счётчика/статуса делегирует узлу —
+    см. BehaviorManagerNode.record_face_search_attempt().
+    """
+
+    def __init__(self, node: Node):
+        super().__init__('FaceSearchAttempt')
+        self._node = node
+        self._torso_pub = node.create_publisher(JointState, '/joint_command', 10)
+
+    def update(self) -> py_trees.common.Status:
+        node = self._node
+        now = time.monotonic()
+        if now - node._face_search_last_attempt_mono < node._FACE_SEARCH_MIN_RETRY_INTERVAL_SEC:
+            return py_trees.common.Status.SUCCESS  # слишком рано после прошлого доворота — пропуск
+
+        target, source = node.record_face_search_attempt()
+        node.enable_face_detection(True)
+        if target is not None:
+            node.note_own_torso_move()
+            msg = JointState()
+            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.name     = ['midstom']
+            msg.position = [(target - 90.0) * math.pi / 180.0]
+            msg.velocity = [1.0]
+            self._torso_pub.publish(msg)
+            node.get_logger().info(
+                f'FaceSearch: попытка #{node._face_search_attempts} — '
+                f'{source} → midstom={target:.0f}°')
+        else:
+            node.get_logger().info(
+                f'FaceSearch: попытка #{node._face_search_attempts} — '
+                f'направления нет, жду следующую реплику')
+        return py_trees.common.Status.SUCCESS
 
 
 class IdleBlinkBehaviour(py_trees.behaviour.Behaviour):
@@ -1002,10 +1165,25 @@ def build_tree(node: Node, tavily_key: str) -> py_trees.behaviour.Behaviour:
         ]
     )
 
+    # Повторный поиск лица по звуку/голосовой подсказке — живёт ВНУТРИ
+    # social_selector (не в SoundScanBranch/PIRScanBranch ниже по дереву —
+    # те никогда не тикаются, пока идёт диалог, см. project memory face
+    # search retry). Все три ребёнка возвращают SUCCESS синхронно за один
+    # тик, поэтому dialogue_branch стартует речь с задержкой не больше ~100мс.
+    face_search_branch = py_trees.composites.Sequence(
+        'FaceSearchBranch', memory=False, children=[
+            CheckBB('HasFaceSearchPending', '/social/face_search_pending',
+                    check_fn=lambda v: v is True),
+            FaceSearchAttempt(node),
+            SetBB('ClearFaceSearchPending', '/social/face_search_pending', False),
+        ]
+    )
+
     social_selector = py_trees.composites.Selector(
         'SocialSelector', memory=False, children=[
             introducing_block,
             greet_branch,
+            face_search_branch,
             dialogue_branch,
             IdleBlinkBehaviour(node, 'IdleGaze'),  # слежение глазами + моргание
         ]
@@ -1081,12 +1259,39 @@ def build_tree(node: Node, tavily_key: str) -> py_trees.behaviour.Behaviour:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class BehaviorManagerNode(LifecycleNode):
+    # Пороги face-search retry (см. FaceSearchAttempt) — не чаще раза в
+    # _FACE_SEARCH_MIN_RETRY_INTERVAL_SEC (защита от дублей поворота, если
+    # несколько реплик/потерь трека приходят быстрее одного цикла движения
+    # корпуса), спросить "где ты" не раньше _FACE_SEARCH_ASK_MIN_ATTEMPTS
+    # неудачных попыток и не чаще раза в _FACE_SEARCH_ASK_COOLDOWN_SEC.
+    _FACE_SEARCH_MIN_RETRY_INTERVAL_SEC = 2.5
+    _FACE_SEARCH_ASK_MIN_ATTEMPTS       = 2
+    _FACE_SEARCH_ASK_COOLDOWN_SEC       = 15.0
+    # Грейс перед реакцией на потерю лица посреди диалога (_face_locked_cb) —
+    # /head_tracker/face_locked и так флипается в False только после 2с
+    # "устаревания" трека (_STALE_SEC в vision_head_tracker_node), но короткие
+    # потери (моргание, отвёл взгляд на секунду) — обычное дело в разговоре и
+    # самовосстанавливаются. Живой баг 2026-08-28: без этого грейса каждая
+    # такая мелочь запускала реальный доворот корпуса каждые несколько секунд
+    # ("чередовал потерю лица и его нахождение"). Ждём ещё столько же поверх
+    # штатных 2с — итого ~5с, всё ещё заметно быстрее полного возврата в
+    # покой у head_tracker (return_timeout_sec, по факту ~7с).
+    _FACE_LOST_GRACE_SEC = 3.0
+    # PIR-датчик физически стоит В КОРПУСЕ — когда мы сами поворачиваем торс
+    # (SoundScan/FaceSearch/ручная robot_control-команда с scope=partial|full),
+    # датчик видит собственное движение робота и принимает его за человека,
+    # запуская PIRScan прямо посреди диалога. Живой баг 2026-08-28 (нашёл
+    # пользователь). Окно подобрано с запасом над временем поворота
+    # (~60°/1.0рад/с ≈ 1с) + типичной задержкой PIR/Arduino heartbeat.
+    _PIR_SELF_MOTION_BLANK_SEC = 2.5
+
     def __init__(self):
         super().__init__('behavior_manager_node')
 
-        self._pir_cooldown     = 20.0  # будет перезаписан в on_configure
-        self._pir_next_scan_at = 0.0
-        self._pir_prev_state   = False
+        self._pir_cooldown         = 20.0  # будет перезаписан в on_configure
+        self._pir_next_scan_at     = 0.0
+        self._pir_prev_state       = False
+        self._last_own_torso_move_mono = float('-inf')
 
         # Кэш последнего /sound_direction и /human_detected для SoundScanBehaviour
         # (читает через getattr(node, ...), не через topic-подписку в самом behaviour)
@@ -1094,6 +1299,17 @@ class BehaviorManagerNode(LifecycleNode):
         self._last_sound_confidence = 0.0
         self._human_detected        = False
         self._last_human_angle      = 0.0   # /human_angle_deg (OAK-D, atan2(x_mm,z_mm)) — SoundScanBehaviour наводит голову перед enable_head_tracker
+
+        # ── Face-search retry (повторный поиск лица на каждой реплике, пока
+        # head_tracker не поймал лицо — см. FaceSearchAttempt/_face_locked_cb) ──
+        self._face_locked                   = False   # /head_tracker/face_locked
+        self._face_ever_locked              = False   # хоть раз поймали в этой сессии?
+        self._last_direction_hint           = 'none'  # /voice/direction_hint
+        self._face_search_attempts          = 0
+        self._face_search_pending_check     = None    # {'direction': deg|None} — исход ПРЕДЫДУЩЕЙ попытки
+        self._face_search_last_attempt_mono = 0.0
+        self._face_search_last_ask_mono     = float('-inf')
+        self._face_lost_since               = None    # monotonic ts потери — грейс перед реакцией
 
         # ── Blackboard инициализация ──────────────────────────────────────
         self._bb = py_trees.blackboard.Client(name='BehaviorManager')
@@ -1120,6 +1336,7 @@ class BehaviorManagerNode(LifecycleNode):
             '/search/result':           {},
             '/pir/scan_active':         False,
             '/sound/scan_active':       False,
+            '/social/face_search_pending': False,
             '/scene/person_count':      0,
             '/scene/objects_summary':   '',
             '/scene/location':          '',
@@ -1148,6 +1365,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._bb.search.result           = {}
         self._bb.pir.scan_active         = False
         self._bb.sound.scan_active       = False
+        self._bb.social.face_search_pending = False
         self._bb.scene.person_count      = 0
         self._bb.scene.objects_summary   = ''
         self._bb.scene.location          = ''
@@ -1179,6 +1397,136 @@ class BehaviorManagerNode(LifecycleNode):
         msg.data = enabled
         self._head_tracker_pub.publish(msg)
 
+    def note_own_torso_move(self) -> None:
+        """Вызывать при КАЖДОЙ команде на сустав midstom — PIR физически в
+        корпусе и видит собственное вращение робота как "движение человека"
+        (см. _PIR_SELF_MOTION_BLANK_SEC/_pir_cb)."""
+        self._last_own_torso_move_mono = time.monotonic()
+
+    # ── Face-search retry (см. FaceSearchAttempt) ─────────────────────────
+
+    def _reset_face_search(self) -> None:
+        """Сброс сессии поиска лица — новая сессия (wake word/сон), человек
+        ушёл, или лицо реально поймано. НЕ вызывать на промежуточные успехи
+        типа SoundScanBehaviour._found() (OAK-D грубо увидел тело) — там лицо
+        ещё может не поймать head_tracker несколько секунд."""
+        self._face_search_attempts      = 0
+        self._face_ever_locked          = False
+        self._face_search_pending_check = None
+        self._face_search_last_ask_mono = float('-inf')
+        self._last_direction_hint       = 'none'
+        self._face_lost_since           = None
+        # На случай, если флаг успел выставиться до сброса (например,
+        # _direction_hint_cb сработал на подсказку из уходящей сессии) —
+        # иначе он "выстрелит" в следующей, уже не связанной сессии.
+        self._bb.social.face_search_pending = False
+        self._publish_face_search_status(active=False, attempts=0, ask_now=False)
+
+    def _publish_face_search_status(self, active: bool, attempts: int, ask_now: bool) -> None:
+        msg = String()
+        msg.data = json.dumps({
+            'active': active,
+            'attempts': attempts,
+            'ask_now': ask_now,
+            'kind': 'never_found' if not self._face_ever_locked else 'lost_again',
+        })
+        self._face_search_status_pub.publish(msg)
+
+    def _face_locked_cb(self, msg: Bool):
+        was_locked = self._face_locked
+        self._face_locked = msg.data
+
+        if msg.data:
+            self._face_lost_since = None
+            if not was_locked:
+                # Нашли (или заново поймали) — сессия поиска закончена.
+                self._face_ever_locked = True
+                self._face_search_attempts = 0
+                self._face_search_pending_check = None
+                self._face_search_last_ask_mono = float('-inf')
+                # Если флаг успел выставиться (реплика/потеря пришли чуть раньше,
+                # чем head_tracker сам заново поймал лицо) — снимаем, иначе
+                # FaceSearchBranch сделает лишний доворот сразу после находки.
+                self._bb.social.face_search_pending = False
+                self._publish_face_search_status(active=False, attempts=0, ask_now=False)
+                self.get_logger().info('FaceSearch: HeadTracker поймал лицо — сброс счётчика')
+            return
+
+        # msg.data == False. Потеряли — НЕ реагируем мгновенно: короткие потери
+        # (моргание, на секунду отвёл взгляд) — обычное дело в разговоре и
+        # самовосстанавливаются за меньше секунды (см. живой баг 2026-08-28 —
+        # без грейса каждая такая мелочь дёргала корпус). Даём _FACE_LOST_GRACE_SEC
+        # сверху штатных 2с "устаревания" трека, и реагируем только если потеря
+        # продержалась дольше — это уже не моргание.
+        if was_locked:
+            self._face_lost_since = time.monotonic()
+            return
+        if self._face_lost_since is None:
+            return  # эту потерю уже обработали (или её не было) — не спамим
+        if time.monotonic() - self._face_lost_since < self._FACE_LOST_GRACE_SEC:
+            return
+
+        self._face_lost_since = None  # обработали — следующий триггер только по новой потере/реплике
+        if self._bb.social.person_present:
+            self._bb.social.face_search_pending = True
+            self.get_logger().info(
+                f'FaceSearch: лицо потеряно >{self._FACE_LOST_GRACE_SEC:.1f}с '
+                f'во время диалога — планирую попытку')
+
+    def _direction_hint_cb(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        self._last_direction_hint = data.get('direction', 'none')
+        if self._face_locked:
+            return
+        # НЕ гейтим на текущий /social/person_present: при возврате человека
+        # (после тихого ухода/OakD-вето) эта подсказка приходит РАНЬШЕ, чем
+        # person_present успевает стать True (тот выставляется позже — либо
+        # _llm_response_cb уже ПОСЛЕ ответа LLM на ту же реплику, либо
+        # _social_ctx_cb ещё держит False, пока identity_manager в IDLE).
+        # Живой баг 2026-08-28: "Я нахожусь слева от тебя" был молча отброшен
+        # именно этим гейтом. FaceSearchBranch сам гейтится на person_present
+        # на уровне BT (social_branch) — выставлять флаг здесь безопасно, он
+        # просто подождёт следующего тика, когда присутствие подтвердится.
+        self._bb.social.face_search_pending = True
+
+    def record_face_search_attempt(self):
+        """Вызывается из FaceSearchAttempt.update(). Разрешает исход
+        ПРЕДЫДУЩЕЙ попытки (инкремент счётчика при неудаче), выбирает цель
+        этой попытки (голосовая подсказка > /sound_direction > ничего),
+        публикует статус. Возвращает (torso_target_deg|None, source|None)."""
+        prev = self._face_search_pending_check
+        if prev is not None:
+            if prev['direction'] is None or not self._human_detected:
+                self._face_search_attempts += 1
+
+        if self._last_direction_hint == 'right':
+            target, source = SoundScanBehaviour._RIGHT, 'voice_hint'
+        elif self._last_direction_hint == 'left':
+            target, source = SoundScanBehaviour._LEFT, 'voice_hint'
+        elif (self._last_sound_confidence >= SoundScanBehaviour._MIN_CONFIDENCE
+              and abs(self._last_sound_angle) >= SoundScanBehaviour._MIN_ANGLE_DEG):
+            target = (SoundScanBehaviour._RIGHT if self._last_sound_angle > 0
+                      else SoundScanBehaviour._LEFT)
+            source = 'sound'
+        else:
+            target, source = None, None
+
+        self._face_search_pending_check = {'direction': target}
+        self._face_search_last_attempt_mono = time.monotonic()
+
+        ask_now = False
+        if self._face_search_attempts >= self._FACE_SEARCH_ASK_MIN_ATTEMPTS:
+            now = time.monotonic()
+            if now - self._face_search_last_ask_mono >= self._FACE_SEARCH_ASK_COOLDOWN_SEC:
+                ask_now = True
+                self._face_search_last_ask_mono = now
+        self._publish_face_search_status(
+            active=True, attempts=self._face_search_attempts, ask_now=ask_now)
+        return target, source
+
     # ── Callbacks ─────────────────────────────────────────────────────────
 
     def _llm_response_cb(self, msg: String):
@@ -1202,8 +1550,18 @@ class BehaviorManagerNode(LifecycleNode):
         if self._bb.llm.has_content and not via_telegram:
             # Голос = подтверждение присутствия: разрешаем DialogueBranch даже без лица.
             # Telegram-запросы не ставят person_present — человек физически не присутствует.
+            was_present = self._bb.social.person_present
             self._bb.social.person_present = True
-            self.get_logger().info('LLM ответ → person_present=True (голосовое присутствие)')
+            if not was_present:
+                # Присутствие подтверждено голосом, а не успешным сканом — без
+                # этого face_detection/head_tracker могут остаться выключены,
+                # и face-search retry (FaceSearchAttempt) будет бесполезен.
+                self.enable_face_detection(True)
+                self.enable_head_tracker(True)
+                self.get_logger().info(
+                    'LLM ответ → person_present=True (голосовое присутствие), vision включена')
+            else:
+                self.get_logger().info('LLM ответ → person_present=True (голосовое присутствие)')
         self.get_logger().debug(
             f'LLM→BB: "{self._bb.llm.text[:60]}" '
             f'[{self._bb.llm.emotion}]'
@@ -1316,6 +1674,11 @@ class BehaviorManagerNode(LifecycleNode):
             self._bb.social.person_present   = True
             self._bb.social.farewell_pending = False
             self._bb.social.farewell_text    = ''
+            # Присутствие подтверждено этим топиком (не обязательно успешным
+            # сканом) — включаем vision, иначе face-search retry бесполезен
+            # (см. _llm_response_cb, тот же баг-фикс).
+            self.enable_face_detection(True)
+            self.enable_head_tracker(True)
 
         elif was_present and not now_present:
             # Тихий уход (таймаут / OakD вето) — прощание НЕ произносим.
@@ -1345,6 +1708,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._bb.llm.text        = ''
         self._bb.llm.emotion     = 'neutral'
         self._bb.llm.voice_style = ''
+        self._reset_face_search()  # человек ушёл — сессия поиска лица закончена
         self.get_logger().info('Прощание: person_present=False, vision выключен')
 
     def _robot_sleep_cb(self, msg: Bool):
@@ -1357,6 +1721,7 @@ class BehaviorManagerNode(LifecycleNode):
             # /robot_sleep False по нему) — значит есть направление, используем
             # SoundScan (поворот корпуса), не старый PIR-скан головой.
             self._bb.sound.scan_active = True
+            self._reset_face_search()  # новая сессия — старый счётчик неактуален
             self.get_logger().info('Пробуждение (по wake word) — запуск SoundScan')
 
     def _sound_direction_cb(self, msg: SoundDirection):
@@ -1400,6 +1765,7 @@ class BehaviorManagerNode(LifecycleNode):
             return
         self._pir_next_scan_at = 0.0   # wake word важнее cooldown
         self._bb.sound.scan_active = True
+        self._reset_face_search()  # новая сессия — старый счётчик неактуален
         self.get_logger().info('Wake word в IDLE → запуск SoundScan (поворот корпуса на голос)')
 
     def _pir_cb(self, msg: Bool):
@@ -1434,6 +1800,10 @@ class BehaviorManagerNode(LifecycleNode):
                 or self._human_detected:
             return
         now = time.monotonic()
+        if now - self._last_own_torso_move_mono < self._PIR_SELF_MOTION_BLANK_SEC:
+            self.get_logger().debug(
+                'PIR: движение сразу после нашего поворота корпуса — считаю самотриггером, игнорирую')
+            return
         if now < self._pir_next_scan_at:
             self.get_logger().debug('PIR: движение (cooldown активен, игнорируем)')
             return
@@ -1475,6 +1845,10 @@ class BehaviorManagerNode(LifecycleNode):
         self._face_det_pub     = self.create_lifecycle_publisher(Bool, '/face_detection/enable', lqos)
         self._head_tracker_pub = self.create_lifecycle_publisher(Bool, '/head_tracker/enable',   lqos)
         self._go_idle_pub      = self.create_lifecycle_publisher(Bool, '/go_idle', 10)
+        # Статус face-search retry для llm_node (промпт "спроси где ты") — latched,
+        # как /robot_sleep, чтобы перезапущенный llm_node сразу видел текущий статус.
+        self._face_search_status_pub = self.create_lifecycle_publisher(
+            String, '/behavior/face_search_status', lqos)
 
         self.create_subscription(String, '/llm_response',   self._llm_response_cb,   10)
         self.create_subscription(String, 'robot_events',    self._event_cb,           10)
@@ -1487,6 +1861,8 @@ class BehaviorManagerNode(LifecycleNode):
         self.create_subscription(SoundDirection, '/sound_direction', self._sound_direction_cb, 10)
         self.create_subscription(Bool,   '/human_detected', self._human_detected_cb,  10)
         self.create_subscription(Float32, '/human_angle_deg', self._human_angle_cb,   10)
+        self.create_subscription(Bool,   '/head_tracker/face_locked', self._face_locked_cb, 10)
+        self.create_subscription(String, '/voice/direction_hint', self._direction_hint_cb, 10)
 
         self.get_logger().info('BehaviorManager настроен')
         return TransitionCallbackReturn.SUCCESS
@@ -1495,6 +1871,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._face_det_pub.on_activate(state)
         self._head_tracker_pub.on_activate(state)
         self._go_idle_pub.on_activate(state)
+        self._face_search_status_pub.on_activate(state)
         self.enable_face_detection(False)
         self.enable_head_tracker(False)
         self._tick_timer = self.create_timer(1.0 / self._tick_rate, self._tick)
@@ -1511,6 +1888,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._face_det_pub.on_deactivate(state)
         self._head_tracker_pub.on_deactivate(state)
         self._go_idle_pub.on_deactivate(state)
+        self._face_search_status_pub.on_deactivate(state)
         self._bb.robot.command       = {}
         self._bb.llm.has_content     = False
         self._bb.social.person_present = False

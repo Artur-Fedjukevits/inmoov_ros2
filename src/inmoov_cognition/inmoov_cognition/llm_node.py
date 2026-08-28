@@ -183,20 +183,36 @@ TOOLS = [
         'function': {
             'name': 'robot_control',
             'description': (
-                'Control the physical robot: arms, torso, head, enter sleep mode, or say goodbye. '
-                'Use action=sleep when user says "выключись", "иди спать", "спать", "отдыхай" etc. '
-                'Use action=goodbye when user says "пока", "до свидания", "увидимся", "прощай" etc. — '
-                'say a farewell phrase and end the conversation session. '
-                'Sleep mode: robot goes quiet, disables vision/PIR, only wakeword wakes it.'
+                'Control the physical robot: arms, head (with optional torso assist), enter sleep '
+                'mode, or say goodbye. Use action=sleep when user says "выключись", "иди спать", '
+                '"спать", "отдыхай" etc. Use action=goodbye when user says "пока", "до свидания", '
+                '"увидимся", "прощай" etc. — say a farewell phrase and end the conversation session. '
+                'Sleep mode: robot goes quiet, disables vision/PIR, only wakeword wakes it. '
+                'For "посмотри туда-то, что ты видишь?" style requests, use look_direction instead — '
+                'it turns AND takes/describes a photo in the correct order; robot_control(action=head) '
+                'alone only turns, it does not look at anything.'
             ),
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'action':     {'type': 'string', 'enum': ['arm', 'torso', 'head', 'status', 'sleep', 'goodbye']},
+                    'action':     {'type': 'string', 'enum': ['arm', 'head', 'status', 'sleep', 'goodbye']},
                     'command':    {'type': 'string', 'description': 'For arm: grab|release|home|extend|retract'},
                     'target':     {'type': 'string', 'description': 'For arm: object description'},
-                    'pan':        {'type': 'number', 'description': 'For head: -90..90 degrees'},
+                    'pan':        {'type': 'number', 'description': 'For head: -90..90 degrees, positive = right'},
                     'tilt':       {'type': 'number', 'description': 'For head: -45..45 degrees'},
+                    'scope': {
+                        'type': 'string',
+                        'enum': ['head', 'partial', 'full'],
+                        'description': (
+                            'For head: how much torso to add to the head turn. '
+                            '"head" (default) — head only, for an ordinary glance/orientation. '
+                            '"partial" — head + ~30% torso rotation same direction as pan; use when '
+                            'the person explicitly says they are standing/sitting off to that side '
+                            'and a head-only turn will not be enough to bring them into camera view. '
+                            '"full" — head + full torso rotation; use for "обернись", "повернись '
+                            'полностью", "посмотри что сзади".'
+                        ),
+                    },
                     'query':      {'type': 'string', 'description': 'For status: battery|position|all'},
                     'text':       {'type': 'string', 'description': 'For sleep/goodbye: farewell phrase (goes to TTS via speak_text, do NOT duplicate in speak_text)'},
                     'speak_text': {'type': 'string', 'description': 'What to say after execution (1-2 sentences in Russian). For sleep/goodbye: use text field instead, leave speak_text empty.'},
@@ -501,12 +517,14 @@ TOOLS = [
         'function': {
             'name': 'look_and_describe',
             'description': (
-                'Сделать снимок с камеры в глазу робота ПРЯМО СЕЙЧАС и проанализировать его через '
-                'vision-модель — для вопросов, требующих реально посмотреть и понять, что в кадре '
-                '(YOLO-детекция в блоке "Сцена ПРЯМО СЕЙЧАС" знает только ограниченный набор '
-                'предметов и не годится для этого). Используй для: "что это?", "что у меня в '
-                'руках?", "посмотри", "что ты видишь?", "что за окном?", "что там на столе?" '
-                'и любых похожих вопросов, где нужно распознать конкретный предмет/сцену. '
+                'Сделать снимок с камеры в глазу робота ПРЯМО СЕЙЧАС, без поворота, и '
+                'проанализировать его через vision-модель — для вопросов, требующих реально '
+                'посмотреть и понять, что в кадре ПРЯМО ПЕРЕД РОБОТОМ (YOLO-детекция в блоке '
+                '"Сцена ПРЯМО СЕЙЧАС" знает только ограниченный набор предметов и не годится для '
+                'этого). Используй для: "что это?", "что у меня в руках?", "посмотри", "что ты '
+                'видишь?", "что там на столе?" и любых похожих вопросов БЕЗ указания стороны/поворота. '
+                'Если нужно посмотреть В СТОРОНУ (направо/налево/вверх/вниз/назад) — используй '
+                'look_direction, а не этот инструмент. '
                 'НЕ используй robot_control(action="status") для таких вопросов.'
             ),
             'parameters': {
@@ -522,6 +540,58 @@ TOOLS = [
                     },
                 },
                 'required': [],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'look_direction',
+            'description': (
+                'Повернуть голову (и при необходимости корпус) в указанную сторону, ДОЖДАТЬСЯ '
+                'реального завершения поворота (~2с) и только потом сделать снимок и '
+                'проанализировать через vision-модель. '
+                'ЕДИНСТВЕННЫЙ инструмент для запросов вида "посмотри направо/налево/вверх/вниз, '
+                'что ты видишь?", "обернись, что там?", "посмотри что у меня за спиной", '
+                '"глянь налево" — то есть когда нужно И повернуться, И описать увиденное. '
+                'НЕ вызывай для этого robot_control(action=head) + look_and_describe по отдельности — '
+                'они выполняются параллельно и снимок улетит раньше, чем голова довернётся. '
+                'Если нужно просто повернуться без описания — используй robot_control(action=head). '
+                'Если нужно посмотреть на то, что ПРЯМО СЕЙЧАС перед роботом, без поворота — '
+                'используй look_and_describe.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'pan': {
+                        'type': 'number',
+                        'description': (
+                            '-90..90 градусов, положительное = направо. Обязательно ненулевое '
+                            'значение при scope=partial/full. Для "обернись" без уточнения стороны '
+                            'бери ±70.'
+                        ),
+                    },
+                    'tilt': {'type': 'number', 'description': '-45..45 градусов, положительное = вверх. По умолчанию 0.'},
+                    'scope': {
+                        'type': 'string',
+                        'enum': ['head', 'partial', 'full'],
+                        'description': (
+                            '"head" (по умолчанию) — только голова, обычный взгляд в сторону. '
+                            '"partial" — голова + ~30% поворота корпуса туда же; используй, когда '
+                            'собеседник явно сказал что стоит/сидит сбоку и одной головы не хватит, '
+                            'чтобы он попал в кадр. '
+                            '"full" — голова + корпус полностью; для "обернись"/"повернись полностью".'
+                        ),
+                    },
+                    'query': {
+                        'type': 'string',
+                        'description': (
+                            'Что именно нужно рассмотреть после поворота — конкретная формулировка '
+                            'вопроса пользователя. Если неясно — оставь пустым, будет общее описание.'
+                        ),
+                    },
+                },
+                'required': ['pan'],
             },
         },
     },
@@ -639,7 +709,9 @@ def _build_user_content(text: str, image_b64: str | None):
     """Content для user-сообщения: строка если без картинки, иначе OpenAI
     vision content-array (text + image_url data URI). Картинка передаётся
     только в ИСХОДЯЩЕМ запросе — в self.history остаётся текстовый плейсхолдер
-    (см. _query_llm), иначе base64 раздувал бы токены каждого следующего хода."""
+    (см. _query_llm), иначе base64 раздувал бы токены каждого следующего хода.
+    РОВНО ОДНА картинка — vLLM-сервер отдаёт 400 при >1 image_url в одном
+    промпте ("At most 1 image(s) may be provided", проверено 2026-08-26)."""
     if not image_b64:
         return text
     return [
@@ -751,6 +823,49 @@ def _ru_direction(direction: str) -> str:
     return _SCENE_DIRECTION_RU.get(direction, direction)
 
 
+# ── Разбор голосовой подсказки направления (face-search retry) ─────────────
+# Намеренно НЕ матчим голые "право"/"лево" — коллизии с "направление",
+# "исправить", "справедливо" и т.п. Целые слова/фразы через границы \b.
+_RIGHT_HINT_RE = re.compile(
+    r'\b(направо|справа|правее|по правую руку|с правой стороны|правой рукой)\b',
+    re.IGNORECASE)
+_LEFT_HINT_RE = re.compile(
+    r'\b(налево|слева|левее|по левую руку|с левой стороны|левой рукой)\b',
+    re.IGNORECASE)
+# Живой баг 2026-08-28: "Повернись направо" — это КОМАНДА роботу (уже
+# обрабатывается отдельно через robot_control/look_direction tool call), а
+# НЕ подсказка о том, где стоит собеседник — но по словам "направо"/"налево"
+# она неотличима от «я справа от тебя». Без этого исключения FaceSearchAttempt
+# ошибочно доворачивал корпус НА ТУ ЖЕ фразу, что уже легитимно повернула
+# голову через LLM tool call — лишнее/конфликтующее движение.
+_ROBOT_TURN_COMMAND_RE = re.compile(
+    r'\b(повернись|поверни\w*|обернись|оберн\w*|посмотри|погляди|взгляни|глянь|оглянись)\b',
+    re.IGNORECASE)
+
+
+def _parse_direction_hint(text: str) -> tuple[str, str]:
+    """Возвращает (direction, phrase), direction ∈ {'left','right','none'}.
+
+    Если в реплике встретились оба направления (например «не слева, а
+    справа») — побеждает ПОСЛЕДНЕЕ по позиции упоминание, обычно это и есть
+    исправленный/финальный ответ говорящего.
+
+    Фразы-команды роботу ("повернись направо", "посмотри налево") исключены —
+    см. _ROBOT_TURN_COMMAND_RE.
+    """
+    if _ROBOT_TURN_COMMAND_RE.search(text):
+        return 'none', ''
+    right_m = list(_RIGHT_HINT_RE.finditer(text))
+    left_m = list(_LEFT_HINT_RE.finditer(text))
+    if not right_m and not left_m:
+        return 'none', ''
+    last_right = right_m[-1].start() if right_m else -1
+    last_left = left_m[-1].start() if left_m else -1
+    if last_right > last_left:
+        return 'right', right_m[-1].group(0)
+    return 'left', left_m[-1].group(0)
+
+
 def _build_scene_block(scene_ctx: dict | None) -> str:
     """Короткое описание сцены (объекты + люди) для конца system prompt."""
     if not scene_ctx:
@@ -785,14 +900,53 @@ def _build_scene_block(scene_ctx: dict | None) -> str:
             + ' '.join(parts) + '\n')
 
 
+_NEVER_FOUND_EXAMPLES = [
+    'Извини, я тебя не вижу — ты где?',
+    'Прости, никак не могу тебя найти взглядом, ты рядом?',
+    'Я не понимаю, где ты — подскажешь?',
+]
+_LOST_AGAIN_EXAMPLES = [
+    'Ой, кажется я тебя потерял из виду — ты всё ещё здесь?',
+    'Извини, отвлёкся и не вижу тебя — ты не отошёл?',
+    'Погоди, я тебя не вижу сейчас — где ты?',
+]
+
+
+def _build_face_search_block(face_search_ctx: dict | None) -> str:
+    """Просит LLM естественно спросить "где ты", когда поиск лица по звуку
+    не даёт результата 2+ раза подряд (face_search_status.ask_now из
+    behavior_manager_node). Разные примеры формулировок для "ещё ни разу не
+    нашли после wake word" (kind='never_found') и "потеряли посреди уже
+    идущего диалога" (kind='lost_again') — во втором случае тон мягче.
+    Не требует ответа именно в формате "слева/справа" — направление всё
+    равно определяется отдельно, разбором голосовой подсказки и/или
+    /sound_direction (см. behavior_manager_node.FaceSearchAttempt)."""
+    if not face_search_ctx or not face_search_ctx.get('ask_now'):
+        return ''
+    examples = (_NEVER_FOUND_EXAMPLES if face_search_ctx.get('kind') == 'never_found'
+                else _LOST_AGAIN_EXAMPLES)
+    examples_str = ' / '.join(f'"{e}"' for e in examples)
+    return (
+        '\nТы физически не видишь собеседника прямо сейчас (звук/направление '
+        'ненадёжны). Естественно и коротко вплети в ЭТОТ ответ вопрос о том, '
+        f'где он — своими словами, в духе: {examples_str}. Не настаивай на '
+        'формате "слева/справа" — подойдёт любой ответ ("я здесь", "у окна" '
+        'и т.п.), направление всё равно определяется отдельно по голосу. '
+        'Не игнорируй суть его исходного сообщения.\n'
+    )
+
+
 def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
-                        memory_context: str = '', scene_ctx: dict | None = None) -> str:
+                        memory_context: str = '', scene_ctx: dict | None = None,
+                        face_search_ctx: dict | None = None) -> str:
     """Формирует системный промпт со схемой устройств и контекстом собеседника.
 
     oh_schema — JSON-строка со схемой OpenHAB (name/label/type/options, без state).
                 Передаётся один раз в начале диалога; состояния запрашиваются
                 через get_openhab_states / search_openhab_items по необходимости.
     scene_ctx — сводка сцены от scene_manager_node (объекты + люди вокруг).
+    face_search_ctx — статус поиска лица от behavior_manager_node
+                       (/behavior/face_search_status), см. _build_face_search_block.
     """
     if person_ctx:
         name       = person_ctx.get('name') or 'Незнакомец'
@@ -858,8 +1012,9 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
     else:
         devices_block = 'OpenHAB устройства: нет данных (openhab_bridge_node не запущен).\n'
 
-    memory_block = f'\n{memory_context}\n' if memory_context else ''
-    scene_block  = _build_scene_block(scene_ctx)
+    memory_block      = f'\n{memory_context}\n' if memory_context else ''
+    scene_block       = _build_scene_block(scene_ctx)
+    face_search_block = _build_face_search_block(face_search_ctx)
 
     # ВАЖНО: весь ДИНАМИЧЕСКИЙ блок (person_block/memory_block/scene_block —
     # время, собеседник, последние события, сцена вокруг — меняется КАЖДЫЙ
@@ -892,7 +1047,9 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
   (доступны только 4 пресета: neutral/happy/sad/surprise — не описывай тон текстом)
 - Если просто разговор — отвечай текстом без tool call
 - Если пользователь просит "передай на колонку", "скажи в гостиной", "объяви" — используй broadcast_message. НЕ используй items_control для LivingRoom_Chromecast.
-- Если спрашивают "что ты видишь", "что это", "что у меня в руках", "посмотри", "что за окном", "кто перед тобой", "опиши что рядом" и подобное — ОБЯЗАТЕЛЬНО вызывай look_and_describe (query = суть вопроса). Блок "Сцена ПРЯМО СЕЙЧАС" ниже — это только фоновый YOLO-контекст (кто рядом, сколько человек) для твоей ОБЩЕЙ ориентации, а не источник ответа на прямой вопрос "что ты видишь" — YOLO распознаёт ограниченный набор предметов и часто ошибается. НЕ вызывай robot_control(action="status") для таких вопросов — status только для батареи/позиции сервоприводов.
+- Если спрашивают "что ты видишь", "что это", "что у меня в руках", "что за окном", "кто перед тобой", "опиши что рядом" БЕЗ указания стороны/поворота — ОБЯЗАТЕЛЬНО вызывай look_and_describe (query = суть вопроса). Блок "Сцена ПРЯМО СЕЙЧАС" ниже — это только фоновый YOLO-контекст (кто рядом, сколько человек) для твоей ОБЩЕЙ ориентации, а не источник ответа на прямой вопрос "что ты видишь" — YOLO распознаёт ограниченный набор предметов и часто ошибается. НЕ вызывай robot_control(action="status") для таких вопросов — status только для батареи/позиции сервоприводов.
+- Если просят посмотреть В КАКУЮ-ТО СТОРОНУ и сказать что там ("посмотри направо, что видишь?", "глянь налево", "обернись, что там?", "посмотри что у меня за спиной") — используй ТОЛЬКО look_direction (сам поворачивает голову/корпус, ждёт завершения поворота и только потом смотрит). НЕ вызывай для этого robot_control(action=head) — оно только повернёт голову, но не посмотрит и не опишет, а если вызвать его вместе с look_and_describe в одном ответе, снимок улетит раньше, чем голова довернётся.
+- Если пользователь говорит, что стоит/сидит сбоку от тебя (например «я справа от тебя») и просит повернуться к нему или посмотреть на него, а одной головы физически не хватает — используй scope="partial" (в robot_control или look_direction). "Обернись"/"повернись полностью" — scope="full".
 
 ВАЖНО — управление устройствами:
 - НИКОГДА не придумывай имена устройств — используй только точные имена из таблицы ниже.
@@ -904,7 +1061,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
 - Если цель команды широкая или неточная ("выключи везде", "выключи весь свет", "выключи всё", "во всём доме") — это означает ВСЕ устройства группы AllLights (для света) или All_Heaters (для отопления). СНАЧАЛА вызови search_openhab_items(group_filter=AllLights, state_filter="ON") чтобы найти включённые устройства, ЗАТЕМ вызови items_control для КАЖДОГО найденного. Не отвечай текстом вместо этой последовательности вызовов.
 
 {devices_block}
-{person_block}{memory_block}{scene_block}"""
+{person_block}{memory_block}{scene_block}{face_search_block}"""
 
 
 _RU_WEEKDAY = {
@@ -1002,8 +1159,11 @@ class LLMNode(LifecycleNode):
         # Кэш OpenHAB от openhab_bridge_node
         self._oh_schema      = ''        # JSON-строка схемы (name/label/type/options)
         self._oh_items       = []        # Список dict с актуальными state
-        # Последний кадр с левой глазной камеры (JPEG bytes) — для look_and_describe
-        self._latest_eye_jpeg: bytes | None = None
+        # Последние кадры с глазных камер (JPEG bytes) — для look_and_describe/look_direction.
+        # Оба глаза кэшируются отдельно: одно фото может быть смазано/не в фокусе,
+        # поэтому обе камеры уходят в vision-запрос одновременно (см. _call_vision_model).
+        self._latest_eye_jpeg:       bytes | None = None   # left
+        self._latest_eye_jpeg_right: bytes | None = None
         # Стиль голоса и эмоция — буферизуются инструментами, включаются в /llm_response
         self._voice_style    = {'emotion': ''}
         self._pending_emotion: str | None = None
@@ -1021,6 +1181,9 @@ class LLMNode(LifecycleNode):
         self._memory_context: str = ''
         # Сводка сцены (объекты + люди) от scene_manager_node — вставляется в system prompt
         self._scene_context: dict = {}
+        # Статус поиска лица от behavior_manager_node (/behavior/face_search_status)
+        # — вставляется в system prompt через _build_face_search_block
+        self._face_search_status: dict = {}
         # Накапливаем transcript текущего диалога
         self._dialogue_lines: list[str] = []
 
@@ -1488,6 +1651,16 @@ class LLMNode(LifecycleNode):
                 f'LLM: речь не адресована роботу (gaze=False) — пропускаю: "{text[:60]}"')
             return
 
+        # Разбор голосовой подсказки направления — независимо от и до LLM-запроса
+        # (не блокирует/не замедляет ответ). Публикуется на КАЖДОЙ адресованной
+        # реплике (даже direction='none') — это одновременно и подсказка, и
+        # триггер "реплика произошла" для face-search retry в behavior_manager_node.
+        direction, phrase = _parse_direction_hint(text)
+        hint_msg = String()
+        hint_msg.data = json.dumps(
+            {'direction': direction, 'phrase': phrase, 'text': text[:80]}, ensure_ascii=False)
+        self._direction_hint_pub.publish(hint_msg)
+
         with self._lock:
             if self._introducing:
                 self.get_logger().debug('LLM: /introducing=True — команда проигнорирована')
@@ -1571,8 +1744,10 @@ class LLMNode(LifecycleNode):
                 memory_context    = (self._memory_context if _pid is not None
                                       else _strip_episodic_memory(self._memory_context))
                 scene_ctx         = self._scene_context
+                face_search_ctx   = self._face_search_status
 
-            system_prompt = build_system_prompt(oh_schema, person_ctx, memory_context, scene_ctx)
+            system_prompt = build_system_prompt(
+                oh_schema, person_ctx, memory_context, scene_ctx, face_search_ctx)
             if scene_ctx:
                 _scene_age = time.time() - scene_ctx.get('updated_at', 0)
                 _scene_labels = [o['label'] for o in scene_ctx.get('objects', [])]
@@ -1649,7 +1824,7 @@ class LLMNode(LifecycleNode):
                 # одновременно — экономит время при N > 1 action-инструментах.
                 _QUERY_FNS = frozenset(('get_openhab_states', 'search_openhab_items',
                                         'web_search', 'get_weather', 'search_memory',
-                                        'look_and_describe'))
+                                        'look_and_describe', 'look_direction'))
 
                 def _exec_one(tc):
                     fn   = tc['function']['name']
@@ -1960,47 +2135,118 @@ class LLMNode(LifecycleNode):
             return self._tool_merge_persons(args)
         elif fn_name == 'look_and_describe':
             return self._tool_look_and_describe(args)
+        elif fn_name == 'look_direction':
+            return self._tool_look_direction(args)
         else:
             return {'error': f'Unknown function: {fn_name}'}
 
-    def _tool_look_and_describe(self, args: dict) -> dict:
-        """Снимок с глазной камеры (последний закэшированный кадр) → анализ через ту же
-        vision-модель (vLLM). Отдельный, лёгкий запрос к LLM — вне self.history
-        и без tools, чтобы не тянуть за собой весь диалоговый контекст."""
-        query = (args.get('query') or '').strip() or 'Опиши коротко и по делу, что видишь.'
-        with self._lock:
-            jpeg = self._latest_eye_jpeg
-        if not jpeg:
-            return {'success': False,
-                    'error': 'Камера недоступна или кадр ещё не пришёл'}
-        image_b64 = base64.b64encode(jpeg).decode()
+    def _call_vision_model(self, images_b64: list[str], query: str,
+                            system_content: str, max_tokens: int = 200) -> dict:
+        """Один запрос к ОТДЕЛЬНОЙ vision-модели (self.vision_llm_url, не self.llm_url —
+        та ограничена 1 картинкой на промпт, см. историю 2026-08-26). Эта модель
+        принимает 2-4 картинки за раз (проверено на сервере пользователем). Обычный
+        блокирующий POST, без стриминга — короткий self-contained запрос вне self.history."""
+        if not images_b64:
+            return {'success': False, 'error': 'Нет ни одного кадра с камер'}
+        content = [{'type': 'text', 'text': query}]
+        for b64 in images_b64:
+            content.append(
+                {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{b64}'}})
         payload = {
-            'model':    self.model,
+            'model':    self.vision_model,
             'messages': [
-                {'role': 'system', 'content':
-                    'Отвечай кратко и по делу, простым текстом без markdown-разметки, '
-                    'списков и заголовков — 2-3 предложения максимум.'},
-                {'role': 'user', 'content': _build_user_content(query, image_b64)},
+                {'role': 'system', 'content': system_content},
+                {'role': 'user',   'content': content},
             ],
             'stream':      False,
             'temperature': 0.3,
-            'max_tokens':  200,
-            'chat_template_kwargs': {'enable_thinking': False},
+            'max_tokens':  max_tokens,
         }
+        headers = ({'Authorization': f'Bearer {self.vision_bearer_token}'}
+                   if self.vision_bearer_token else {})
         try:
-            parts = []
-            for delta, done, _tc in self._stream_llm(payload, read_timeout=20.0):
-                if delta:
-                    parts.append(delta)
-                if done:
-                    break
-            description = ''.join(parts).strip()
+            r = requests.post(self.vision_llm_url, json=payload, headers=headers,
+                               timeout=(self.connect_timeout, 25.0))
+            r.raise_for_status()
+            data = r.json()
+            description = (data['choices'][0]['message']['content'] or '').strip()
         except Exception as e:
-            self.get_logger().warn(f'look_and_describe: ошибка vision-запроса: {e}')
+            self.get_logger().warn(f'vision-модель ({len(images_b64)} кадр(ов)): ошибка {e}')
             return {'success': False, 'error': str(e)}
         if not description:
             return {'success': False, 'error': 'Vision-модель не дала ответа'}
         return {'success': True, 'description': description}
+
+    _VISION_SYS_HINT = (
+        'Отвечай кратко и по делу, простым текстом без markdown-разметки, '
+        'списков и заголовков — 2-3 предложения максимум. Тебе может быть показано '
+        'несколько кадров одной и той же сцены с разных камер или в разные моменты '
+        'времени — используй все вместе, один кадр может быть смазан или не в фокусе.'
+    )
+
+    def _tool_look_and_describe(self, args: dict) -> dict:
+        """Снимок ПРЯМО СЕЙЧАС с ОБЕИХ глазных камер (левой и правой — на случай, если
+        одна не в фокусе/смазана) → анализ через отдельную vision-модель."""
+        query = (args.get('query') or '').strip() or 'Опиши коротко и по делу, что видишь.'
+        with self._lock:
+            left, right = self._latest_eye_jpeg, self._latest_eye_jpeg_right
+        images_b64 = [base64.b64encode(j).decode() for j in (left, right) if j]
+        if not images_b64:
+            return {'success': False, 'error': 'Камера недоступна или кадр ещё не пришёл'}
+        return self._call_vision_model(images_b64, query, self._VISION_SYS_HINT)
+
+    # Сколько реально занимает физический поворот (см. ExecuteRobotCommand._do_head/
+    # _send_head_cmd в behavior_manager_node.py) — голова стартует через 0.2с
+    # после event, сам поворот ~1.2-1.8с. С корпусом (scope=partial/full) чуть дольше.
+    _LOOK_SETTLE_HEAD_SEC  = 2.0
+    _LOOK_SETTLE_TORSO_SEC = 2.3
+    _LOOK_FRAME_GAP_SEC    = 1.0   # интервал между 2 захватами по пути поворота
+
+    def _tool_look_direction(self, args: dict) -> dict:
+        """Поворот головы/корпуса (через тот же /robot_events, что и robot_control) +
+        ОЖИДАНИЕ реального завершения поворота + 2 снимка с каждого глаза (с каждой
+        камеры — до и в конце поворота) + анализ всех кадров одной vision-моделью.
+        В одном tool call, синхронно в этом же потоке — так гарантируется правильный
+        порядок (поворот → снимки), в отличие от отдельных robot_control+look_and_describe,
+        которые ThreadPoolExecutor запускает параллельно (см. _exec_one/_pool.map выше)."""
+        pan   = float(args.get('pan', 0) or 0)
+        tilt  = float(args.get('tilt', 0) or 0)
+        scope = str(args.get('scope') or 'head').strip().lower()
+        if scope not in ('head', 'partial', 'full'):
+            scope = 'head'
+        query = (args.get('query') or '').strip() or 'Опиши коротко и по делу, что видишь.'
+
+        event = {'action': 'head', 'pan': pan, 'tilt': tilt, 'scope': scope, 'priority': 10}
+        msg = String()
+        msg.data = json.dumps(event, ensure_ascii=False)
+        self.event_pub.publish(msg)
+        self.get_logger().info(f'look_direction: поворот pan={pan:+.0f}° tilt={tilt:+.0f}° scope={scope}')
+
+        settle = self._LOOK_SETTLE_HEAD_SEC if scope == 'head' else self._LOOK_SETTLE_TORSO_SEC
+        # 2 захвата с обеих камер с интервалом ~1с — первый незадолго до конца
+        # поворота (на случай overshoot), второй сразу после устаканивания.
+        # Отдельная vision-модель принимает 2-4 картинки за запрос (в отличие от
+        # self.llm_url, ограниченного 1 картинкой — см. историю 2026-08-26).
+        t1 = max(0.0, settle - self._LOOK_FRAME_GAP_SEC)
+        time.sleep(t1)
+        with self._lock:
+            left_1, right_1 = self._latest_eye_jpeg, self._latest_eye_jpeg_right
+        time.sleep(settle - t1)
+        with self._lock:
+            left_2, right_2 = self._latest_eye_jpeg, self._latest_eye_jpeg_right
+
+        images_b64 = [base64.b64encode(j).decode()
+                      for j in (left_1, right_1, left_2, right_2) if j]
+        if not images_b64:
+            return {'success': False, 'error': 'Камера недоступна или кадр ещё не пришёл'}
+
+        sys_hint = (
+            'Тебе показаны кадры (с обеих камер, в конце поворота головы робота '
+            'в нужную сторону), снятые с интервалом около секунды. ' + self._VISION_SYS_HINT
+        )
+        result = self._call_vision_model(images_b64, query, sys_hint)
+        result.update({'pan': pan, 'scope': scope})
+        return result
 
     # Координаты по умолчанию — Bødalen, Asker, Норвегия
     _DEFAULT_LAT  = 59.835
@@ -2406,10 +2652,15 @@ class LLMNode(LifecycleNode):
             self.get_logger().warn(f'Невалидный openhab_items JSON: {e}')
 
     def _eye_camera_cb(self, msg: CompressedImage):
-        """Кэширует последний кадр с левой глазной камеры для look_and_describe
-        (снимок по запросу, не стрим — просто держим самый свежий JPEG)."""
+        """Кэширует последний кадр с левой глазной камеры для look_and_describe/
+        look_direction (снимок по запросу, не стрим — просто держим самый свежий JPEG)."""
         with self._lock:
             self._latest_eye_jpeg = bytes(msg.data)
+
+    def _eye_camera_right_cb(self, msg: CompressedImage):
+        """То же самое для правой глазной камеры — см. _eye_camera_cb."""
+        with self._lock:
+            self._latest_eye_jpeg_right = bytes(msg.data)
 
     def _social_context_cb(self, msg: String):
         """Перехватываем looking_at_robot из social_context."""
@@ -2432,6 +2683,16 @@ class LLMNode(LifecycleNode):
                 self._scene_context = ctx
         except json.JSONDecodeError as e:
             self.get_logger().warn(f'Невалидный /scene/objects JSON: {e}')
+
+    def _face_search_status_cb(self, msg: String):
+        """Статус поиска лица от behavior_manager_node → кэш для system prompt
+        (см. _build_face_search_block)."""
+        try:
+            ctx = json.loads(msg.data)
+            with self._lock:
+                self._face_search_status = ctx
+        except json.JSONDecodeError as e:
+            self.get_logger().warn(f'Невалидный /behavior/face_search_status JSON: {e}')
 
     def _person_context_callback(self, msg: String):
         try:
@@ -2755,10 +3016,24 @@ class LLMNode(LifecycleNode):
         self._dp('cast_volume',         80)
         self._dp('cast_to_file_url',    'http://192.168.10.118:8000/tts/to_file')
 
+        # Отдельная vision-модель (look_and_describe/look_direction) — принимает
+        # 2-4 картинки base64 в одном запросе, OpenAI-совместимый /v1/chat/completions.
+        # Добавлено 2026-08-28: раньше картинки шли на self.llm_url (текстовая модель),
+        # но та ограничена 1 картинкой на промпт ("At most 1 image(s) may be provided").
+        # vision_bearer_token пуст по умолчанию → используем тот же bearer_token, что и
+        # у llm_url (сервер за тем же прокси/токеном), если не задан отдельно.
+        self._dp('vision_llm_url',      'http://192.168.10.118:18090/v1/chat/completions')
+        self._dp('vision_model',        'qwen3vl')
+        self._dp('vision_bearer_token', '')
+
         self.llm_url            = self.get_parameter('llm_url').value
         self.llm_fallback_url   = self.get_parameter('llm_fallback_url').value
         self.bearer_token          = self.get_parameter('bearer_token').value
         self.bearer_token_fallback = self.get_parameter('bearer_token_fallback').value
+        self.vision_llm_url     = self.get_parameter('vision_llm_url').value
+        self.vision_model       = self.get_parameter('vision_model').value
+        self.vision_bearer_token = (self.get_parameter('vision_bearer_token').value
+                                     or self.bearer_token)
         self.model_primary     = self.get_parameter('model').value
         self.model_fallback    = self.get_parameter('model_fallback').value
         self.temperature       = self.get_parameter('temperature').value
@@ -2786,10 +3061,14 @@ class LLMNode(LifecycleNode):
         self.create_subscription(String, 'person_context',  self._person_context_callback, 10)
         self.create_subscription(String, '/social_context', self._social_context_cb,       10)
         self.create_subscription(String, '/scene/objects',  self._scene_context_cb,        10)
+        self.create_subscription(String, '/behavior/face_search_status',
+                                  self._face_search_status_cb,                             10)
         self.create_subscription(String, 'openhab_schema',  self._oh_schema_callback,      10)
         self.create_subscription(String, 'openhab_items',   self._oh_items_callback,       10)
         self.create_subscription(CompressedImage, '/camera/eye_left/compressed',
                                   self._eye_camera_cb, 5)
+        self.create_subscription(CompressedImage, '/camera/eye_right/compressed',
+                                  self._eye_camera_right_cb, 5)
         self.create_subscription(Bool,   '/introducing',    self._introducing_cb,          10)
         self.create_subscription(Bool,   '/go_idle',        self._go_idle_cb,              10)
         self.create_subscription(Bool,   '/robot_sleep',    self._robot_sleep_cb,          _latched)
@@ -2800,6 +3079,10 @@ class LLMNode(LifecycleNode):
         self._tg_resp_pub        = self.create_lifecycle_publisher(String, '/telegram_response', 10)
         self._tts_cancel_pub     = self.create_lifecycle_publisher(Bool,   '/tts_cancel_queue',  10)
         self._conv_end_pub       = self.create_lifecycle_publisher(String, '/conversation_end',  10)
+        # Разобранная голосовая подсказка направления ("я справа" и т.п.) — на
+        # каждой адресованной реплике, потребитель: behavior_manager_node
+        # (face-search retry). См. _parse_direction_hint/command_callback.
+        self._direction_hint_pub = self.create_lifecycle_publisher(String, '/voice/direction_hint', 10)
 
         self._mem_client         = self.create_client(MemoryQuery, '/memory/query')
         self._tts_direct_client  = ActionClient(self, Speak, 'speak')
@@ -2812,6 +3095,7 @@ class LLMNode(LifecycleNode):
         self._tg_resp_pub.on_activate(state)
         self._tts_cancel_pub.on_activate(state)
         self._conv_end_pub.on_activate(state)
+        self._direction_hint_pub.on_activate(state)
         self._check_servers()
         # Фоновый прогрев: ждём схему от openhab_bridge (10-15с), затем
         # отправляем минимальный запрос — загружаем модель и наполняем KV-cache.
@@ -2851,6 +3135,7 @@ class LLMNode(LifecycleNode):
         self._tg_resp_pub.on_deactivate(state)
         self._tts_cancel_pub.on_deactivate(state)
         self._conv_end_pub.on_deactivate(state)
+        self._direction_hint_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):

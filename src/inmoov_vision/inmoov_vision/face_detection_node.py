@@ -137,6 +137,11 @@ class FaceDetectionNode(LifecycleNode):
 
     def on_activate(self, state):
         self._pub.on_activate(state)
+        # Грейс-период: считаем primary живым с момента активации, а не с
+        # эпохи (иначе _last_primary_t=0.0 → time.time()-0 огромно >
+        # primary_timeout → ложный "primary молчит" на самом первом тике,
+        # ещё до того как primary вообще успел прислать первый heartbeat).
+        self._last_primary_t = time.time()
         self._timers.append(self.create_timer(1.0 / self._det_hz, self._trigger_detection))
         self._timers.append(self.create_timer(5.0, self._watchdog))
         return TransitionCallbackReturn.SUCCESS
@@ -172,7 +177,9 @@ class FaceDetectionNode(LifecycleNode):
     def _enable_cb(self, msg) -> None:
         self._enabled = msg.data
         self._no_face_since = 0.0
-        self.get_logger().info(f'FaceDetection: {"включена" if msg.data else "выключена"}')
+        role = f', fallback-резерв за {self._fallback_for}' if self._fallback_for else ', primary'
+        self.get_logger().info(
+            f'FaceDetection: {"включена" if msg.data else "выключена"}{role}')
 
     def _primary_heartbeat_cb(self, msg) -> None:
         """Приход ЛЮБОГО сообщения от primary-камеры = она жива, не важно нашла ли лицо."""

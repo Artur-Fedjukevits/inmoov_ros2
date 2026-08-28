@@ -137,6 +137,17 @@ class VoiceDetectorNode(LifecycleNode):
         self._person_present_time  = 0.0
         self._person_last_seen     = 0.0
         self._person_present_grace = 120.0
+        # Живой баг 2026-08-28: сразу после wake word, ДО первой успешной фразы
+        # в этой сессии, _is_person_present() всегда False (_person_last_seen
+        # ещё не обновлялся ни от /person_present, ни от успешной отправки в
+        # STT) — если самая первая запись отбрасывается как слишком короткая
+        # (например, VAD зацепил только хвост произнесения будильного слова),
+        # авто-переактивация не срабатывает, и микрофон "умирает" до
+        # следующего wake word, будто человек вообще ничего не сказал. Даём
+        # отдельное окно грейса ПОСЛЕ wake word — не полагаемся только на
+        # _is_person_present().
+        self._last_wake_time          = 0.0
+        self._POST_WAKE_LISTEN_GRACE_SEC = 15.0
 
         sv_status = 'вкл' if self._sv_enabled else 'выкл'
         self.get_logger().info(
@@ -196,6 +207,7 @@ class VoiceDetectorNode(LifecycleNode):
             self.audio_buffer    = []
             self.silence_counter = 0
             self.activation_time = time.time()
+            self._last_wake_time = time.time()
             self._sv_buf.clear()
             if not person_active:
                 self._sv_gallery.clear()
@@ -213,6 +225,7 @@ class VoiceDetectorNode(LifecycleNode):
         self.silence_counter = 0
         self.speech_chunks   = 0
         self.activation_time = time.time()
+        self._last_wake_time = time.time()
         self._sv_buf.clear()
         if not person_active:
             self._sv_gallery.clear()
@@ -343,6 +356,19 @@ class VoiceDetectorNode(LifecycleNode):
         if (now - self._person_last_seen) < self._person_present_grace:
             return True
         return False
+
+    def _should_keep_listening(self) -> bool:
+        """_is_person_present() ИЛИ мы совсем недавно проснулись по wake word.
+
+        Нужно отдельно от _is_person_present(): сразу после wake word, до
+        первой успешно отправленной в STT фразы этой сессии, presence ещё
+        не подтверждён (_person_last_seen не обновлялся). Если самая первая
+        запись отброшена как слишком короткая (VAD зацепил только хвост
+        произнесения будильного слова) — без этой проверки микрофон "умирал"
+        насовсем, будто человек вообще не сказал ни слова после wake word."""
+        if self._is_person_present():
+            return True
+        return (time.time() - self._last_wake_time) < self._POST_WAKE_LISTEN_GRACE_SEC
 
     def _tts_speaking_callback(self, msg: Bool):
         was_speaking  = self.tts_speaking
@@ -641,7 +667,7 @@ class VoiceDetectorNode(LifecycleNode):
         # Таймаут ожидания первого слова
         if not self.audio_buffer and not self._sv_buf:
             if (time.time() - self.activation_time) > self.no_speech_timeout:
-                if self._is_person_present() and not self._sleeping:
+                if self._should_keep_listening() and not self._sleeping:
                     self.activation_time = time.time()
                 else:
                     self.get_logger().info('Таймаут ожидания речи — возвращаюсь к wake word')
@@ -718,13 +744,21 @@ class VoiceDetectorNode(LifecycleNode):
                 f'∆wake={time.time()-self.activation_time:.1f}с). Отправляю в STT...'
             )
             self._stt_sent_time = time.time()
+            # Реальная распознанная речь = прямое доказательство присутствия,
+            # даже если /person_present (по лицу/телу от identity_manager) ни
+            # разу не приходил True в этой сессии (чисто голосовой диалог,
+            # лицо не поймано). Без этого _is_person_present() всегда False
+            # (см. её реализацию — сверяет только с последним True по лицу),
+            # и авто-активация после TTS отключается насовсем — робот
+            # переставал слышать пользователя. Живой баг 2026-08-28.
+            self._person_last_seen = time.time()
             self._publish(full_audio)
         else:
             self.get_logger().info(
                 f'Фраза отброшена: речи {speech_sec:.1f}с < {effective_min_speech_sec:.1f}с'
                 f'{" (знакомство)" if self._introducing else ""} — игнорирую'
             )
-            if self._is_person_present() and not self._sleeping:
+            if self._should_keep_listening() and not self._sleeping:
                 import threading
                 threading.Timer(0.5, self._activate_after_tts).start()
 

@@ -19,6 +19,10 @@ vision_head_tracker_node.py
 Публикует:
   /joint_command  (JointState) — rothead, neck
   /face_command   (JointState) — eye_lr_L + eye_ud_L  | eye_lr_R + eye_ud_R
+  /head_tracker/face_locked (Bool) — есть ли ПРЯМО СЕЙЧАС свежий bbox
+    (не устаревший, см. _STALE_SEC). Не latched — при выключении явно
+    публикуется False. Единственный источник истины "поймали лицо" для
+    поведений повторного поиска в behavior_manager_node.
 
 Подписки:
   /face/tracks/left    (String JSON)
@@ -149,13 +153,22 @@ class VisionHeadTrackerNode(LifecycleNode):
         # P-регулятора считается от неверной базы, дёргая голову обратно
         # к центру прежде чем поймать реальный трек. Обнаружено 2026-08-24.
         self.create_subscription(JointState, '/joint_command', self._external_joint_cb, 10)
-        self._head_pub = self.create_lifecycle_publisher(JointState, '/joint_command', 10)
-        self._face_pub = self.create_lifecycle_publisher(JointState, '/face_command',  10)
+        self._head_pub   = self.create_lifecycle_publisher(JointState, '/joint_command', 10)
+        self._face_pub   = self.create_lifecycle_publisher(JointState, '/face_command',  10)
+        # /head_tracker/face_locked — единственный источник истины "реально ли
+        # сейчас поймано лицо" (есть свежий, не устаревший bbox). Используется
+        # behavior_manager_node для решения, нужна ли повторная попытка поиска
+        # по sound_localization на каждой реплике (см. project memory: face
+        # search retry). НЕ latched — поэтому явно публикуем False при
+        # выключении трекера (_enable_cb), иначе подписчик хранил бы устаревший
+        # True вечно.
+        self._locked_pub = self.create_lifecycle_publisher(Bool, '/head_tracker/face_locked', 10)
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
         self._head_pub.on_activate(state)
         self._face_pub.on_activate(state)
+        self._locked_pub.on_activate(state)
         self._timer = self.create_timer(1.0 / self._hz, self._tick)
         return TransitionCallbackReturn.SUCCESS
 
@@ -165,6 +178,7 @@ class VisionHeadTrackerNode(LifecycleNode):
             self._timer = None
         self._head_pub.on_deactivate(state)
         self._face_pub.on_deactivate(state)
+        self._locked_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
@@ -190,6 +204,7 @@ class VisionHeadTrackerNode(LifecycleNode):
                 self._at_rest      = False
         if not msg.data:
             self._return_to_rest()
+            self._locked_pub.publish(Bool(data=False))
             self.get_logger().info('HeadTracker: выключен → покой')
         else:
             self.get_logger().info('HeadTracker: включён')
@@ -320,6 +335,8 @@ class VisionHeadTrackerNode(LifecycleNode):
             right_bbox   = self._right_bbox if (right_fresh and left_absent) else None
             head_stale  = self._head_stale
             last_any    = max(self._last_left_t, self._last_right_t)
+
+        self._locked_pub.publish(Bool(data=bool(left_bbox is not None or right_bbox is not None)))
 
         if left_bbox is None and right_bbox is None:
             elapsed = time.time() - last_any
