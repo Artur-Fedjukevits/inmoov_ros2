@@ -177,6 +177,14 @@ class FaceDetectionNode(LifecycleNode):
     def _enable_cb(self, msg) -> None:
         self._enabled = msg.data
         self._no_face_since = 0.0
+        if msg.data:
+            # Грейс-период на КАЖДОЕ включение (не только on_activate — сам
+            # lifecycle activate происходит раз при старте стека, а enable
+            # дальше дёргается toggle'ом через PIRScan/пробуждение). Без
+            # сброса здесь _last_primary_t остаётся протухшим с прошлого
+            # раза → primary_alive сразу ложно False на первом тике.
+            self._last_primary_t = time.time()
+            self._fallback_active = False
         role = f', fallback-резерв за {self._fallback_for}' if self._fallback_for else ', primary'
         self.get_logger().info(
             f'FaceDetection: {"включена" if msg.data else "выключена"}{role}')
