@@ -60,6 +60,12 @@ class TTSNode(LifecycleNode):
         self._goals_pending      = 0
         self._goals_pending_lock = threading.Lock()
         self._cancel_queued      = threading.Event()
+        # Эмоция лица, показанная для текущей речи (см. _execute_speak) —
+        # держится на /face_expression_hold пока не завершится ПОСЛЕДНЯЯ
+        # ожидающая цель (тот же паттерн, что и tts_speaking ниже), защищена
+        # тем же _goals_pending_lock.
+        self._active_face_emotion: str | None = None
+        self._FACE_EMOTIONS = frozenset(('neutral', 'happy', 'sad', 'surprise'))
 
         # Stall-watchdog (см. комментарий у _STALL_TIMEOUT_SEC)
         self._playback_active      = threading.Event()
@@ -80,6 +86,7 @@ class TTSNode(LifecycleNode):
         self._session       = None
         self._speaking_pub  = None
         self._jaw_pub       = None
+        self._face_expr_pub = None
         self._action_server = None
         self._active_url    = None
         self._output_device = None
@@ -122,11 +129,16 @@ class TTSNode(LifecycleNode):
         self.create_subscription(Bool,   '/tts_cancel_queue',  self._cancel_queue_cb, 10)
         self._speaking_pub = self.create_lifecycle_publisher(Bool, 'tts_speaking', 10)
         self._jaw_pub      = self.create_lifecycle_publisher(JointState, '/face_command', 10)
+        # Held-мимика на время речи (см. _execute_speak) — отдельно от
+        # анимированного одноразового /face_expression (greet/farewell/BT).
+        self._face_expr_pub = self.create_lifecycle_publisher(
+            String, '/face_expression_hold', 10)
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
         self._speaking_pub.on_activate(state)
         self._jaw_pub.on_activate(state)
+        self._face_expr_pub.on_activate(state)
 
         # Инцидент 2026-08-15: при аварийном os._exit(1) из _stall_watchdog_loop
         # процесс убивается посреди speaking=True — finally-блок с
@@ -174,6 +186,7 @@ class TTSNode(LifecycleNode):
 
         self._speaking_pub.on_deactivate(state)
         self._jaw_pub.on_deactivate(state)
+        self._face_expr_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
@@ -365,6 +378,13 @@ class TTSNode(LifecycleNode):
         error_msg = ''
 
         self._publish_speaking(True)
+        # Мимика лица синхронно с голосом на всё время этой фразы (см.
+        # set_voice_style в llm_node). Пусто (greet/farewell) — лицо не трогаем.
+        face_emotion = emotion.lower()
+        if face_emotion in self._FACE_EMOTIONS:
+            with self._goals_pending_lock:
+                self._active_face_emotion = face_emotion
+            self._publish_face_emotion(face_emotion)
         try:
             for url in urls:
                 if my_abort.is_set() or goal_handle.is_cancel_requested:
@@ -382,10 +402,20 @@ class TTSNode(LifecycleNode):
                     error_msg = str(e)
                     self.get_logger().error(f'TTS ошибка [{url}]: {e}')
         finally:
+            revert_face = False
             with self._goals_pending_lock:
                 self._goals_pending -= 1
                 if self._goals_pending == 0:
                     self._cancel_queued.clear()
+                    # Последняя ожидающая цель — если для неё была показана
+                    # не-нейтральная эмоция, возвращаем лицо в neutral. Работает
+                    # и при обычном завершении, и при cancel/abort (оба пути
+                    # приходят сюда же).
+                    if self._active_face_emotion not in (None, 'neutral'):
+                        revert_face = True
+                    self._active_face_emotion = None
+            if revert_face:
+                self._publish_face_emotion('neutral')
             self._publish_speaking(False)
             self._execute_lock.release()
 
@@ -529,6 +559,14 @@ class TTSNode(LifecycleNode):
         msg = Bool()
         msg.data = speaking
         self._speaking_pub.publish(msg)
+
+    def _publish_face_emotion(self, name: str):
+        """Held-мимика на время речи, см. _execute_speak. Отдельно от
+        анимированного /face_expression — face_expressions_node применяет
+        позу статично, без встроенного авто-возврата."""
+        msg = String()
+        msg.data = name
+        self._face_expr_pub.publish(msg)
 
     def _find_output_device(self, name: str):
         if not name:

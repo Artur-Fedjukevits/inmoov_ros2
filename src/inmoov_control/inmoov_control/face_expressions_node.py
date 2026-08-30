@@ -267,6 +267,14 @@ class FaceExpressions:
             time.sleep(hold_sec)
             self.neutral()
 
+    def hold(self, name: str) -> None:
+        """Static, non-animated apply — no built-in revert timer. Used by
+        /face_expression_hold (tts_node): the pose is meant to stay exactly
+        until the caller (speech duration) explicitly changes/reverts it,
+        unlike the one-shot animated methods below (happy()/surprise()/etc.)
+        used by /face_expression."""
+        self._expr(name)
+
     # ── Expressions ───────────────────────────────────────────────────────────
 
     def neutral(self) -> None:
@@ -402,6 +410,9 @@ class FaceExpressionsNode(LifecycleNode):
     def on_configure(self, state):
         self._fe = FaceExpressions(self)
         self.create_subscription(String, '/face_expression', self._cb, 10)
+        # Held-мимика на время речи (tts_node) — статичная поза, без
+        # анимации/авто-возврата, см. FaceExpressions.hold().
+        self.create_subscription(String, '/face_expression_hold', self._cb_hold, 10)
         self.get_logger().info(
             f'face_expressions_node configured | calib: '
             f'{"loaded" if os.path.exists(_CALIB_FILE) else "defaults"}')
@@ -429,6 +440,16 @@ class FaceExpressionsNode(LifecycleNode):
             return
         self.get_logger().info(f'face expression: {name}')
         self._executor.submit(self._fe.execute, name)
+
+    def _cb_hold(self, msg: String) -> None:
+        name = msg.data.strip().lower()
+        if name not in EXPRESSIONS_DATA:
+            self.get_logger().warn(f'Unknown hold expression: "{name}"')
+            return
+        self.get_logger().info(f'face expression (hold): {name}')
+        # Тот же single-worker executor, что и /face_expression — сериализует
+        # с анимированными жестами (greet/farewell), исключая гонку сервоприводов.
+        self._executor.submit(self._fe.hold, name)
 
 
 

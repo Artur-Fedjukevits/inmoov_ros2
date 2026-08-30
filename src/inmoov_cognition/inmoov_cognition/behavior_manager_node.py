@@ -1138,9 +1138,13 @@ def build_tree(node: Node, tavily_key: str) -> py_trees.behaviour.Behaviour:
         ]
     )
 
-    # Диалоговая ветка: BT оркеструет речь + мимику + жест параллельно.
+    # Диалоговая ветка: BT оркеструет речь + жест параллельно.
     # Запускается когда LLM положил текст в BB через /llm_response.
     # Прерывается автоматически если человек уйдёт (SocialBranch gate выше).
+    # Мимика лица здесь больше не идёт через ExpressEmotion/BT: tts_node сам
+    # держит её на всё время произнесения фразы (см. /face_expression_hold) —
+    # раньше BT дёргал лицо на ~1с параллельно с речью и оно откатывалось в
+    # rest ещё до конца фразы.
     dialogue_branch = py_trees.composites.Sequence(
         'DialogueBranch', memory=True, children=[
             # has_content=True при обычном ответе (text непустой) и при стриминге (text='')
@@ -1153,7 +1157,6 @@ def build_tree(node: Node, tavily_key: str) -> py_trees.behaviour.Behaviour:
                     SpeakBehaviour(node,
                                    bb_key='/llm/text',
                                    voice_bb_key='/llm/voice_style'),
-                    ExpressEmotion(node, bb_key='/llm/emotion'),
                     GesticulationAction(node),
                 ]
             ),
@@ -1541,9 +1544,14 @@ class BehaviorManagerNode(LifecycleNode):
         via_telegram = data.get('telegram', False)
         self._bb.llm.text        = '' if streamed else data.get('text', '')
         self._bb.llm.voice_style = data.get('voice_instruct', '')
-        self._bb.llm.emotion     = data.get('emotion', 'neutral')
-        # has_content=True триггерит BT DialogueBranch для эмоции/жеста
-        # (при streamed=True текст пустой, но SpeakBehaviour сразу успешен → Emotion+Gesture бегут)
+        # /llm/emotion больше не приходит отдельным полем — payload объединил
+        # эмоцию и голосовой стиль в один voice_instruct (см. llm_node.py
+        # _tool_set_voice_style). Значение здесь нужно только GesticulationAction
+        # для выбора жеста (wave при happy) — мимика лица теперь синхронизирована
+        # с речью напрямую в tts_node (/face_expression_hold), не через BT.
+        self._bb.llm.emotion     = data.get('voice_instruct', '') or 'neutral'
+        # has_content=True триггерит BT DialogueBranch для речи/жеста
+        # (при streamed=True текст пустой, но SpeakBehaviour сразу успешен → Gesture бежит)
         self._bb.llm.has_content = bool(
             self._bb.llm.text or streamed
         )

@@ -6,8 +6,10 @@ llm_node.py  (v2 — Генератор Намерений)
 LLM нода — OpenAI-совместимый chat.completions API (vLLM), function calling (tools API).
 
 Принцип: LLM НЕ управляет TTS и сервоприводами напрямую.
-Она публикует намерение в /llm_response (текст + голос + эмоция).
-Behavior Tree оркеструет: Speak + FaceExpression + Gesticulation параллельно.
+Она публикует намерение в /llm_response (текст + голосовой стиль).
+Behavior Tree оркеструет Speak + Gesticulation параллельно; мимика лица теперь
+синхронизирована с длительностью самой речи — её держит tts_node (см.
+/face_expression_hold), а не BT.
 
 Tools:
   - items_control        — управление OpenHAB устройствами
@@ -15,14 +17,14 @@ Tools:
   - search_openhab_items — найти устройства по комнате/типу/состоянию
   - robot_control        — физические команды робота (→ /robot_events → BT)
   - web_search           — поиск в интернете (→ /robot_events → BT)
-  - express_emotion      — буферизует эмоцию + стиль голоса для /llm_response
-  - set_voice_style      — буферизует инструкцию голоса для /llm_response
+  - set_voice_style      — буферизует голосовой пресет (+ синхронную мимику
+                            лица на время речи) для /llm_response
   - save_memory          — сохранение в SQLite через /memory/query
   - search_memory        — поиск в памяти через /memory/query
 
 Топики:
   /voice_command   (in)  String — текст от Whisper STT
-  /llm_response    (out) String JSON {text, voice_instruct, emotion} → BT Blackboard
+  /llm_response    (out) String JSON {text, voice_instruct} → BT Blackboard
   /robot_events    (out) String JSON — физические команды (move/arm/head/sleep/search) → BT
   /search_result   (in)  String — результат поиска от behavior_manager
   /openhab_schema  (in)  String — статичная схема устройств от openhab_bridge_node
@@ -238,39 +240,6 @@ TOOLS = [
     {
         'type': 'function',
         'function': {
-            'name': 'express_emotion',
-            'description': (
-                'Make the robot physically express an emotion via face servos AND set voice style. '
-                'Face expression and voice change start simultaneously when speech begins. '
-                'Use when the conversation context warrants an emotional reaction — ALWAYS include speak_text with your reply. '
-                'Examples: good news → happy; question → thinking; insult → angry; '
-                'compliment → smile; bad news → sad; unexpected → surprise.'
-            ),
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'emotion': {
-                        'type': 'string',
-                        'enum': [
-                            'neutral', 'happy', 'smile', 'sad', 'angry',
-                            'surprise', 'fear', 'disgust', 'thinking',
-                            'sorry', 'suspicious', 'unamused', 'sigh',
-                            'wink', 'sleeping',
-                        ],
-                        'description': 'Emotion to express on face and in voice',
-                    },
-                    'speak_text': {
-                        'type': 'string',
-                        'description': 'Your verbal response to the user (1-2 sentences in Russian). ALWAYS provide this — express_emotion must never replace your text reply.',
-                    },
-                },
-                'required': ['emotion', 'speak_text'],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
             'name': 'save_memory',
             'description': (
                 'Save LASTING FACTS about the current person or household to long-term memory. '
@@ -433,11 +402,14 @@ TOOLS = [
         'function': {
             'name': 'set_voice_style',
             'description': (
-                'Set voice preset for the next speech response, independent of face expression. '
+                'Set voice preset for the next speech response. Also makes the robot '
+                'physically show the matching face expression for the ENTIRE duration '
+                'of that speech (not just a flash) — voice and face always change together. '
                 'The TTS server (OmniVoice) uses cloned-voice presets recorded in advance — '
                 'free-form tone instructions are NOT supported (voice cloning overrides them). '
-                'Only 4 presets exist. Use this for a tone-only change when express_emotion '
-                '(which also drives the face) is not appropriate. Reset to normal → "" or "neutral".'
+                'Only 4 presets exist. Use when the conversation context warrants an '
+                'emotional/tonal reaction. Examples: good news → happy; bad news → sad; '
+                'unexpected → surprise. Reset to normal → "" or "neutral".'
             ),
             'parameters': {
                 'type': 'object',
@@ -1029,10 +1001,10 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
 Используй инструменты (tools) для выполнения команд.
 ВАЖНО: Никогда не используй азиатские языки в ответах, никаких иероглифов!
 ВАЖНО: Никогда не повторяй и не перефразируй вопрос пользователя в начале ответа. Не начинай ответ со слов "Почему", "Почём", "Зачем", "О чём", "По поводу" или любого пересказа вопроса. Отвечай сразу по существу.
-ВАЖНО: Текстовый ответ озвучивается напрямую TTS. НЕ добавляй ремарки или сценические указания в скобках — например, (Тихо), (С улыбкой), (Шёпотом). Для изменения стиля голоса используй инструмент set_voice_style или express_emotion. Не используй URL в ответе - TTS их плохо произносит.
-ВАЖНО: TTS понимает неречевые теги ПРЯМО ВНУТРИ текста ответа, в квадратных скобках, в любом месте фразы (это НЕ ремарка из строки выше — те в круглых скобках запрещены полностью, а эти теги — фиксированный список звуков TTS). Разрешены ТОЛЬКО эти, дословно: [laughter] [sigh] [confirmation-en] [question-en] [question-ah] [question-oh] [question-ei] [question-yi] [surprise-ah] [surprise-oh] [surprise-wa] [surprise-yo] [dissatisfaction-hnn]. Вставляй умеренно и только когда это естественно усиливает фразу — например «[laughter] Ну ты даёшь!», «[sigh] Ладно, попробую ещё раз», «[surprise-ah] Ого, не ожидал!». НЕ придумывай свои теги и не переводи их на русский — неизвестные теги будут вырезаны из речи. Это дополняет express_emotion/set_voice_style, а не заменяет их.
+ВАЖНО: Текстовый ответ озвучивается напрямую TTS. НЕ добавляй ремарки или сценические указания в скобках — например, (Тихо), (С улыбкой), (Шёпотом). Для изменения стиля голоса используй инструмент set_voice_style. Не используй URL в ответе - TTS их плохо произносит.
+ВАЖНО: TTS понимает неречевые теги ПРЯМО ВНУТРИ текста ответа, в квадратных скобках, в любом месте фразы (это НЕ ремарка из строки выше — те в круглых скобках запрещены полностью, а эти теги — фиксированный список звуков TTS). Разрешены ТОЛЬКО эти, дословно: [laughter] [sigh] [confirmation-en] [question-en] [question-ah] [question-oh] [question-ei] [question-yi] [surprise-ah] [surprise-oh] [surprise-wa] [surprise-yo] [dissatisfaction-hnn]. Вставляй умеренно и только когда это естественно усиливает фразу — например «[laughter] Ну ты даёшь!», «[sigh] Ладно, попробую ещё раз», «[surprise-ah] Ого, не ожидал!». НЕ придумывай свои теги и не переводи их на русский — неизвестные теги будут вырезаны из речи. Это дополняет set_voice_style, а не заменяет его.
 ВАЖНО: Ответы — РАЗГОВОРНЫЕ и КРАТКИЕ, 1-2 предложения максимум. Отвечай ТОЛЬКО на то, что спросили — не пересказывай все данные из инструмента. Примеры: вопрос «будет ли дождь?» → «Да, завтра ожидается небольшой дождь, около трёх миллиметров» (не надо перечислять почасовой прогноз и скорость ветра). Вопрос «какая температура?» → «Завтра от пяти до тринадцати градусов, пасмурно». Если хотят подробности — спросят.
-ВАЖНО: При вызове save_memory, items_control, robot_control, express_emotion — всегда включай параметр speak_text с ответом пользователю (1-2 предложения, естественное продолжение разговора). express_emotion НИКОГДА не заменяет текстовый ответ — это дополнение к нему. При save_memory НЕ говори "Запомнил/Сохранил" — просто продолжай диалог как будто ты это уже знаешь. При get_openhab_states, search_openhab_items — speak_text не нужен, ответ формируй после получения данных.
+ВАЖНО: При вызове save_memory, items_control, robot_control — всегда включай параметр speak_text с ответом пользователю (1-2 предложения, естественное продолжение разговора). При save_memory НЕ говори "Запомнил/Сохранил" — просто продолжай диалог как будто ты это уже знаешь. При get_openhab_states, search_openhab_items — speak_text не нужен, ответ формируй после получения данных.
 
 - Если пользователь управляет роботом — используй robot_control
 - Если пользователь прощается ("пока", "до свидания", "увидимся", "прощай") — вызови robot_control(action="goodbye", text="[твоя прощальная фраза]"). Не отвечай просто текстом на прощание — нужен tool call чтобы завершить сессию.
@@ -1040,11 +1012,10 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
 - Если нужна информация из интернета (кроме погоды) — используй web_search
 - Если нужно вспомнить факты о человеке из прошлых разговоров — используй search_memory
 - Если пользователь просит НАПОМНИТЬ что-либо ("напомни", "не забудь напомнить") — ВСЕГДА используй set_reminder. НИКОГДА не используй save_memory для напоминаний!
-- Используй express_emotion когда контекст разговора вызывает эмоциональную реакцию
-  (услышал хорошую новость → happy, сложный вопрос → thinking, и т.д.)
-  express_emotion автоматически задаёт стиль голоса под эмоцию
-- Используй set_voice_style для смены голосового пресета без смены мимики
-  (доступны только 4 пресета: neutral/happy/sad/surprise — не описывай тон текстом)
+- Используй set_voice_style когда контекст разговора вызывает эмоциональную/тональную реакцию
+  (хорошая новость → happy, плохая новость → sad, неожиданность → surprise). Он одновременно
+  меняет и голос, и мимику лица на всё время произнесения фразы (доступны только 4 пресета:
+  neutral/happy/sad/surprise — не описывай тон текстом)
 - Если просто разговор — отвечай текстом без tool call
 - Если пользователь просит "передай на колонку", "скажи в гостиной", "объяви" — используй broadcast_message. НЕ используй items_control для LivingRoom_Chromecast.
 - Если спрашивают "что ты видишь", "что это", "что у меня в руках", "что за окном", "кто перед тобой", "опиши что рядом" БЕЗ указания стороны/поворота — ОБЯЗАТЕЛЬНО вызывай look_and_describe (query = суть вопроса). Блок "Сцена ПРЯМО СЕЙЧАС" ниже — это только фоновый YOLO-контекст (кто рядом, сколько человек) для твоей ОБЩЕЙ ориентации, а не источник ответа на прямой вопрос "что ты видишь" — YOLO распознаёт ограниченный набор предметов и часто ошибается. НЕ вызывай robot_control(action="status") для таких вопросов — status только для батареи/позиции сервоприводов.
@@ -1164,9 +1135,9 @@ class LLMNode(LifecycleNode):
         # поэтому обе камеры уходят в vision-запрос одновременно (см. _call_vision_model).
         self._latest_eye_jpeg:       bytes | None = None   # left
         self._latest_eye_jpeg_right: bytes | None = None
-        # Стиль голоса и эмоция — буферизуются инструментами, включаются в /llm_response
+        # Стиль голоса (+ синхронная мимика лица на время речи, см. tts_node) —
+        # буферизуется set_voice_style, включается в /llm_response
         self._voice_style    = {'emotion': ''}
-        self._pending_emotion: str | None = None
         # Взгляд собеседника: True/False/None (None = нет данных от детектора)
         # Используется для фильтрации речи, не адресованной роботу.
         self._looking_at_robot: bool | None = None
@@ -1584,7 +1555,6 @@ class LLMNode(LifecycleNode):
             self.history          = []
             self._dialogue_lines  = []
             self._voice_style     = {'emotion': ''}
-            self._pending_emotion = None
             self._person_context  = None
         if history_snapshot:
             self._publish_conversation_end(history_snapshot, person_ctx)
@@ -1601,7 +1571,14 @@ class LLMNode(LifecycleNode):
             self.history          = []
             self._dialogue_lines  = []
             self._voice_style     = {'emotion': ''}
-            self._pending_emotion = None
+            # Страховка: если /introducing застрял True (identity_manager перешёл
+            # в сон из State.INTRODUCING до своего фикса, либо был перезапущен и
+            # не переслал False) — сон обязан снимать гейт сам, иначе telegram_ask
+            # и voice_command будут вечно отвечать "занят", даже во сне.
+            if msg.data and self._introducing:
+                self.get_logger().warn(
+                    'robot_sleep=True при /introducing=True — гейт снят принудительно')
+                self._introducing = False
         # При засыпании — публикуем завершение диалога (если было что-то)
         if msg.data and history_snapshot:
             self._publish_conversation_end(history_snapshot, person_ctx)
@@ -1819,7 +1796,7 @@ class LLMNode(LifecycleNode):
                 any_tool_failed = False  # True если хотя бы один tool вернул success:False
 
                 # ── Параллельное выполнение tool calls ────────────────────────────
-                # Мета-инструменты (express_emotion, set_voice_style) мгновенны;
+                # Мета-инструмент (set_voice_style) мгновенен;
                 # HTTP-инструменты (items_control × N, get_weather) могут идти
                 # одновременно — экономит время при N > 1 action-инструментах.
                 _QUERY_FNS = frozenset(('get_openhab_states', 'search_openhab_items',
@@ -1908,7 +1885,7 @@ class LLMNode(LifecycleNode):
                     # уметь вызвать его в R2 через правильный tool call API.
                     tools_r2 = [t for t in TOOLS
                                 if t['function']['name'] in (
-                                    'express_emotion', 'set_voice_style', 'items_control')]
+                                    'set_voice_style', 'items_control')]
                     # Инъекция краткого напоминания прямо перед финальным ответом:
                     # LLM должен ответить на конкретный вопрос пользователя,
                     # а не пересказывать все поля из результата инструмента.
@@ -1946,11 +1923,11 @@ class LLMNode(LifecycleNode):
                                 f'Fallback R2: {len(tool_calls2)} tool call(s) из текста')
 
                     _R2_ALLOWED = frozenset(
-                        ('express_emotion', 'set_voice_style', 'items_control'))
+                        ('set_voice_style', 'items_control'))
 
                     if tool_calls2:
                         # Выполняем только мета-инструменты и items_control.
-                        # Собираем speak_text: если R2 вызвал express_emotion только с speak_text
+                        # Собираем speak_text: если R2 вызвал set_voice_style только с speak_text
                         # и без content — используем speak_text напрямую, без R3.
                         # id/type + пара 'tool' сообщений на каждый tool_call обязательны —
                         # см. докстринг _normalize_tool_calls и R1 выше (тот же класс бага).
@@ -2035,10 +2012,10 @@ class LLMNode(LifecycleNode):
                                         f'Финальный ответ R3 за {time.time()-_t0:.1f}с: '
                                         f'"{final_text}"')
                                 else:
-                                    self.get_logger().warn('R3 пуст после R2 express_emotion — молчим')
+                                    self.get_logger().warn('R3 пуст после R2 set_voice_style — молчим')
                             except Exception as _e3:
-                                self.get_logger().warn(f'R3 ошибка (после R2 express_emotion): {_e3}')
-                        # Текст уже стримился в TTS через _stream_with_tts; BT обработает эмоцию/жест
+                                self.get_logger().warn(f'R3 ошибка (после R2 set_voice_style): {_e3}')
+                        # Текст уже стримился в TTS через _stream_with_tts; BT обработает жест
                         self._publish_response('', streamed=True)
                     else:
                         final_text = _strip_tool_blocks(resp2.get('content', '').strip())
@@ -2117,8 +2094,6 @@ class LLMNode(LifecycleNode):
             return self._tool_robot_control(args)
         elif fn_name == 'web_search':
             return self._tool_web_search(args)
-        elif fn_name == 'express_emotion':
-            return self._tool_express_emotion(args)
         elif fn_name == 'set_voice_style':
             return self._tool_set_voice_style(args)
         elif fn_name == 'save_memory':
@@ -2479,42 +2454,10 @@ class LLMNode(LifecycleNode):
             return {'success': True, 'result': result_text, 'query': query}
         return {'success': False, 'error': 'поиск не вернул результат за 30 секунд', 'query': query}
 
-    # Маппинг 14 эмоций → 1 из 4 голосовых пресетов OmniVoice (server.json →
-    # voice_presets). Клонирование голоса доминирует над instruct-текстом
-    # (наследие CosyVoice3), поэтому свободных инструкций больше нет —
-    # только заранее записанные пресеты. Пресетов под angry/fear/thinking и
-    # т.п. пока нет — откатываются на neutral (лицо всё равно меняется).
-    # Лицо и голос меняются одновременно при старте TTS.
-    _EMOTION_PRESET = {
-        'neutral':    'neutral',
-        'happy':      'happy',
-        'smile':      'happy',
-        'wink':       'happy',
-        'surprise':   'surprise',
-        'sad':        'sad',
-        'sorry':      'sad',
-        'sigh':       'sad',
-        'angry':      'neutral',
-        'fear':       'neutral',
-        'disgust':    'neutral',
-        'thinking':   'neutral',
-        'suspicious': 'neutral',
-        'unamused':   'neutral',
-        'sleeping':   'neutral',
-    }
-
-    def _tool_express_emotion(self, args: dict) -> dict:
-        emotion = args.get('emotion', 'neutral').lower()
-        preset  = self._EMOTION_PRESET.get(emotion, 'neutral')
-        with self._lock:
-            # Голос применится при отправке TTS goal (_send_tts_chunk / _tts_dispatch)
-            self._voice_style    = {'emotion': preset}
-            # Лицо — откладываем до старта TTS, чтобы запустить синхронно
-            self._pending_emotion = emotion
-        self.get_logger().info(f'Эмоция запланирована: {emotion} → голосовой пресет "{preset}"')
-        return {'success': True, 'emotion': emotion}
-
     def _tool_set_voice_style(self, args: dict) -> dict:
+        """Буферизует голосовой пресет. tts_node сам покажет ту же эмоцию на
+        лице на всё время произнесения фразы (см. /face_expression_hold) —
+        отдельного tool call для мимики больше нет."""
         style = (args.get('style') or 'neutral').lower()
         if style not in ('neutral', 'happy', 'sad', 'surprise', ''):
             self.get_logger().warn(f'set_voice_style: неизвестный пресет "{style}" → neutral')
@@ -2734,9 +2677,11 @@ class LLMNode(LifecycleNode):
     def _publish_response(self, text: str, user_text: str = '', streamed: bool = False):
         """Публикует ответ LLM в /llm_response → BT читает из Blackboard и оркеструет речь.
 
-        Формат: {text, voice_instruct, emotion, streamed, telegram}
+        Формат: {text, voice_instruct, streamed, telegram}
         Если streamed=True: текст уже отправлен в TTS напрямую;
-        BT запускает только ExpressEmotion + Gesticulation (SpeakBehaviour получает пустой текст).
+        BT запускает только Gesticulation (SpeakBehaviour получает пустой текст).
+        Мимика лица больше не идёт через BT/ExpressEmotion — её на всё время
+        речи держит tts_node, синхронно с voice_instruct (см. /face_expression_hold).
         telegram=True: запрос пришёл через Telegram — BM не должен ставить person_present=True.
         """
         if not streamed:
@@ -2750,8 +2695,6 @@ class LLMNode(LifecycleNode):
 
         with self._lock:
             voice_preset      = self._voice_style.get('emotion', '')
-            emotion           = self._pending_emotion or 'neutral'
-            self._pending_emotion = None
             self._voice_style     = {'emotion': ''}
             tg_req_id         = self._tg_req_id
             self._tg_req_id   = ''
@@ -2763,7 +2706,6 @@ class LLMNode(LifecycleNode):
             # CosyVoice3, теперь — имя голосового пресета OmniVoice
             # (neutral/happy/sad/surprise), см. MIGRATION_NOTES.md.
             'voice_instruct': voice_preset,
-            'emotion':        emotion,
             'streamed':       streamed,
             'telegram':       bool(tg_req_id),
         }
@@ -2774,14 +2716,12 @@ class LLMNode(LifecycleNode):
             self.get_logger().info(
                 '→ BT: (streamed)'
                 + (' [TG]' if tg_req_id else '')
-                + (f' [{emotion}]' if emotion != 'neutral' else '')
                 + (f' voice="{voice_preset}"' if voice_preset else '')
             )
         else:
             self.get_logger().info(
                 f'→ BT: "{text[:70]}{"..." if len(text)>70 else ""}"'
                 + (' [TG]' if tg_req_id else '')
-                + (f' [{emotion}]' if emotion != 'neutral' else '')
                 + (f' voice="{voice_preset}"' if voice_preset else '')
             )
 

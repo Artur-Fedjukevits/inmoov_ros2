@@ -91,7 +91,7 @@ class TestBuildSystemPrompt:
 
     def test_tools_mentioned(self):
         prompt = build_system_prompt([])
-        for keyword in ('items_control', 'robot_control', 'web_search', 'express_emotion'):
+        for keyword in ('items_control', 'robot_control', 'web_search', 'set_voice_style'):
             # Инструменты перечислены в TOOLS, но могут быть в промпте или нет
             # Главное что правила упоминаются
             pass

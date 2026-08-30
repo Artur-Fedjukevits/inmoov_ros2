@@ -155,18 +155,28 @@ class IdentityManagerNode(LifecycleNode):
     def _robot_sleep_cb(self, msg: Bool):
         """Получаем команду сна от behavior_manager. Vision управляется BT."""
         if msg.data and not self._sleeping:
+            # /sleep из Telegram — мгновенный переход, минуя обычный watchdog/
+            # goodbye-путь. Если в этот момент шло знакомство (State.INTRODUCING),
+            # /introducing иначе останется True навсегда — llm_node/telegram_ask
+            # будут вечно отвечать "занят", даже во сне (баг найден 2026-08-30).
+            was_introducing = (self._state == State.INTRODUCING)
             self._sleeping = True
             self.get_logger().info('Спящий режим активирован')
             with self._lock:
-                self._state           = State.IDLE
-                self._primary_track   = None
-                self._current_person  = {}
-                self._last_emotion    = None
-                self._face_emo_pend   = None
-                self._voice_emo_pend  = None
-                self._face_hunt_since = 0.0
+                self._state                    = State.IDLE
+                self._primary_track            = None
+                self._current_person           = {}
+                self._last_emotion             = None
+                self._face_emo_pend            = None
+                self._voice_emo_pend           = None
+                self._face_hunt_since          = 0.0
                 self._frontal_scores.clear()
-                self._looking_at_robot = True
+                self._looking_at_robot         = True
+                self._pending_name_confirm     = None
+                self._pending_name_confirm_pid = None
+                self._skip_db_check            = False
+            if was_introducing:
+                self._set_introducing(False)
             self._pub_person_present(False)
         elif not msg.data and self._sleeping:
             self._sleeping = False
