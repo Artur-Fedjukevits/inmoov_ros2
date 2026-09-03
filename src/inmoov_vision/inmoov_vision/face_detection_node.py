@@ -71,6 +71,11 @@ class FaceDetectionNode(LifecycleNode):
         self._primary_timeout    = 1.5
         self._last_primary_t     = 0.0
         self._fallback_active    = False
+        # Диагностика "подвисшей" камеры (см. _trigger_detection) — кадр
+        # приходит по расписанию, но его stamp не меняется.
+        self._last_processed_stamp   = -1.0
+        self._stale_frame_streak     = 0
+        self._STALE_FRAME_WARN_STREAK = 3
 
     def _dp(self, name, default=None):
         """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
@@ -185,6 +190,8 @@ class FaceDetectionNode(LifecycleNode):
             # раза → primary_alive сразу ложно False на первом тике.
             self._last_primary_t = time.time()
             self._fallback_active = False
+            self._last_processed_stamp = -1.0
+            self._stale_frame_streak   = 0
         role = f', fallback-резерв за {self._fallback_for}' if self._fallback_for else ', primary'
         self.get_logger().info(
             f'FaceDetection: {"включена" if msg.data else "выключена"}{role}')
@@ -216,6 +223,28 @@ class FaceDetectionNode(LifecycleNode):
                 return
             frame = self._latest_frame.copy()
             stamp = self._latest_stamp
+
+        # Живой баг 2026-08-31/09-01: подозрение, что USB-камера в глазу может
+        # физически "подвиснуть" (сенсор перестал обновляться), но кадры с
+        # последним удачным снимком продолжают приходить по /camera/eye_*
+        # — _frame_callback добросовестно обновляет _last_frame_t на КАЖДОЕ
+        # сообщение, поэтому обычный "камера молчит" watchdog это не ловит.
+        # Раньше это приводило к тому, что head_tracker получал "свежие" (по
+        # времени сообщения) детекции с НЕИЗМЕНЫМ bbox/offset — голову
+        # уводило в сторону без остановки, потому что реальной новой
+        # картинки не было. Сравниваем stamp КАДРА (не сообщения) с прошлым
+        # запуском детекции — если он не продвинулся, это тот же кадр.
+        if stamp == self._last_processed_stamp:
+            self._stale_frame_streak += 1
+            if self._stale_frame_streak == self._STALE_FRAME_WARN_STREAK:
+                self.get_logger().warn(
+                    f'FaceDetection ({self._side}): кадр НЕ обновляется '
+                    f'{self._stale_frame_streak} детекций подряд (stamp='
+                    f'{stamp:.3f}) — камера могла "подвиснуть" (сообщения '
+                    f'приходят, но картинка та же)')
+        else:
+            self._stale_frame_streak = 0
+        self._last_processed_stamp = stamp
 
         self._last_detect_t = time.time()
         self._busy = True

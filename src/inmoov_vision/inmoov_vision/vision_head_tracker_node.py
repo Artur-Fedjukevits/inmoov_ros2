@@ -81,7 +81,52 @@ class VisionHeadTrackerNode(LifecycleNode):
         # (даже без лица). Используется для определения "камера жива", а не "лицо есть".
         self._last_left_msg_t: float = 0.0
         self._active_side     = 'left'
-        self._head_stale      = 0
+        # Живой баг 2026-09-01 (найдено пользователем): _tick() крутится на
+        # track_hz (15Гц), а новые детекции приходят на detection_hz (2.5Гц
+        # по умолчанию) — раньше между двумя детекциями _step_head()
+        # применялся к ОДНОМУ И ТОМУ ЖЕ offset до _max_stale(5) раз подряд,
+        # что было скрытым 5-кратным усилением gain_head/max_step_deg и
+        # накопительной ошибкой при "подвисшем" кадре камеры (см.
+        # face_detection_node._trigger_detection). Теперь голова делает
+        # ОДИН шаг СТРОГО на каждую новую детекцию (bbox_seq), а не на
+        # каждый тик — счётчик сравнивается с последним обработанным.
+        self._bbox_seq        = 0
+        self._last_stepped_seq = -1
+        # Диагностика дрейфа во время активного слежения (живой баг 2026-08-31:
+        # пользователь наблюдал, как голова/торс постепенно уводит В СТОРОНУ от
+        # реально пойманного лица, а логов при этом не было вообще — P-регулятор
+        # ничего не логировал по умолчанию). Троттлинг — иначе спам на ~15Гц.
+        self._last_track_log_mono = 0.0
+        self._TRACK_LOG_INTERVAL_SEC = 3.0
+        # Для WARNING на подозрительный скачок target_track_id (см. _tick()) —
+        # живой баг 2026-08-31: в момент, когда identity_manager подтверждал
+        # личность и выдавал target_track_id, head_tracker переключался на
+        # ДРУГОЙ трек (не тот, что уже был хорошо центрирован), офсет скачком
+        # уходил к краю кадра (например, -0.13 → -0.79) и голову весь диалог
+        # медленно уводило в сторону от реального лица, пока трек не терялся.
+        self._prev_target_track_id = None
+        # Страховка от разгона головы (живой баг 2026-08-31, подтверждено
+        # пользователем): offset не уменьшался 27с подряд, пока rothead
+        # честно проехал ПОЧТИ ВЕСЬ физический диапазон (41°→130°, упор) —
+        # накопительная коррекция головы (в отличие от глаза, который метит
+        # в абсолютную цель и сам себя не разгоняет) не имеет предохранителя
+        # "offset не уменьшается — что-то не так, хватит наматывать шаги".
+        # Если несколько детекций подряд НЕ приближают offset к нулю —
+        # останавливаем накопление, не доезжая до аппаратного предела.
+        #
+        # ВАЖНО (живой баг 2026-09-01): сравнивать mag с ПРЕДЫДУЩИМ шагом
+        # (шаг за шагом) нельзя — реальный шум bbox между двумя соседними
+        # детекциями легко ±0.05-0.15 (см. project_face_search_retry.md),
+        # поэтому "не улучшилось хотя бы на EPS КАЖДЫЙ отдельный шаг" почти
+        # никогда не выполняется даже при настоящей сходимости — голова
+        # замерзала на ~10с при абсолютно нормальном (просто шумном) треке.
+        # Вместо этого сравниваем с BASELINE, зафиксированным в начале серии
+        # неудач — так шум внутри серии не мешает, а настоящий "плоский"
+        # offset (как в баге 2026-08-31 — 27с без сдвига) всё равно ловится.
+        self._runaway_streak      = 0
+        self._streak_ref_mag      = None   # mag на начало текущей серии
+        self._RUNAWAY_MAX_STREAK  = 8       # детекций подряд без прогресса от baseline
+        self._RUNAWAY_IMPROVE_EPS = 0.04    # прогресс от baseline меньше этого не считаем улучшением
         self._at_rest         = False
         self._target_person_id = self._target_track_id = None
 
@@ -113,7 +158,7 @@ class VisionHeadTrackerNode(LifecycleNode):
         self._dp('rest_eye_lr',    90.0)
         self._dp('rest_eye_ud',   100.0)
         self._dp('bbox_ema_alpha',  0.4)
-        self._dp('max_stale_ticks', 5)
+        self._dp('max_stale_ticks', 5)  # больше не используется (см. _bbox_seq), оставлен чтобы не ломать launch-файлы
 
         self._img_w          = self.get_parameter('image_width').value
         self._img_h          = self.get_parameter('image_height').value
@@ -130,7 +175,6 @@ class VisionHeadTrackerNode(LifecycleNode):
         self._eye_tilt_dir   = float(self.get_parameter('eye_tilt_dir').value)
         self._max_step       = self.get_parameter('max_step_deg').value
         self._ema_alpha      = self.get_parameter('bbox_ema_alpha').value
-        self._max_stale      = self.get_parameter('max_stale_ticks').value
         self._rothead        = self.get_parameter('rest_rothead').value
         self._neck           = self.get_parameter('rest_neck').value
         self._eye_lr         = self.get_parameter('rest_eye_lr').value
@@ -251,7 +295,13 @@ class VisionHeadTrackerNode(LifecycleNode):
             return
         with self._lock:
             if data.get('person_id') == self._target_person_id:
-                self._target_track_id = data.get('track_id')
+                new_track_id = data.get('track_id')
+                if new_track_id != self._target_track_id:
+                    # Новая привязка — даём полный бюджет коррекции заново,
+                    # не наследуем "разгонный" счётчик от прошлого трека.
+                    self._runaway_streak  = 0
+                    self._streak_ref_mag  = None
+                self._target_track_id = new_track_id
 
     # ── Track callbacks ───────────────────────────────────────────────────
 
@@ -269,7 +319,7 @@ class VisionHeadTrackerNode(LifecycleNode):
         with self._lock:
             self._last_left_t = time.time()
             self._left_bbox   = self._ema(self._left_bbox, bbox)
-            self._head_stale  = 0   # новая детекция → голова может двигаться
+            self._bbox_seq   += 1  # новая детекция → голове можно сделать ОДИН шаг (см. _tick)
             self._at_rest     = False
 
     def _right_tracks_cb(self, msg: String):
@@ -282,9 +332,9 @@ class VisionHeadTrackerNode(LifecycleNode):
             now = time.time()
             self._last_right_t = now
             self._right_bbox   = self._ema(self._right_bbox, bbox)
-            # Если правый — ведущий (левый недоступен), сбрасываем stale
+            # Если правый — ведущий (левый недоступен) — тоже новая детекция
             if (now - self._last_left_t) >= _STALE_SEC:
-                self._head_stale = 0
+                self._bbox_seq += 1
             self._at_rest = False
 
     def _extract_primary(self, msg: String) -> list | None:
@@ -307,7 +357,11 @@ class VisionHeadTrackerNode(LifecycleNode):
             # Лицо собеседника не в кадре — не двигаемся к чужому
             return None
 
-        # Не в диалоге — следуем за самым большим лицом
+        # Пробовали здесь предпочитать непрерывность с прошлым bbox вместо
+        # площади (живой баг 2026-08-31: перехват чужого/ложного объекта) —
+        # откачено 2026-08-31: не устранило сам уход головы (см.
+        # project_face_search_retry.md), лишняя сложность. Оставлено как
+        # было — самое большое лицо.
         return max(tracks, key=lambda t: _bbox_area(t.get('bbox', [0, 0, 0, 0]))).get('bbox')
 
     def _ema(self, current: list | None, new: list) -> list:
@@ -333,7 +387,7 @@ class VisionHeadTrackerNode(LifecycleNode):
             left_absent  = (now - left_msg_ref) >= _FALLBACK_SEC
             left_bbox    = self._left_bbox  if left_fresh  else None
             right_bbox   = self._right_bbox if (right_fresh and left_absent) else None
-            head_stale  = self._head_stale
+            bbox_seq    = self._bbox_seq
             last_any    = max(self._last_left_t, self._last_right_t)
 
         self._locked_pub.publish(Bool(data=bool(left_bbox is not None or right_bbox is not None)))
@@ -369,14 +423,42 @@ class VisionHeadTrackerNode(LifecycleNode):
 
         norm_x, norm_y = self._bbox_to_norm(lead_bbox)
 
-        # ── Голова (с защитой от осцилляции) ─────────────────────────────
-        if head_stale < self._max_stale:
+        # Диагностика: track_id сменился (например, identity_manager только что
+        # подтвердил личность и выдал target_track_id) И новый bbox оказался на
+        # краю кадра, хотя мгновение назад трекинг был нормальным — подозрение
+        # на переключение на ДРУГОЙ, ошибочный трек вместо уже хорошо
+        # центрированного лица. См. живой баг 2026-08-31.
+        if self._target_track_id != self._prev_target_track_id:
+            if abs(norm_x) > 0.5 or abs(norm_y) > 0.5:
+                self.get_logger().warn(
+                    f'HeadTracker: ПОДОЗРИТЕЛЬНЫЙ СКАЧОК track_id '
+                    f'{self._prev_target_track_id} → {self._target_track_id}, '
+                    f'новый bbox на краю кадра offset=({norm_x:+.2f},{norm_y:+.2f}) — '
+                    f'возможно, переключились на не то лицо')
+            self._prev_target_track_id = self._target_track_id
+
+        # ── Голова: ОДИН шаг СТРОГО на каждую новую детекцию, не на тик ──
+        # (см. комментарий у self._bbox_seq в __init__ — раньше здесь была
+        # проверка head_stale < max_stale, позволявшая до 5 повторных шагов
+        # на одном и том же устаревшем offset между двумя детекциями).
+        if bbox_seq != self._last_stepped_seq:
             self._step_head(norm_x, norm_y)
-            with self._lock:
-                self._head_stale += 1
+            self._last_stepped_seq = bbox_seq
 
         # ── Глаза: один набор joint names, EYE_SYNC зеркалирует второй ──
         self._set_eye(norm_x, norm_y)
+
+        # Диагностика: раз в секунду показываем, куда и почему едет голова —
+        # раньше P-регулятор не логировал НИЧЕГО между "включён" и "нет трека
+        # → покой", дрейф в сторону от реального лица был не виден в логах.
+        now_mono = time.monotonic()
+        if now_mono - self._last_track_log_mono >= self._TRACK_LOG_INTERVAL_SEC:
+            self._last_track_log_mono = now_mono
+            self.get_logger().info(
+                f'HeadTracker: слежу ({self._active_side}, track_id='
+                f'{self._target_track_id}) offset=({norm_x:+.2f},{norm_y:+.2f}) '
+                f'→ rothead={self._rothead:.1f}° neck={self._neck:.1f}° '
+                f'eye_lr={self._eye_lr:.1f}°')
 
         self._publish_head()
         self._publish_eyes(self._active_side)
@@ -401,6 +483,34 @@ class VisionHeadTrackerNode(LifecycleNode):
             step_v = _clamp(
                 self._head_tilt_dir * norm_y * self._max_step * self._gain_head,
                 -self._max_step, self._max_step)
+
+        # Страховка от разгона: offset (ошибка позиции лица в кадре) должен
+        # УМЕНЬШАТЬСЯ по мере того, как голова доворачивается к лицу. Если
+        # несколько детекций подряд этого не происходит — что-то не так
+        # (устаревший/некорректный bbox или голова физически не может
+        # скомпенсировать сдвиг) — останавливаем накопление коррекции,
+        # вместо того чтобы доехать до аппаратного предела серва.
+        mag = abs(norm_x) + abs(norm_y)
+        if self._streak_ref_mag is None:
+            self._streak_ref_mag = mag
+        if mag <= self._streak_ref_mag - self._RUNAWAY_IMPROVE_EPS:
+            # Настоящий прогресс относительно начала серии — сбрасываем
+            # счётчик и переносим baseline на текущее (уже лучшее) значение.
+            self._runaway_streak = 0
+            self._streak_ref_mag = mag
+        else:
+            self._runaway_streak += 1
+
+        if self._runaway_streak >= self._RUNAWAY_MAX_STREAK:
+            if self._runaway_streak == self._RUNAWAY_MAX_STREAK:
+                self.get_logger().warn(
+                    f'HeadTracker: РАЗГОН — offset не уменьшается '
+                    f'{self._runaway_streak} детекций подряд '
+                    f'(offset=({norm_x:+.2f},{norm_y:+.2f}), track_id='
+                    f'{self._target_track_id}) — останавливаю накопление '
+                    f'коррекции головы')
+            return
+
         self._rothead = _clamp(self._rothead + step_h, *self._rothead_range)
         self._neck    = _clamp(self._neck    + step_v, *self._neck_range)
 
@@ -430,10 +540,11 @@ class VisionHeadTrackerNode(LifecycleNode):
         with self._lock:
             self._left_bbox        = None
             self._right_bbox       = None
-            self._head_stale       = 0
             self._target_track_id  = None
             self._target_person_id = None
             self._at_rest          = True
+            self._runaway_streak   = 0
+            self._streak_ref_mag   = None
         self._publish_head()
         # В покое публикуем левый — EYE_SYNC зеркалирует правый
         self._publish_eyes('left')

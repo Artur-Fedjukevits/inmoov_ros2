@@ -248,6 +248,11 @@ class IdentityManagerNode(LifecycleNode):
                 track_ids = {t['track_id'] for t in tracks}
 
                 if self._primary_track not in track_ids:
+                    # Пробовали здесь выбирать по схожести embedding вместо
+                    # площади bbox (живой баг 2026-08-31: перехват чужого/
+                    # ложного трека) — откачено 2026-08-31: не устранило сам
+                    # уход головы (см. project_face_search_retry.md), лишняя
+                    # сложность. Оставлено как было — по площади bbox.
                     best = max(tracks, key=lambda t: (
                         (t['bbox'][2] - t['bbox'][0]) * (t['bbox'][3] - t['bbox'][1])))
                     new_track = best['track_id']

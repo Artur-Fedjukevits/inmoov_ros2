@@ -98,7 +98,7 @@ def generate_launch_description():
         DeclareLaunchArgument('cam_right',
             default_value='/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0'),
         DeclareLaunchArgument('fps',                  default_value='15'),
-        DeclareLaunchArgument('detection_hz',         default_value='2.5'),
+        DeclareLaunchArgument('detection_hz',         default_value='5.0'),
         DeclareLaunchArgument('det_thresh',           default_value='0.5'),
         DeclareLaunchArgument('analysis_hz',          default_value='2.0'),
         DeclareLaunchArgument('gain_head',            default_value='0.3'),
@@ -486,8 +486,8 @@ def generate_launch_description():
             'dead_zone_px':       20,
             'head_dead_zone_px':  80,
             'eye_limit_deg':      8.0,
-            'return_timeout_sec': 7.0,  # было 3.0 — слишком мало для догона после наведения по OAK-D (2026-08-24)
-            'track_hz':           15.0,
+            'return_timeout_sec': 10.0,  # было 7.0 — всё ещё мало, роняло голову в rest посреди диалога при кратковременной потере лица на краю кадра (2026-09-01)
+            'track_hz':           10.0,
             'max_step_deg':       2.0,
             'bbox_ema_alpha':     0.4,
             'max_stale_ticks':    5,

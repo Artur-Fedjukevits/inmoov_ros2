@@ -166,6 +166,9 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         self._pre_turn_rothead  = self._REST_ROTHEAD
         self._pre_turn_neck     = self._REST_NECK
         self._override_active   = False   # True между ручной командой и resume
+        # Был ли реально пойман трек ДО ручной команды (не просто "голова была
+        # в покое/центре") — см. _resume_head_tracker.
+        self._had_lock_before_turn = False
         self._sub_joint = node.create_subscription(
             JointState, '/joint_command', self._track_joint_cb, 10)
 
@@ -221,6 +224,7 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
             # снимок промежуточной повёрнутой позицией.
             self._pre_turn_rothead = self._known_rothead
             self._pre_turn_neck    = self._known_neck
+            self._had_lock_before_turn = getattr(self._node, '_face_locked', False)
             self._override_active  = True
 
         rothead = max(30.0, min(140.0, self._REST_ROTHEAD + pan))
@@ -271,27 +275,41 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         self._head_timer.start()
 
     def _resume_head_tracker(self):
-        # Сначала физически возвращаем голову (и корпус, если двигали) туда, где
-        # было лицо ДО ручной команды — иначе head_tracker включится там, куда мы
-        # повернули (например, крайне вправо), не найдёт там лицо в течение
-        # return_timeout_sec (7с) и сам уедет в REST, теряя собеседника.
-        back = JointState()
-        back.header.stamp = self._node.get_clock().now().to_msg()
-        back.name     = ['rothead', 'neck']
-        back.position = [
-            (self._pre_turn_rothead - 90.0) * math.pi / 180.0,
-            (self._pre_turn_neck    - 90.0) * math.pi / 180.0,
-        ]
-        if self._last_scope != 'head':
-            # Корпус двигали ручной командой (scope=partial/full) — head_tracker
-            # управляет только головой, поэтому корпус сам не вернётся в центр.
-            back.name.append('midstom')
-            back.position.append(0.0)
-            self._node.note_own_torso_move()
-        self._pub_joint.publish(back)
-        self._node.get_logger().info(
-            f'Head: возврат к позиции до команды rothead={self._pre_turn_rothead:.0f}° '
-            f'neck={self._pre_turn_neck:.0f}°')
+        # Если ДО ручной команды лицо было реально поймано (не просто "голова
+        # стояла в покое/центре") — возвращаем голову туда, где было лицо,
+        # иначе head_tracker включится там, куда мы повернули, не найдёт там
+        # лицо за return_timeout_sec и сам уедет в REST, теряя собеседника.
+        #
+        # НО если лица не было и ДО команды (типичный случай "я слева от тебя"
+        # / look_direction, когда head_tracker весь диалог просто стоял в
+        # покое) — НЕ откатываем: ручная команда только что физически
+        # подтвердила (в т.ч. фото/описанием), что человек находится ИМЕННО
+        # в текущей повёрнутой позиции. Откат в старую позицию (по факту —
+        # в REST) отменял бы это открытие и гарантированно снова терял
+        # человека. Живой баг 2026-08-31 (нашёл пользователь): "посмотрел
+        # налево, сфотографировал, описал — и тут же повернулся обратно".
+        if self._had_lock_before_turn:
+            back = JointState()
+            back.header.stamp = self._node.get_clock().now().to_msg()
+            back.name     = ['rothead', 'neck']
+            back.position = [
+                (self._pre_turn_rothead - 90.0) * math.pi / 180.0,
+                (self._pre_turn_neck    - 90.0) * math.pi / 180.0,
+            ]
+            if self._last_scope != 'head':
+                # Корпус двигали ручной командой (scope=partial/full) — head_tracker
+                # управляет только головой, поэтому корпус сам не вернётся в центр.
+                back.name.append('midstom')
+                back.position.append(0.0)
+                self._node.note_own_torso_move()
+            self._pub_joint.publish(back)
+            self._node.get_logger().info(
+                f'Head: возврат к позиции до команды rothead={self._pre_turn_rothead:.0f}° '
+                f'neck={self._pre_turn_neck:.0f}°')
+        else:
+            self._node.get_logger().info(
+                'Head: лица не было и до команды — остаёмся в текущей '
+                '(только что подтверждённой) позиции, не откатываем')
         self._last_scope       = 'head'
         self._override_active  = False
 
@@ -683,7 +701,8 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
         self._phase_end = time.monotonic() + dur
         self._node.enable_face_detection(True)
         self._head_cmd(target)
-        self._node.get_logger().info('PIRScan: старт — поворот влево, face_detection включена')
+        self._node.get_logger().info(
+            f'PIRScan: старт — поворот влево (rothead={target:.0f}°), face_detection включена')
 
     def update(self) -> py_trees.common.Status:
         if time.monotonic() < self._phase_end:
@@ -697,7 +716,7 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
         self._phase_end = time.monotonic() + dur
         if target is not None:
             self._head_cmd(target)
-            self._node.get_logger().info(f'PIRScan: {name}')
+            self._node.get_logger().info(f'PIRScan: {name} (rothead={target:.0f}°)')
 
         return py_trees.common.Status.RUNNING
 
@@ -785,42 +804,6 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
         msg.velocity = [self._TURN_VEL]
         self._torso_pub.publish(msg)
 
-    def _aim_head_at_human(self) -> None:
-        """Одноразовое наведение головы (rothead) на человека по /human_angle_deg
-        (OAK-D atan2(x_mm,z_mm)) — ДО enable_head_tracker(). Идея из статьи
-        AIR2025 (Saini et al.): грубый SSL уже довёл корпус, но лицо может ещё
-        не попасть в кадр глазных камер (узкий FOV) пока не наведём голову
-        точнее по OAK-D, у которого более широкий обзор и реальная позиция.
-        Без этого шага vision_head_tracker может сдаться по таймауту "нет
-        трека 3с" раньше, чем face_detection вообще успеет увидеть лицо
-        (см. живой тест 2026-08-22/23 — задержка распознавания ~6с > 3с
-        терпения head_tracker).
-        Первая версия (`90 - angle`) дала rothead=123° для человека слева
-        (angle=-33°) — по документированной конвенции rothead
-        (LEFT=120/RIGHT=60) это должно было быть верно, но пользователь
-        по факту увидел поворот НЕ в ту сторону 2026-08-24 (аналогично
-        истории с midstom, где документированная конвенция тоже оказалась
-        перепутанной). Формула перевёрнута на `90 + angle` — ЕЩЁ НЕ
-        перепроверено вживую после правки, нужен повторный тест. Если
-        опять не туда — под вопросом уже не формула, а либо знак самого
-        /human_angle_deg (OAK-D x_mm), либо истинная физическая конвенция
-        rothead (возможно, документация "LEFT=120/RIGHT=60" сама неверна
-        несмотря на старую пометку [x] в памяти) — тогда сверять оба по
-        отдельности, не гадать формулой."""
-        angle = getattr(self._node, '_last_human_angle', 0.0)
-        rothead = max(self._ROTHEAD_MIN, min(self._ROTHEAD_MAX, self._ROTHEAD_CENTER + angle * self._AIM_GAIN))
-        msg = JointState()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.name     = ['rothead', 'neck']
-        msg.position = [
-            (rothead        - 90.0) * math.pi / 180.0,
-            (self._NECK_REST - 90.0) * math.pi / 180.0,
-        ]
-        msg.velocity = [self._TURN_VEL, self._TURN_VEL]
-        self._torso_pub.publish(msg)
-        self._node.get_logger().info(
-            f'SoundScan: навожу голову на человека (OAK-D angle={angle:.0f}° → rothead={rothead:.0f}°)')
-
     def initialise(self) -> None:
         self._completed = False
         self._phase      = 0
@@ -882,7 +865,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     def _found(self) -> py_trees.common.Status:
         self._completed = True
         self._bb.sound.scan_active = False
-        self._aim_head_at_human()   # сразу навести голову по OAK-D, не ждать пока её найдёт face_detection
+        self._node.aim_head_at_human()   # сразу навести голову по OAK-D, не ждать пока её найдёт face_detection
         self._node.enable_head_tracker(True)
         self._node.get_logger().info(
             'SoundScan: OAK-D увидел человека — останавливаюсь, передаю управление head_tracker')
@@ -1406,6 +1389,40 @@ class BehaviorManagerNode(LifecycleNode):
         (см. _PIR_SELF_MOTION_BLANK_SEC/_pir_cb)."""
         self._last_own_torso_move_mono = time.monotonic()
 
+    def aim_head_at_human(self) -> None:
+        """Одноразовое точное наведение головы (rothead) на человека по
+        /human_angle_deg (OAK-D atan2(x_mm,z_mm)) — узкий FOV глазных камер
+        может не поймать лицо после одного лишь грубого поворота КОРПУСА
+        (SoundScanBehaviour/FaceSearchAttempt поворачивают только midstom,
+        в фиксированные крайние 60°/120°, без точной довидки головой).
+
+        Раньше вызывалась только из SoundScanBehaviour._found() (одноразовый
+        скан сразу после wake word). Вынесена на уровень узла и подключена
+        также к _human_detected_cb (см. ниже) — живой баг 2026-08-31: во
+        время диалога FaceSearchAttempt крутил корпус в упор, но rothead
+        весь диалог стоял на 90° (нет трека 7с → покой), потому что точная
+        довидка головой не происходила вообще, если OAK-D видел человека НЕ
+        сразу после wake word, а позже, посреди уже идущего разговора.
+
+        Идея из статьи AIR2025 (Saini et al.). Формула/знак — см.
+        SoundScanBehaviour._ROTHEAD_* / _AIM_GAIN, не переопределяем здесь
+        повторно, используем те же."""
+        angle = self._last_human_angle
+        rothead = max(SoundScanBehaviour._ROTHEAD_MIN, min(
+            SoundScanBehaviour._ROTHEAD_MAX,
+            SoundScanBehaviour._ROTHEAD_CENTER + angle * SoundScanBehaviour._AIM_GAIN))
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name     = ['rothead', 'neck']
+        msg.position = [
+            (rothead - 90.0) * math.pi / 180.0,
+            (SoundScanBehaviour._NECK_REST - 90.0) * math.pi / 180.0,
+        ]
+        msg.velocity = [SoundScanBehaviour._TURN_VEL, SoundScanBehaviour._TURN_VEL]
+        self._aim_joint_pub.publish(msg)
+        self.get_logger().info(
+            f'AimHead: навожу голову на человека (OAK-D angle={angle:.0f}° → rothead={rothead:.0f}°)')
+
     # ── Face-search retry (см. FaceSearchAttempt) ─────────────────────────
 
     def _reset_face_search(self) -> None:
@@ -1432,6 +1449,10 @@ class BehaviorManagerNode(LifecycleNode):
             'attempts': attempts,
             'ask_now': ask_now,
             'kind': 'never_found' if not self._face_ever_locked else 'lost_again',
+            # Живой баг 2026-08-31: LLM отвечал "да, вижу тебя!" на прямой
+            # вопрос, хотя head_tracker лицо не держал — вплетаем правду в
+            # промпт (_build_face_search_block), чтобы не галлюцинировать.
+            'locked': self._face_locked,
         })
         self._face_search_status_pub.publish(msg)
 
@@ -1463,6 +1484,11 @@ class BehaviorManagerNode(LifecycleNode):
         # продержалась дольше — это уже не моргание.
         if was_locked:
             self._face_lost_since = time.monotonic()
+            # locked=False должен дойти до llm_node СРАЗУ (не через грейс) —
+            # честность про "вижу/не вижу" важнее, чем физическая реакция
+            # (доворот корпуса), которую по-прежнему придерживаем на грейс.
+            self._publish_face_search_status(
+                active=True, attempts=self._face_search_attempts, ask_now=False)
             return
         if self._face_lost_since is None:
             return  # эту потерю уже обработали (или её не было) — не спамим
@@ -1507,8 +1533,15 @@ class BehaviorManagerNode(LifecycleNode):
 
         if self._last_direction_hint == 'right':
             target, source = SoundScanBehaviour._RIGHT, 'voice_hint'
+            # Разовая подсказка — расходуем сразу, иначе при следующей неудаче
+            # (или после того, как look_direction/фото УЖЕ опровергли её) она
+            # использовалась бы повторно до следующей реплики с направлением.
+            # Живой баг 2026-08-31: "я слева" продолжало применяться даже
+            # после снимка, подтвердившего, что слева никого нет.
+            self._last_direction_hint = 'none'
         elif self._last_direction_hint == 'left':
             target, source = SoundScanBehaviour._LEFT, 'voice_hint'
+            self._last_direction_hint = 'none'
         elif (self._last_sound_confidence >= SoundScanBehaviour._MIN_CONFIDENCE
               and abs(self._last_sound_angle) >= SoundScanBehaviour._MIN_ANGLE_DEG):
             target = (SoundScanBehaviour._RIGHT if self._last_sound_angle > 0
@@ -1738,8 +1771,25 @@ class BehaviorManagerNode(LifecycleNode):
         self._last_sound_confidence = msg.confidence
 
     def _human_detected_cb(self, msg: Bool):
-        """Кэш последнего /human_detected (OAK-D) для SoundScanBehaviour."""
+        """Кэш последнего /human_detected (OAK-D) для SoundScanBehaviour.
+
+        На переднем фронте (False→True), если лицо ещё не поймано, а
+        человек рядом (диалог активен) — сразу точно доводим голову по
+        OAK-D (aim_head_at_human), не дожидаясь пока это сделает head_tracker
+        своими узкими глазными камерами. Раньше эта довидка происходила
+        ТОЛЬКО в SoundScanBehaviour._found() (сразу после wake word) — если
+        OAK-D видел человека позже, посреди уже идущего диалога (типичный
+        случай для FaceSearchAttempt, который крутит только корпус), голова
+        так и оставалась в покое. Живой баг 2026-08-31."""
+        was_detected = self._human_detected
         self._human_detected = msg.data
+        if msg.data and not was_detected and not self._face_locked:
+            try:
+                person_present = self._bb.social.person_present
+            except Exception:
+                person_present = False
+            if person_present:
+                self.aim_head_at_human()
 
     def _human_angle_cb(self, msg: Float32):
         """Кэш последнего /human_angle_deg (OAK-D atan2(x_mm,z_mm)) для наведения головы."""
@@ -1857,6 +1907,9 @@ class BehaviorManagerNode(LifecycleNode):
         # как /robot_sleep, чтобы перезапущенный llm_node сразу видел текущий статус.
         self._face_search_status_pub = self.create_lifecycle_publisher(
             String, '/behavior/face_search_status', lqos)
+        # Для aim_head_at_human() — обычный (не lifecycle) паблишер, как и у
+        # остальных BT-листьев в этом файле (SoundScanBehaviour, FaceSearchAttempt).
+        self._aim_joint_pub = self.create_publisher(JointState, '/joint_command', 10)
 
         self.create_subscription(String, '/llm_response',   self._llm_response_cb,   10)
         self.create_subscription(String, 'robot_events',    self._event_cb,           10)
