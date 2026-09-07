@@ -273,6 +273,14 @@ class FaceExpressions:
         until the caller (speech duration) explicitly changes/reverts it,
         unlike the one-shot animated methods below (happy()/surprise()/etc.)
         used by /face_expression."""
+        if name == 'neutral':
+            # EXPRESSIONS_DATA['neutral'] == {} → _expr('neutral') would send
+            # an empty positions dict, which _send() no-ops on. Without this,
+            # holding 'neutral' never actually moves the servos back to rest
+            # — the previous expression's pose (e.g. happy) stays stuck
+            # forever instead of relaxing when speech ends.
+            self.neutral()
+            return
         self._expr(name)
 
     # ── Expressions ───────────────────────────────────────────────────────────

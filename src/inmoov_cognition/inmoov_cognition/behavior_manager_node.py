@@ -417,12 +417,14 @@ class SpeakBehaviour(py_trees.behaviour.Behaviour):
     """
 
     def __init__(self, node: Node, text: str | None = None,
-                 bb_key: str | None = None, voice_bb_key: str | None = None):
+                 bb_key: str | None = None, voice_bb_key: str | None = None,
+                 voice: str | None = None):
         super().__init__('Speak')
         self._node          = node
         self._text          = text
         self._bb_key        = bb_key
         self._voice_bb_key  = voice_bb_key
+        self._voice         = voice
         self._client        = ActionClient(node, Speak, 'speak')
         self._goal_handle   = None
         self._done          = threading.Event()
@@ -443,7 +445,7 @@ class SpeakBehaviour(py_trees.behaviour.Behaviour):
         self._goal_handle = None
 
         text  = self._text
-        voice = ''
+        voice = self._voice or ''
         if self._bb is not None:
             try:
                 if self._bb_key:
@@ -1105,18 +1107,16 @@ def build_tree(node: Node, tavily_key: str) -> py_trees.behaviour.Behaviour:
     )
 
     # Приветствие: только один раз (should_greet → True → BT приветствует → сбрасывает флаг)
+    # Мимика — через /face_expression_hold (tts_node), не ExpressEmotion/BT:
+    # раньше параллельная ExpressEmotion('happy') дёргала animated happy() с
+    # собственным hold_sec=1с и откатывала лицо в rest ещё до конца фразы
+    # приветствия (5-7с), см. dialogue_branch выше — тот же баг, что там уже
+    # был исправлен, здесь просмотрели при миграции e0ddd51.
     greet_branch = py_trees.composites.Sequence(
         'GreetBranch', memory=True, children=[
             CheckBB('ShouldGreet', '/social/should_greet',
                     check_fn=lambda v: v is True),
-            py_trees.composites.Parallel(
-                'GreetParallel',
-                policy=py_trees.common.ParallelPolicy.SuccessOnAll(),
-                children=[
-                    SpeakBehaviour(node, bb_key='/social/greet_text'),
-                    ExpressEmotion(node, emotion='happy'),
-                ]
-            ),
+            SpeakBehaviour(node, bb_key='/social/greet_text', voice='happy'),
             SetBB('ClearGreet', '/social/should_greet', False),
         ]
     )
