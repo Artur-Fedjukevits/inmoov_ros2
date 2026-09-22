@@ -8,9 +8,7 @@ for motion control. Everything is orchestrated by a tier-based lifecycle
 manager built on ROS2 managed lifecycle nodes.
 
 This is a hobby project built and tuned against one specific physical robot
-— expect hardcoded defaults (LAN IPs, device paths, model directories) tied
-to that machine throughout the code and READMEs. They are called out where
-found; treat them as "override for your own setup," not as configuration
+— expect hardcoded defaults. Not as configuration
 that works out of the box.
 
 ## Architecture
@@ -74,9 +72,9 @@ those sections before relying on a given node).
 
 ## Hardware
 
-- **Onboard compute**: a local mini-PC (Ryzen 9, integrated GPU) running the
+- **Onboard compute**: Geekom Mini PC A8 Max Ryzen 9 8945HS 32GB RAM running the
   full ROS2 graph.
-- **LLM/TTS compute**: a separate machine with two GPUs, one serving the LLM
+- **LLM/TTS compute**: a separate machine with two GPUs 3090 and 5060, one serving the LLM
   (OpenAI-compatible API) and one serving TTS, both reached over the LAN —
   see `inmoov_cognition`/`inmoov_voice` READMEs for the exact endpoints
   (override their host/port parameters for your own setup).
@@ -84,7 +82,7 @@ those sections before relying on a given node).
   [`Arduino/`](Arduino/) and `inmoov_control`.
 - **Vision**: one USB camera per eye plus an OAK-D Lite depth camera in the
   torso.
-- **Audio**: a USB conferencing speaker/mic as the primary audio device.
+- **Audio**: USB Jabra Speak 2 as the primary audio device.
 
 ## Build
 
