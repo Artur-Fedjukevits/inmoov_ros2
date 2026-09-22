@@ -17,6 +17,15 @@ UART packet (body + face, total 28 bytes) — ORDER MUST MATCH InMoovLeft.ino:
 
   Face PCA9685 (10 bytes, 18-27):
     Byte 18-27: eyelid_L_Upper .. forhead_R
+
+  Hall finger sensors (5)  → /hall_left_raw (Int16MultiArray, raw analogRead)
+                              order: [thumb, index, middle, ring, pinky]
+                              (MIDDLE/PINKY physical pins swapped vs. the
+                              right arm — see InMoovLeft.ino)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import rclpy
@@ -68,7 +77,9 @@ class ArduinoLeftNode(ArduinoCommNode):
 
     HAS_ULTRASONIC   = True
     HAS_PIR          = False
+    HAS_HALL         = True
     ULTRASONIC_TOPIC = 'ultrasonic_left_distance'
+    HALL_TOPIC       = 'hall_left_raw'
 
     def __init__(self, serial_port: str = DEFAULT_PORT):
         super().__init__('arduino_left_node', serial_port)

@@ -1,18 +1,19 @@
 """
-faceExpressions.py — InMoov face expression library for ROS2.
+face_expressions_node.py — InMoov face expression library for ROS2.
 
 Source files ported from MRL InMoov2:
   gestures/faceExpressions.py
   EyebrowMovements.py, EyelidMovements.py, CheekMovements.py, EyeMovements.py
 
 Usage as a library (from behavior_manager_node or similar):
-  from inmoov_control.faceExpressions import FaceExpressions
+  from inmoov_control.face_expressions_node import FaceExpressions
   fe = FaceExpressions(node)
   fe.happy()
 
 Usage as a standalone node:
   ros2 run inmoov_control face_expressions_node
   ros2 topic pub /face_expression std_msgs/msg/String "data: happy"
+  ros2 topic pub /face_expression_hold std_msgs/msg/String "data: happy"
 
 Calibration:
   Run face_expression_calibrator (test/face_expression_calibrator.py) to tune
@@ -24,6 +25,10 @@ IMPORTANT — firmware protocol quirk:
   Sending degree value 0 in /face_command means "go to rest" (not 0°).
   Arduino firmware: val==0 → use rest_angle, else constrain(val, min, max).
   All minimum-position commands therefore use 1° (firmware clamps to min_angle).
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -418,8 +423,8 @@ class FaceExpressionsNode(LifecycleNode):
     def on_configure(self, state):
         self._fe = FaceExpressions(self)
         self.create_subscription(String, '/face_expression', self._cb, 10)
-        # Held-мимика на время речи (tts_node) — статичная поза, без
-        # анимации/авто-возврата, см. FaceExpressions.hold().
+        # Held expression for the duration of speech (tts_node) — a static
+        # pose, no animation / auto-revert, see FaceExpressions.hold().
         self.create_subscription(String, '/face_expression_hold', self._cb_hold, 10)
         self.get_logger().info(
             f'face_expressions_node configured | calib: '
@@ -455,8 +460,8 @@ class FaceExpressionsNode(LifecycleNode):
             self.get_logger().warn(f'Unknown hold expression: "{name}"')
             return
         self.get_logger().info(f'face expression (hold): {name}')
-        # Тот же single-worker executor, что и /face_expression — сериализует
-        # с анимированными жестами (greet/farewell), исключая гонку сервоприводов.
+        # Same single-worker executor as /face_expression — serialises with
+        # the animated gestures (greet/farewell), avoiding a servo race.
         self._executor.submit(self._fe.hold, name)
 
 

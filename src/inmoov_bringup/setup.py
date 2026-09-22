@@ -19,7 +19,7 @@ setup(
     maintainer='artur',
     maintainer_email='fedjukevitsh@gmail.com',
     description='Top-level bringup for InMoov robot',
-    license='Apache-2.0',
+    license='GPL-3.0-only',
     entry_points={
         'console_scripts': [
             'lifecycle_manager = inmoov_bringup.lifecycle_manager:main',

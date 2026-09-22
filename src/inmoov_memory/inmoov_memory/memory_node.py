@@ -2,45 +2,49 @@
 """
 memory_node.py — Memory Manager Node (v2)
 ==========================================
-Единый ROS2-узел, управляющий всей памятью робота:
+Single ROS2 node that manages all of the robot's memory:
 
-  СОЦИАЛЬНАЯ ПАМЯТЬ (SQLite, /home/artur/inmoov_memory.db):
+  SOCIAL MEMORY (SQLite, /home/artur/inmoov_memory.db):
     persons, person_gallery, person_notes, robot_knowledge
-    — распознавание лиц, голосов, заметки о людях
+    — face/voice recognition, notes about people
 
-  РАБОЧАЯ ПАМЯТЬ  (RAM, WorkingMemory):
-    время, место, режим, люди рядом — всегда в LLM context
+  WORKING MEMORY (RAM, WorkingMemory):
+    time, location, mode, people nearby — always in the LLM context
 
-  ЭПИЗОДИЧЕСКАЯ ПАМЯТЬ (SQLite, /home/artur/inmoov_episodic.db):
-    краткосрочные воспоминания, диалоги — последние 5 в prompting
+  EPISODIC MEMORY (SQLite, /home/artur/inmoov_episodic.db):
+    short-term memories, dialogues — last 5 included in prompting
 
-  СЕМАНТИЧЕСКАЯ ПАМЯТЬ (SQLite + ChromaDB, /home/artur/inmoov_semantic.db):
-    долгосрочные факты, предпочтения — только через tool call
+  SEMANTIC MEMORY (SQLite + ChromaDB, /home/artur/inmoov_semantic.db):
+    long-term facts, preferences — only via tool call
 
-ROS2-интерфейсы:
-  /memory/query   (srv MemoryQuery) — все операции (ops ниже)
-  /memory/context (pub String, 30s) — рабочая память + эпизоды для LLM prompt
-  /social_context (sub String)      — обновление рабочей памяти из identity_manager
-  /conversation_end (sub String)    — после диалога: резюме + извлечение фактов
+ROS2 interfaces:
+  /memory/query   (srv MemoryQuery) — all operations (ops below)
+  /memory/context (pub String, 30s) — working memory + episodes for the LLM prompt
+  /social_context (sub String)      — working memory updates from identity_manager
+  /conversation_end (sub String)    — after a dialogue: summary + fact extraction
   /robot_sleep    (sub Bool, latched)
 
-Операции /memory/query:
-  Социальная память (существующие):
+/memory/query operations:
+  Social memory (original):
     lookup_person, save_person, update_embedding, get_context,
     update_seen, set_note, get_knowledge, set_knowledge,
     gallery_add, gallery_remove, gallery_rebuild_embedding,
     gallery_list, merge_persons, reload_gallery,
     get_voice_embedding, save_voice_embedding, update_voice_embedding, lookup_by_voice
 
-  Новые (3-слойная память):
-    search_semantic        — семантический поиск в долговременной памяти
-    save_semantic_fact     — сохранить факт в долговременную память
-    search_episodes        — поиск по эпизодической памяти
-    get_recent_episodes    — последние N эпизодов (для LLM tool)
-    save_episode           — сохранить эпизод вручную
-    get_working_memory     — текущее состояние рабочей памяти
-    update_working_memory  — обновить рабочую память
-    get_memory_context     — собрать текстовый контекст для LLM
+  New (3-layer memory):
+    search_semantic        — semantic search in long-term memory
+    save_semantic_fact     — save a fact to long-term memory
+    search_episodes        — search episodic memory
+    get_recent_episodes    — last N episodes (for an LLM tool)
+    save_episode           — save an episode manually
+    get_working_memory     — current working memory state
+    update_working_memory  — update working memory
+    get_memory_context     — assemble text context for the LLM
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -65,7 +69,7 @@ logger = logging.getLogger(__name__)
 class MemoryNode(LifecycleNode):
     def __init__(self):
         super().__init__('memory_node')
-        # Инстанс-переменные — будут заполнены в on_configure
+        # Instance variables — populated in on_configure
         self._db              = None
         self._lock            = threading.Lock()
         self._gallery_cache: dict[int, np.ndarray] = {}
@@ -87,12 +91,12 @@ class MemoryNode(LifecycleNode):
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores repeated declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
     def on_configure(self, state):
-        # ── Параметры ──────────────────────────────────────────────────────
+        # ── Parameters ─────────────────────────────────────────────────────
         self._dp('db_path',                    '/home/artur/inmoov_memory.db')
         self._dp('episodic_db_path',           '/home/artur/inmoov_episodic.db')
         self._dp('semantic_db_path',           '/home/artur/inmoov_semantic.db')
@@ -121,18 +125,18 @@ class MemoryNode(LifecycleNode):
         self._tg_reminder_person_id = self.get_parameter('telegram_reminder_person_id').value
         self._reminder_default_time = self.get_parameter('reminder_default_time').value
 
-        # ── Социальная память (SQLite) ─────────────────────────────────────
+        # ── Social memory (SQLite) ────────────────────────────────────────
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._init_social_db()
         self._load_gallery_cache()
         self._load_voice_cache()
         self._load_voice_gallery_cache()
 
-        # ── Напоминания ────────────────────────────────────────────────────
+        # ── Reminders ──────────────────────────────────────────────────────
         self._reminder_db = ReminderDB(reminder_db)
         self.get_logger().info(f'ReminderDB: {reminder_db}')
 
-        # ── 3-слойная память ───────────────────────────────────────────────
+        # ── 3-layer memory ─────────────────────────────────────────────────
         self._mm = MemoryManager(
             db_path=episodic_db,
             semantic_db_path=semantic_db,
@@ -144,10 +148,10 @@ class MemoryNode(LifecycleNode):
         self.get_logger().info(
             f'MemoryManager: episodic={episodic_db} semantic={semantic_db}')
 
-        # ── Сервис — создаём в configure, доступен сразу после активации ───
+        # ── Service — created in configure, available right after activation ─
         self.create_service(MemoryQuery, '/memory/query', self._handle)
 
-        # ── Подписки ───────────────────────────────────────────────────────
+        # ── Subscriptions ──────────────────────────────────────────────────
         self.create_subscription(String, '/social_context',   self._social_context_cb, 10)
         self.create_subscription(String, '/conversation_end', self._conversation_end_cb, 10)
         _latched = QoSProfile(
@@ -157,16 +161,16 @@ class MemoryNode(LifecycleNode):
         )
         self.create_subscription(Bool, '/robot_sleep', self._robot_sleep_cb, _latched)
 
-        # ── Lifecycle publishers (молчат пока не вызван on_activate) ───────
+        # ── Lifecycle publishers (silent until on_activate is called) ──────
         self._ctx_pub     = self.create_lifecycle_publisher(String, '/memory/context', 10)
         self._tg_push_pub = self.create_lifecycle_publisher(String, '/telegram_push', 10)
 
         self.get_logger().info(
-            f'MemoryNode configured. БД: {db_path} | порог: {self.sim_threshold}')
+            f'MemoryNode configured. DB: {db_path} | threshold: {self.sim_threshold}')
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
-        # ОБЯЗАТЕЛЬНО активировать каждый lifecycle publisher, передавая state
+        # MUST activate every lifecycle publisher, passing state
         self._ctx_pub.on_activate(state)
         self._tg_push_pub.on_activate(state)
 
@@ -178,13 +182,13 @@ class MemoryNode(LifecycleNode):
             self._timers.append(
                 self.create_timer(tg_check_sec, self._send_due_reminders_to_telegram))
 
-        # Первая публикация контекста сразу
+        # Publish context immediately the first time
         self._publish_memory_context()
 
         self.get_logger().info(
-            f'MemoryNode active. Контекст каждые {ctx_rate}с | '
+            f'MemoryNode active. Context every {ctx_rate}s | '
             f'telegram reminders person_id={self._tg_reminder_person_id} '
-            f'каждые {tg_check_sec:.0f}с')
+            f'every {tg_check_sec:.0f}s')
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
@@ -227,7 +231,7 @@ class MemoryNode(LifecycleNode):
             pass
 
     # ════════════════════════════════════════════════════════════════════
-    # Инициализация социальной БД (бывший _init_db)
+    # Social DB initialization (formerly _init_db)
     # ════════════════════════════════════════════════════════════════════
 
     def _init_social_db(self):
@@ -268,16 +272,16 @@ class MemoryNode(LifecycleNode):
             try:
                 self._db.execute('ALTER TABLE persons ADD COLUMN voice_embedding BLOB')
                 self._db.commit()
-                self.get_logger().info('Миграция БД: добавлена колонка voice_embedding')
+                self.get_logger().info('DB migration: added column voice_embedding')
             except sqlite3.OperationalError:
                 pass
             try:
                 self._db.execute('ALTER TABLE persons ADD COLUMN telegram_id INTEGER DEFAULT NULL')
                 self._db.commit()
-                self.get_logger().info('Миграция БД: добавлена колонка telegram_id')
+                self.get_logger().info('DB migration: added column telegram_id')
             except sqlite3.OperationalError:
                 pass
-            # Голосовая галерея (до 10 отпечатков на человека)
+            # Voice gallery (up to 10 embeddings per person)
             self._db.execute('''
                 CREATE TABLE IF NOT EXISTS voice_gallery (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -288,7 +292,7 @@ class MemoryNode(LifecycleNode):
                 )
             ''')
             self._db.commit()
-            # Миграция: перенести одиночный voice_embedding в voice_gallery (только если галерея пуста)
+            # Migration: move the single voice_embedding into voice_gallery (only if the gallery is empty)
             rows = self._db.execute(
                 'SELECT id, voice_embedding FROM persons WHERE voice_embedding IS NOT NULL'
             ).fetchall()
@@ -301,7 +305,7 @@ class MemoryNode(LifecycleNode):
             self._db.commit()
 
     # ════════════════════════════════════════════════════════════════════
-    # Галерея и голосовые кэши
+    # Gallery and voice caches
     # ════════════════════════════════════════════════════════════════════
 
     def _load_gallery_cache(self):
@@ -321,7 +325,7 @@ class MemoryNode(LifecycleNode):
         }
         total = sum(len(v) for v in self._gallery_cache.values())
         self.get_logger().info(
-            f'Галерея: {len(self._gallery_cache)} человек, {total} фото')
+            f'Gallery: {len(self._gallery_cache)} people, {total} photos')
 
     def _load_voice_cache(self):
         try:
@@ -343,8 +347,8 @@ class MemoryNode(LifecycleNode):
                 emb /= norm
             self._voice_cache[pid] = emb
         self.get_logger().info(
-            f'Голосовые embeddings: {len(self._voice_cache)} человек'
-            + (f' ({skipped} пропущено)' if skipped else ''))
+            f'Voice embeddings: {len(self._voice_cache)} people'
+            + (f' ({skipped} skipped)' if skipped else ''))
 
     def _load_voice_gallery_cache(self):
         try:
@@ -367,30 +371,30 @@ class MemoryNode(LifecycleNode):
             )
         total = sum(len(v) for v in self._voice_gallery_cache.values())
         self.get_logger().info(
-            f'Голосовая галерея: {len(self._voice_gallery_cache)} человек, {total} записей')
+            f'Voice gallery: {len(self._voice_gallery_cache)} people, {total} entries')
 
     # ════════════════════════════════════════════════════════════════════
-    # ROS2 коллбеки — новые
+    # ROS2 callbacks — new
     # ════════════════════════════════════════════════════════════════════
 
     def _social_context_cb(self, msg: String):
-        """Обновляет рабочую память из social_context identity_manager."""
+        """Updates working memory from identity_manager's social_context."""
         try:
             ctx = json.loads(msg.data)
             present = ctx.get('person_present', False)
             name    = ctx.get('name', '')
             emotion = ctx.get('emotion', 'neutral')
 
-            # Список людей рядом
+            # List of people nearby
             people = [name] if present and name else []
             self._mm.working.update_environment(people=people)
 
-            # На кого смотрит робот
+            # Who the robot is looking at
             self._mm.working.update_robot_state(
                 facing=name if present and name else None,
             )
 
-            # Режим работы
+            # Operating mode
             state_raw = ctx.get('state', '')
             mode_map = {
                 'IDLE':         'idle',
@@ -404,7 +408,7 @@ class MemoryNode(LifecycleNode):
             self.get_logger().warn(f'social_context_cb: {e}')
 
     def _conversation_end_cb(self, msg: String):
-        """Обрабатывает завершение диалога: резюме + извлечение фактов в фоне."""
+        """Handles end of dialogue: summary + fact extraction in the background."""
         try:
             data         = json.loads(msg.data)
             transcript   = data.get('transcript', '')
@@ -423,20 +427,20 @@ class MemoryNode(LifecycleNode):
         try:
             self._mm.after_conversation(transcript, participants=participants)
             self.get_logger().info(
-                f'Эпизод сохранён: {len(transcript)} симв., '
-                f'участники: {participants}')
+                f'Episode saved: {len(transcript)} chars, '
+                f'participants: {participants}')
         except Exception as e:
             self.get_logger().error(f'after_conversation error: {e}')
         finally:
             self._publish_memory_context()
-        # Авто-извлечение напоминаний из диалога (в отдельном потоке, не блокирует)
+        # Auto-extract reminders from the dialogue (in a separate thread, non-blocking)
         threading.Thread(
             target=self._extract_reminders,
             args=(transcript, participants),
             daemon=True,
         ).start()
 
-    # Ключевые слова, при наличии которых вызываем LLM для извлечения напоминаний
+    # Keywords whose presence triggers an LLM call to extract reminders
     _REMINDER_KEYWORDS = [
         'рождени', 'выступлени', 'концерт', 'экзамен', 'спектакл',
         'годовщин', 'свидани', 'соревновани', 'дедлайн', 'визит',
@@ -446,8 +450,8 @@ class MemoryNode(LifecycleNode):
     ]
 
     def _extract_reminders(self, transcript: str, participants: list):
-        """Авто-извлечение напоминаний из диалога через LLM.
-        Запускается только если транскрипт содержит ключевые слова с датами."""
+        """Auto-extracts reminders from the dialogue via the LLM.
+        Only runs if the transcript contains keywords associated with dates."""
         if not participants:
             return
         person_name = participants[0]
@@ -497,7 +501,7 @@ class MemoryNode(LifecycleNode):
                 if not message:
                     continue
                 if remind_date and remind_date <= today:
-                    continue  # прошедшая дата — пропускаем
+                    continue  # past date — skip
                 rid = self._reminder_db.add_reminder(
                     person_id=person_id,
                     person_name=person_name,
@@ -507,11 +511,11 @@ class MemoryNode(LifecycleNode):
                 )
                 count += 1
                 self.get_logger().info(
-                    f'Авто-напоминание: id={rid} date={remind_date or "next_meeting"} '
+                    f'Auto-reminder: id={rid} date={remind_date or "next_meeting"} '
                     f'"{message[:60]}"')
             if count:
                 self.get_logger().info(
-                    f'Авто-извлечено {count} напоминаний для {person_name}')
+                    f'Auto-extracted {count} reminders for {person_name}')
         except Exception as e:
             self.get_logger().warn(f'_extract_reminders: {e}')
 
@@ -525,9 +529,9 @@ class MemoryNode(LifecycleNode):
     # ── /memory/context publisher ──────────────────────────────────────
 
     def _send_due_reminders_to_telegram(self):
-        """Таймер: проверяет просроченные напоминания (delivered=0) и отправляет в Telegram.
+        """Timer: checks overdue reminders (delivered=0) and sends them to Telegram.
 
-        После публикации помечает delivered=1 — повторно не отправляются.
+        Marks them delivered=1 after publishing — not sent again.
         """
         import datetime as _dt
         import html as _html
@@ -541,7 +545,7 @@ class MemoryNode(LifecycleNode):
                 default_time=self._reminder_default_time,
             )
         except Exception as e:
-            self.get_logger().warn(f'TG reminder timer: ошибка get_due: {e}')
+            self.get_logger().warn(f'TG reminder timer: get_due error: {e}')
             return
 
         for r in reminders:
@@ -553,12 +557,12 @@ class MemoryNode(LifecycleNode):
                 self._tg_push_pub.publish(msg)
                 self._reminder_db.mark_delivered(r['id'])
                 self.get_logger().info(
-                    f'TG reminder: id={r["id"]} отправлено и помечено delivered')
+                    f'TG reminder: id={r["id"]} sent and marked delivered')
             except Exception as e:
-                self.get_logger().warn(f'TG reminder: ошибка отправки id={r["id"]}: {e}')
+                self.get_logger().warn(f'TG reminder: send error id={r["id"]}: {e}')
 
     def _publish_memory_context(self):
-        """Публикует рабочую память + последние эпизоды в /memory/context."""
+        """Publishes working memory + recent episodes to /memory/context."""
         try:
             working_text = self._mm.working.to_text()
             recent_text  = self._mm.episodic.get_recent_text(limit=5)
@@ -574,7 +578,7 @@ class MemoryNode(LifecycleNode):
             self.get_logger().warn(f'publish_memory_context: {e}')
 
     # ════════════════════════════════════════════════════════════════════
-    # Диспетчер /memory/query
+    # /memory/query dispatcher
     # ════════════════════════════════════════════════════════════════════
 
     def _handle(self, request, response):
@@ -582,7 +586,7 @@ class MemoryNode(LifecycleNode):
             req = json.loads(request.request_json)
             op  = req.get('op', '')
             ops = {
-                # ── Социальная память (оригинальные) ──────────────────
+                # ── Social memory (original) ──────────────────────────
                 'lookup_person':              self._lookup_person,
                 'save_person':                self._save_person,
                 'update_embedding':           self._update_embedding,
@@ -605,7 +609,7 @@ class MemoryNode(LifecycleNode):
                 'lookup_by_voice':            self._lookup_by_voice,
                 'get_voice_gallery':          self._get_voice_gallery,
                 'add_voice_to_gallery':       self._add_voice_to_gallery,
-                # ── 3-слойная память (новые) ───────────────────────────
+                # ── 3-layer memory (new) ────────────────────────────────
                 'search_semantic':            self._op_search_semantic,
                 'save_semantic_fact':         self._op_save_semantic_fact,
                 'search_episodes':            self._op_search_episodes,
@@ -614,7 +618,7 @@ class MemoryNode(LifecycleNode):
                 'get_working_memory':         self._op_get_working_memory,
                 'update_working_memory':      self._op_update_working_memory,
                 'get_memory_context':         self._op_get_memory_context,
-                # ── Напоминания ────────────────────────────────────────
+                # ── Reminders ────────────────────────────────────────────
                 'add_reminder':              self._op_add_reminder,
                 'get_due_reminders':         self._op_get_due_reminders,
                 'mark_reminder_delivered':   self._op_mark_reminder_delivered,
@@ -636,7 +640,7 @@ class MemoryNode(LifecycleNode):
         return response
 
     # ════════════════════════════════════════════════════════════════════
-    # Новые операции — 3-слойная память
+    # New operations — 3-layer memory
     # ════════════════════════════════════════════════════════════════════
 
     def _op_search_semantic(self, req: dict) -> dict:
@@ -714,7 +718,7 @@ class MemoryNode(LifecycleNode):
         return {'updated': True}
 
     def _op_get_memory_context(self, req: dict) -> dict:
-        """Возвращает текстовый контекст для вставки в LLM system prompt."""
+        """Returns the text context to insert into the LLM system prompt."""
         working_text = self._mm.working.to_text()
         recent_text  = self._mm.episodic.get_recent_text(limit=int(req.get('limit', 5)))
         parts = ['== Текущий момент ==', working_text]
@@ -723,7 +727,7 @@ class MemoryNode(LifecycleNode):
         return {'context': '\n'.join(parts)}
 
     # ════════════════════════════════════════════════════════════════════
-    # Напоминания
+    # Reminders
     # ════════════════════════════════════════════════════════════════════
 
     def _op_add_reminder(self, req: dict) -> dict:
@@ -744,7 +748,7 @@ class MemoryNode(LifecycleNode):
             source=source,
         )
         self.get_logger().info(
-            f'Напоминание создано: id={rid} person={person_name} '
+            f'Reminder created: id={rid} person={person_name} '
             f'date={trigger_date or "next_meeting"} time={trigger_time or "default"} source={source}')
         return {'reminder_id': rid, 'saved': True}
 
@@ -777,13 +781,13 @@ class MemoryNode(LifecycleNode):
         return {'deleted': True, 'reminder_id': reminder_id}
 
     def _op_confirm_reminders(self, req: dict) -> dict:
-        """Удаляет все показанные (delivered=1) напоминания — пользователь подтвердил."""
+        """Deletes all shown (delivered=1) reminders — the user has confirmed them."""
         person_id = req.get('person_id')
         if person_id is None:
             return {'error': 'person_id обязателен'}
         count = self._reminder_db.confirm_all_delivered(int(person_id))
         self.get_logger().info(
-            f'Напоминания подтверждены: person_id={person_id}, удалено={count}')
+            f'Reminders confirmed: person_id={person_id}, deleted={count}')
         return {'confirmed': count}
 
     def _op_list_reminders(self, req: dict) -> dict:
@@ -793,7 +797,7 @@ class MemoryNode(LifecycleNode):
         return {'reminders': reminders}
 
     # ════════════════════════════════════════════════════════════════════
-    # Социальная память — оригинальные операции (без изменений)
+    # Social memory — original operations (unchanged)
     # ════════════════════════════════════════════════════════════════════
 
     def _lookup_person(self, req: dict) -> dict:
@@ -826,16 +830,16 @@ class MemoryNode(LifecycleNode):
             best_name = row[0] if row else None
 
         if best_sim >= self.sim_threshold:
-            self.get_logger().info(f'Распознан: {best_name} (sim={best_sim:.3f})')
+            self.get_logger().info(f'Recognized: {best_name} (sim={best_sim:.3f})')
             return {'person_id': best_pid, 'name': best_name,
                     'similarity': best_sim, 'confidence': 'high'}
 
         if best_sim >= self.uncertain_threshold:
-            self.get_logger().info(f'Вероятно {best_name} (sim={best_sim:.3f}) — неуверенно')
+            self.get_logger().info(f'Probably {best_name} (sim={best_sim:.3f}) — uncertain')
             return {'person_id': None, 'similarity': best_sim, 'confidence': 'uncertain',
                     'best_candidate_id': best_pid, 'best_candidate_name': best_name}
 
-        self.get_logger().info(f'Неизвестный (best_sim={best_sim:.3f})')
+        self.get_logger().info(f'Unknown (best_sim={best_sim:.3f})')
         return {'person_id': None, 'similarity': best_sim, 'confidence': 'unknown'}
 
     def _save_person(self, req: dict) -> dict:
@@ -852,7 +856,7 @@ class MemoryNode(LifecycleNode):
             )
             self._db.commit()
             pid = cur.lastrowid
-        self.get_logger().info(f'Новый человек: {name} (id={pid})')
+        self.get_logger().info(f'New person: {name} (id={pid})')
         return {'person_id': pid, 'name': name}
 
     def _update_embedding(self, req: dict) -> dict:
@@ -934,7 +938,7 @@ class MemoryNode(LifecycleNode):
             self._db.commit()
         return {'saved': True}
 
-    # ── Галерея ────────────────────────────────────────────────────────
+    # ── Gallery ────────────────────────────────────────────────────────
 
     def _gallery_add(self, req: dict) -> dict:
         pid        = req['person_id']
@@ -954,7 +958,7 @@ class MemoryNode(LifecycleNode):
                 return {'added': False, 'reason': 'duplicate'}
             if len(existing) >= 3 and max_sim < self.uncertain_threshold:
                 self.get_logger().warn(
-                    f'gallery_add ОТКЛОНЕНО pid={pid}: sim={max_sim:.3f} — другой человек')
+                    f'gallery_add REJECTED pid={pid}: sim={max_sim:.3f} — different person')
                 return {'added': False, 'reason': 'embedding_mismatch'}
 
         with self._lock:
@@ -973,7 +977,7 @@ class MemoryNode(LifecycleNode):
 
         count = len(self._gallery_cache[pid])
         self.get_logger().info(
-            f'gallery_add: pid={pid} | {photo_path} | q={quality:.2f} | итого={count}')
+            f'gallery_add: pid={pid} | {photo_path} | q={quality:.2f} | total={count}')
         return {'added': True, 'gallery_count': count}
 
     def _gallery_remove(self, req: dict) -> dict:
@@ -1033,7 +1037,7 @@ class MemoryNode(LifecycleNode):
             self._db.commit()
 
         self.get_logger().info(
-            f'gallery_rebuild_embedding: pid={pid} | {len(embs)} фото усреднено')
+            f'gallery_rebuild_embedding: pid={pid} | {len(embs)} photos averaged')
         return {'rebuilt': True, 'person_id': pid, 'gallery_count': len(embs)}
 
     def _gallery_list(self, req: dict) -> dict:
@@ -1059,7 +1063,7 @@ class MemoryNode(LifecycleNode):
         VOICE_LIMIT   = self._SV_GALLERY_MAX
 
         with self._lock:
-            # Имена до удаления — нужны для episodic DB и логов
+            # Names before deletion — needed for the episodic DB and logs
             from_row = self._db.execute('SELECT name FROM persons WHERE id=?', (from_id,)).fetchone()
             to_row   = self._db.execute('SELECT name FROM persons WHERE id=?', (to_id,)).fetchone()
             if not from_row or not to_row:
@@ -1067,7 +1071,7 @@ class MemoryNode(LifecycleNode):
             from_name = from_row[0]
             to_name   = to_row[0]
 
-            # Опциональная проверка сходства галерей перед слиянием
+            # Optional gallery similarity check before merging
             if req.get('check_similarity', False):
                 fg = self._gallery_cache.get(from_id)
                 tg = self._gallery_cache.get(to_id)
@@ -1084,7 +1088,7 @@ class MemoryNode(LifecycleNode):
                                           f'слишком низкое ({sim:.2f}). Это точно один человек?'),
                         }
 
-            # ── Фото-галерея: сливаем, соблюдаем лимит (берём лучшие по quality) ──
+            # ── Photo gallery: merge, respect the limit (keep the best by quality) ──
             all_photos = self._db.execute(
                 'SELECT id, person_id, photo_path, quality FROM person_gallery '
                 'WHERE person_id IN (?,?) ORDER BY quality DESC',
@@ -1110,7 +1114,7 @@ class MemoryNode(LifecycleNode):
                 except Exception:
                     pass
 
-            # ── Голосовая галерея: переносим до свободных слотов (новейшие) ──
+            # ── Voice gallery: transfer up to free slots (newest first) ──
             target_vc = self._db.execute(
                 'SELECT COUNT(*) FROM voice_gallery WHERE person_id=?', (to_id,)).fetchone()[0]
             vslots = max(0, VOICE_LIMIT - target_vc)
@@ -1125,7 +1129,7 @@ class MemoryNode(LifecycleNode):
                     (to_id, emb_blob, ts))
             self._db.execute('DELETE FROM voice_gallery WHERE person_id=?', (from_id,))
 
-            # ── Заметки, счётчик встреч, удаление источника ──────────────────
+            # ── Notes, meeting counter, delete the source ────────────────────
             self._db.execute(
                 'INSERT OR IGNORE INTO person_notes (person_id, key, value) '
                 'SELECT ?, key, value FROM person_notes WHERE person_id=?', (to_id, from_id))
@@ -1137,7 +1141,7 @@ class MemoryNode(LifecycleNode):
             self._db.execute('DELETE FROM persons WHERE id=?', (from_id,))
             self._db.commit()
 
-        # ── Обновляем кэши ───────────────────────────────────────────────
+        # ── Update caches ────────────────────────────────────────────────
         if from_id in self._gallery_cache:
             old = self._gallery_cache.pop(from_id)
             if to_id in self._gallery_cache:
@@ -1152,12 +1156,12 @@ class MemoryNode(LifecycleNode):
             dst.sort(key=lambda e: e.get('recorded_at', 0), reverse=True)
             self._voice_gallery_cache[to_id] = dst[:VOICE_LIMIT]
 
-        # ── Физическая директория источника ─────────────────────────────
+        # ── Source's physical directory ─────────────────────────────────
         for d in glob.glob(f'/home/artur/inmoov_faces/persons/{from_id}_*'):
             if os.path.isdir(d):
                 shutil.rmtree(d, ignore_errors=True)
 
-        # ── Эпизодическая память: переименовываем участника ─────────────
+        # ── Episodic memory: rename the participant ──────────────────────
         try:
             import sqlite3 as _sq
             ep_conn = _sq.connect('/home/artur/inmoov_episodic.db')
@@ -1182,7 +1186,7 @@ class MemoryNode(LifecycleNode):
                 'from_name': from_name, 'to_name': to_name}
 
     def _lookup_by_name(self, req: dict) -> dict:
-        """Поиск человека по точному имени (регистронезависимый)."""
+        """Looks up a person by exact name (case-insensitive)."""
         name = req.get('name', '').strip()
         with self._lock:
             row = self._db.execute(
@@ -1193,9 +1197,9 @@ class MemoryNode(LifecycleNode):
         return {'person_id': None}
 
     def _verify_person_claim(self, req: dict) -> dict:
-        """Проверяет, насколько текущие embeddings соответствуют заявленному person_id.
+        """Checks how well the current embeddings match the claimed person_id.
 
-        Возвращает face_sim и voice_sim (0.0 если данных нет).
+        Returns face_sim and voice_sim (0.0 if no data is available).
         """
         person_id  = req['person_id']
         face_emb   = req.get('face_embedding')
@@ -1248,7 +1252,7 @@ class MemoryNode(LifecycleNode):
         total = sum(len(v) for v in self._gallery_cache.values())
         return {'reloaded': True, 'persons': len(self._gallery_cache), 'total': total}
 
-    # ── Голосовые embeddings ───────────────────────────────────────────
+    # ── Voice embeddings ───────────────────────────────────────────────
 
     def _get_voice_embedding(self, req: dict) -> dict:
         pid = req['person_id']
@@ -1271,7 +1275,7 @@ class MemoryNode(LifecycleNode):
                 'UPDATE persons SET voice_embedding=? WHERE id=?', (emb.tobytes(), pid))
             self._db.commit()
         self._voice_cache[pid] = emb
-        self.get_logger().info(f'Голосовой embedding сохранён: pid={pid}')
+        self.get_logger().info(f'Voice embedding saved: pid={pid}')
         return {'saved': True, 'person_id': pid}
 
     def _update_voice_embedding(self, req: dict) -> dict:
@@ -1292,17 +1296,18 @@ class MemoryNode(LifecycleNode):
         return {'updated': True, 'person_id': pid}
 
     def _lookup_by_voice(self, req: dict) -> dict:
-        """Идентификация по голосу: сравниваем запрос с нормализованным центроидом галереи.
+        """Voice identification: compares the query against the gallery's normalized centroid.
 
-        Центроид (mean_emb / ||mean_emb||) лучше чем среднее попарных сходств:
-        он подавляет выбросы и указывает на общее направление кластера.
+        The centroid (mean_emb / ||mean_emb||) works better than the mean of
+        pairwise similarities: it suppresses outliers and points to the
+        cluster's overall direction.
         """
         voice_high      = float(req.get('high_threshold',      0.72))
         voice_uncertain = float(req.get('uncertain_threshold', 0.58))
         query = np.array(req['embedding'], dtype=np.float32)
         query /= np.linalg.norm(query) + 1e-8
 
-        # Предпочитаем новую галерею, fallback на single-emb кэш
+        # Prefer the new gallery, fall back to the single-emb cache
         gallery = dict(self._voice_gallery_cache)
         single  = dict(self._voice_cache)
         all_pids = set(gallery) | set(single)
@@ -1316,7 +1321,7 @@ class MemoryNode(LifecycleNode):
                 valid = [e['emb'] for e in entries if e['emb'].shape[0] == query.shape[0]]
                 if not valid:
                     continue
-                # Нормализованный центроид: усредняем, нормализуем → сравниваем
+                # Normalized centroid: average, normalize → compare
                 centroid = np.mean(np.stack(valid), axis=0)
                 norm = np.linalg.norm(centroid)
                 if norm < 1e-8:
@@ -1346,7 +1351,7 @@ class MemoryNode(LifecycleNode):
         return {'person_id': None, 'similarity': best_sim, 'confidence': 'unknown'}
 
     def _get_voice_gallery(self, req: dict) -> dict:
-        """Возвращает полную голосовую галерею человека (до 10 записей)."""
+        """Returns the full voice gallery for a person (up to 10 entries)."""
         pid = req['person_id']
         entries = self._voice_gallery_cache.get(pid, [])
         return {
@@ -1358,15 +1363,16 @@ class MemoryNode(LifecycleNode):
             ],
         }
 
-    _SV_QUALITY_MIN = 0.40  # минимальное centroid-сходство нового embedding с галереей
+    _SV_QUALITY_MIN = 0.40  # minimum centroid similarity of a new embedding vs. the gallery
 
     def _add_voice_to_gallery(self, req: dict) -> dict:
-        """Добавляет голосовой embedding в галерею.
+        """Adds a voice embedding to the gallery.
 
-        Правило: если < MAX записей — добавляем (если проходит quality-фильтр).
-        Если == MAX — заменяем самую старую запись только если ей > REFRESH_DAYS дней.
-        Quality-фильтр: если в галерее уже есть записи, новый embedding должен иметь
-        centroid-сходство >= _SV_QUALITY_MIN, иначе это шум/чужой голос — отбрасываем.
+        Rule: if < MAX entries — add it (if it passes the quality filter).
+        If == MAX — replace the oldest entry only if it is older than REFRESH_DAYS.
+        Quality filter: if the gallery already has entries, the new embedding must
+        have centroid similarity >= _SV_QUALITY_MIN, otherwise it's noise/another
+        person's voice — discard it.
         """
         import time as _time
         pid         = req['person_id']
@@ -1383,7 +1389,7 @@ class MemoryNode(LifecycleNode):
 
             entries = self._voice_gallery_cache.get(pid, [])
 
-            # Quality-фильтр: отсеиваем мусор по centroid-сходству
+            # Quality filter: discard noise by centroid similarity
             if entries:
                 valid = [e['emb'] for e in entries
                          if e['emb'].shape[0] == new_emb.shape[0]]
@@ -1393,7 +1399,7 @@ class MemoryNode(LifecycleNode):
                     sim = float(np.dot(centroid, new_emb))
                     if sim < self._SV_QUALITY_MIN:
                         self.get_logger().warn(
-                            f'Голосовая галерея [{pid}]: отброшен шум '
+                            f'Voice gallery [{pid}]: noise rejected '
                             f'(centroid_sim={sim:.3f} < {self._SV_QUALITY_MIN})')
                         return {'added': False, 'reason': 'quality_too_low',
                                 'centroid_sim': sim}
@@ -1406,19 +1412,19 @@ class MemoryNode(LifecycleNode):
                 self._voice_gallery_cache.setdefault(pid, []).append(
                     {'emb': new_emb, 'recorded_at': recorded_at})
                 self.get_logger().info(
-                    f'Голосовая галерея [{pid}]: добавлена запись '
+                    f'Voice gallery [{pid}]: entry added '
                     f'({len(self._voice_gallery_cache[pid])}/{self._SV_GALLERY_MAX})')
                 return {'added': True, 'count': len(self._voice_gallery_cache[pid])}
 
-            # Галерея полная — проверяем возраст самой старой записи
+            # Gallery full — check the age of the oldest entry
             oldest = min(entries, key=lambda e: e['recorded_at'])
             age_days = (_time.time() - oldest['recorded_at']) / 86400
             if age_days < self._SV_REFRESH_DAYS:
                 return {'added': False, 'reason': 'gallery_full_and_fresh',
                         'oldest_age_days': round(age_days, 1)}
 
-            # Удаляем самую старую запись, добавляем новую
-            # Определяем id строки для удаления
+            # Remove the oldest entry, add the new one
+            # Find the row id to delete
             row = self._db.execute(
                 'SELECT id FROM voice_gallery WHERE person_id=? ORDER BY recorded_at ASC LIMIT 1',
                 (pid,)).fetchone()
@@ -1429,17 +1435,17 @@ class MemoryNode(LifecycleNode):
                 (pid, new_emb.tobytes(), recorded_at))
             self._db.commit()
 
-            # Обновляем кэш
+            # Update the cache
             entries = [e for e in entries if e['recorded_at'] != oldest['recorded_at']]
             entries.append({'emb': new_emb, 'recorded_at': recorded_at})
             self._voice_gallery_cache[pid] = entries
             self.get_logger().info(
-                f'Голосовая галерея [{pid}]: заменена старая запись '
-                f'(возраст={age_days:.1f}д)')
+                f'Voice gallery [{pid}]: replaced oldest entry '
+                f'(age={age_days:.1f}d)')
             return {'added': True, 'count': len(entries), 'replaced_oldest': True}
 
     # ════════════════════════════════════════════════════════════════════
-    # Завершение (через on_shutdown/on_cleanup — не destroy_node)
+    # Shutdown (via on_shutdown/on_cleanup — not destroy_node)
     # ════════════════════════════════════════════════════════════════════
 
 

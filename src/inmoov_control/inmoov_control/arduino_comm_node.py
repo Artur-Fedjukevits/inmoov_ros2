@@ -8,6 +8,10 @@ Replaces xicro for servo control. Handles:
 
 Subclasses define which joints belong to which Arduino and which topics
 to publish for sensor data.
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import math
@@ -64,8 +68,8 @@ class ArduinoCommNode(LifecycleNode):
     PIR_TOPIC:        str = 'pir_state'
     HALL_TOPIC:       str = 'hall_raw'
 
-    # Парные суставы: когда приходит команда на ключ — применяем то же значение на значение.
-    # Зеркалирование глаз: eye_lr_L ↔ eye_lr_R, eye_ud_L ↔ eye_ud_R.
+    # Paired joints: when a command arrives for the key joint, apply the same
+    # value to the mirrored joint. Eye mirroring: eye_lr_L <-> eye_lr_R, eye_ud_L <-> eye_ud_R.
     EYE_SYNC: dict[str, str] = {
         'eye_lr_L': 'eye_lr_R',
         'eye_lr_R': 'eye_lr_L',
@@ -143,7 +147,7 @@ class ArduinoCommNode(LifecycleNode):
         if self._hall_pub:
             self._hall_pub.on_activate(state)
 
-        # Проверяем что порт существует в файловой системе
+        # Check that the port exists on the filesystem
         if not os.path.exists(self._serial_port):
             self.get_logger().error(
                 f'Serial port not found: {self._serial_port} → FAILURE (retry)')
@@ -176,21 +180,21 @@ class ArduinoCommNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
-        # Отправляем сервы в позицию покоя
+        # Send servos to rest position
         self._send_rest_positions()
 
-        # Останавливаем RX поток
+        # Stop the RX thread
         self._running = False
         if self._rx_thread and self._rx_thread.is_alive():
             self._rx_thread.join(timeout=2.0)
         self._rx_thread = None
 
-        # Останавливаем TX таймер
+        # Stop the TX timer
         if self._tx_timer:
             self.destroy_timer(self._tx_timer)
             self._tx_timer = None
 
-        # Закрываем serial
+        # Close serial
         self._close_serial()
 
         if self._ultrasonic_pub:
@@ -300,7 +304,7 @@ class ArduinoCommNode(LifecycleNode):
     # -----------------------------------------------------------------------
 
     def _apply_joint(self, name: str, pos_rad: float, vel: float) -> None:
-        """Применяет позицию к body или face карте. Вызывается под self._lock."""
+        """Applies a position to the body or face map. Called under self._lock."""
         if name in self._body_map:
             i = self._body_map[name]
             _, center, _ = self.BODY_JOINTS[i]
@@ -332,7 +336,7 @@ class ArduinoCommNode(LifecycleNode):
             for idx, (name, pos_rad) in enumerate(zip(msg.name, msg.position)):
                 vel = vels[idx] if idx < len(vels) else 0.0
                 self._apply_joint(name, pos_rad, vel)
-                # Синхронизация парного глаза (eye_lr_L ↔ eye_lr_R, eye_ud_L ↔ eye_ud_R)
+                # Mirror the paired eye (eye_lr_L <-> eye_lr_R, eye_ud_L <-> eye_ud_R)
                 mirror = self.EYE_SYNC.get(name)
                 if mirror:
                     self._apply_joint(mirror, pos_rad, vel)
@@ -343,7 +347,7 @@ class ArduinoCommNode(LifecycleNode):
             for idx, (name, pos_rad) in enumerate(zip(msg.name, msg.position)):
                 vel = vels[idx] if idx < len(vels) else 0.0
                 self._apply_joint(name, pos_rad, vel)
-                # Синхронизация парного глаза
+                # Mirror the paired eye
                 mirror = self.EYE_SYNC.get(name)
                 if mirror:
                     self._apply_joint(mirror, pos_rad, vel)
@@ -384,4 +388,4 @@ class ArduinoCommNode(LifecycleNode):
             self.get_logger().error(f'Serial write error: {e}')
             self._ser = None
 
-    # destroy_node заменён на on_shutdown / on_deactivate (lifecycle)
+    # destroy_node replaced by on_shutdown / on_deactivate (lifecycle)

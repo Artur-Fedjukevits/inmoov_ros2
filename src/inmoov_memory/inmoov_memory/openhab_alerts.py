@@ -4,12 +4,16 @@ openhab_alerts.py — Shared sensor alert logic for OpenHAB monitoring.
 Used by:
   openhab_bridge_node  — creates alerts when thresholds are crossed
   identity_manager_node — verifies env reminders before announcing (fresh state)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import math
 import re
 
-# ── Пороги ────────────────────────────────────────────────────────────────────
+# ── Thresholds ────────────────────────────────────────────────────────────────────
 
 TEMP_MIN     = 16.0   # °C
 TEMP_MAX     = 27.0   # °C
@@ -17,14 +21,14 @@ HUMIDITY_MIN = 30.0   # %
 HUMIDITY_MAX = 70.0   # %
 CO2_MAX      = 1200.0 # ppm
 VOC_MAX      = 300.0  # ppb
-RADON_ST_MAX = 200.0  # Bq/m³ — краткосрочный (> 200: повышенный риск)
-RADON_LT_MAX = 100.0  # Bq/m³ — долгосрочный (> 100: уровень действия ВОЗ)
+RADON_ST_MAX = 200.0  # Bq/m³ — short-term (> 200: elevated risk)
+RADON_LT_MAX = 100.0  # Bq/m³ — long-term (> 100: WHO action level)
 BATTERY_MIN  = 10.0   # %
 
-# Уличные датчики — не мониторим по температуре/влажности
+# Outdoor sensors — not monitored for temperature/humidity
 _OUTDOOR_PREFIXES = {'EntranceOutside', 'Terrace'}
 
-# Названия комнат на русском
+# Room names in Russian (used in the spoken/pushed alert messages)
 _ROOM_RU = {
     'Bathroom':      'Ванная',
     'Bedroom':       'Спальня',
@@ -39,14 +43,14 @@ _ROOM_RU = {
     'WC':            'Туалет',
 }
 
-# Regex для числового значения из строк вида "23.5 °C", "84", "34 Bq/m³"
+# Regex for the numeric value in strings such as "23.5 °C", "84", "34 Bq/m³"
 _NUM_RE = re.compile(r'[-+]?\d+(?:\.\d+)?')
 
 
-# ── Классификация датчика ──────────────────────────────────────────────────────
+# ── Sensor classification ──────────────────────────────────────────────────────
 
 def classify_sensor(item_name: str, item_type: str) -> str | None:
-    """Определяет тип датчика или None если этот item не мониторим."""
+    """Determines the sensor type, or None if this item is not monitored."""
     prefix  = item_name.split('_')[0]
     name_lo = item_name.lower()
 
@@ -55,13 +59,13 @@ def classify_sensor(item_name: str, item_type: str) -> str | None:
     if 'setpoint' in name_lo or 'targettemp' in name_lo:
         return None
 
-    # Батарейки мониторим для ВСЕХ датчиков, включая уличные
+    # Batteries are monitored for ALL sensors, including outdoor ones
     if name_lo.endswith('_batterylow') and item_type == 'Switch':
         return 'battery_low'
     if name_lo.endswith('_battery') and item_type == 'Number':
         return 'battery'
 
-    # Экологические датчики — уличные исключаем
+    # Environmental sensors — outdoor ones are excluded
     if prefix in _OUTDOOR_PREFIXES:
         return None
 
@@ -81,31 +85,31 @@ def classify_sensor(item_name: str, item_type: str) -> str | None:
     return None
 
 
-# ── Парсинг значения ───────────────────────────────────────────────────────────
+# ── Value parsing ───────────────────────────────────────────────────────────
 
 def parse_value(state_str: str) -> float | None:
-    """Извлекает число из строки вида '23.5 °C', '84', '34 Bq/m³'."""
+    """Extracts a number from a string such as '23.5 °C', '84', '34 Bq/m³'."""
     if not state_str or state_str in ('NULL', 'UNDEF', 'None', '-', ''):
         return None
     m = _NUM_RE.search(state_str)
     return float(m.group()) if m else None
 
 
-# ── Оценка порога ──────────────────────────────────────────────────────────────
+# ── Threshold evaluation ──────────────────────────────────────────────────────────────
 
 def evaluate_threshold(item_name: str, sensor_type: str,
                        value: float) -> tuple[bool, str]:
-    """Проверяет значение на критический порог.
+    """Checks a value against the critical threshold.
 
     Returns:
-        (True, сообщение) — превышение порога, message для напоминания
-        (False, '')       — значение в норме
+        (True, message) — threshold exceeded, message text for the reminder
+        (False, '')       — value is normal
     """
     if sensor_type == 'battery':
         device_raw = item_name[: item_name.lower().rfind('_battery')]
         device = device_raw.replace('Phone_', 'телефон ').replace('_', ' ')
         if value < BATTERY_MIN:
-            # Округляем вверх до ближайших 5% для более точного сообщения:
+            # Round up to the nearest 5% for a more accurate message:
             # 8% → <10%, 4% → <5%, 18% → <20%
             threshold = math.ceil(value / 5) * 5
             return True, f'Разряжен {device} (заряд <{threshold}%)'

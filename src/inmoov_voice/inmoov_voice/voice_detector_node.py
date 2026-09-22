@@ -1,3 +1,42 @@
+"""
+voice_detector_node.py
+======================
+Voice activity detection (Silero VAD) + optional speaker verification
+(ECAPA-TDNN) + phrase recording. Sits between the wake word and the STT.
+
+Flow: wake_detected -> record speech from raw_audio until silence ->
+audio_to_whisper (post-VAD segment) -> STT -> voice_command (used here only
+to know that STT has answered and to re-arm listening).
+
+Subscribes:
+  wake_detected     (Bool)               — wake word fired, start recording
+  tts_speaking      (Bool)               — robot is talking; mic input ignored
+  raw_audio         (Float32MultiArray)  — 16kHz float32 chunks
+  voice_command     (String)             — STT result (empty = silence)
+  /person_present   (Bool)
+  /introducing      (Bool)               — relaxed min speech length + gallery growth
+  /go_idle          (Bool)               — explicit goodbye: stop and reset
+  /robot_sleep      (Bool, latched)
+  /voice_anchor     (String JSON)        — voice gallery from the DB
+                                           {person_id, name, gallery: [{embedding, timestamp}]}
+
+Publishes:
+  audio_to_whisper  (Float32MultiArray)  — recorded phrase, dim label 'sample_rate'
+  /voice_embedding  (String JSON)        — {embedding, timestamp} -> identity_manager -> DB
+  /robot_sleep      (Bool, latched)      — False on wake word while asleep
+  /tts_cancel_queue (Bool)               — True on wake word during TTS
+
+Parameters:
+  sample_rate (16000), vad_threshold (0.4), silence_duration_sec (2.5),
+  min_phrase_sec (0.3), min_speech_sec (1.0), min_speech_sec_introducing (0.4),
+  max_phrase_sec (20.0), no_speech_timeout_sec (8.0), pipeline_timeout_sec (90.0),
+  speaker_verification (True), sv_threshold (0.55), sv_segment_sec (1.0)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
+"""
+
 import collections
 import time
 
@@ -12,7 +51,7 @@ import torch
 class VoiceDetectorNode(LifecycleNode):
     def __init__(self):
         super().__init__('voice_detector_node')
-        # Заглушки — заполняются в on_configure
+        # Placeholders — filled in on_configure
         self.publisher_      = None
         self._voice_emb_pub  = None
         self._sleep_pub      = None
@@ -23,12 +62,12 @@ class VoiceDetectorNode(LifecycleNode):
     # ── Lifecycle: Phase 2 ─────────────────────────────────────────────────
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores re-declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
     def on_configure(self, state):
-        # ── Параметры ─────────────────────────────────────────────────────
+        # ── Parameters ────────────────────────────────────────────────────
         self._dp('sample_rate',           16000)
         self._dp('vad_threshold',         0.4)
         self._dp('silence_duration_sec',  2.5)
@@ -55,7 +94,7 @@ class VoiceDetectorNode(LifecycleNode):
         self._sv_threshold     = self.get_parameter('sv_threshold').value
         self._sv_seg_sec       = self.get_parameter('sv_segment_sec').value
 
-        # ── Подписки ──────────────────────────────────────────────────────
+        # ── Subscriptions ─────────────────────────────────────────────────
         self.create_subscription(Bool,            'wake_detected',   self.wake_callback,          10)
         self.create_subscription(Bool,            'tts_speaking',    self._tts_speaking_callback, 10)
         self.create_subscription(Float32MultiArray, 'raw_audio',     self._audio_callback,        20)
@@ -78,34 +117,34 @@ class VoiceDetectorNode(LifecycleNode):
         self._tts_cancel_pub = self.create_lifecycle_publisher(Bool, '/tts_cancel_queue', 10)
 
         # ── Silero VAD ────────────────────────────────────────────────────
-        self.get_logger().info('Загрузка Silero VAD...')
+        self.get_logger().info('Loading Silero VAD...')
         self.vad_model, _ = torch.hub.load(
             repo_or_dir='snakers4/silero-vad',
             model='silero_vad',
             force_reload=False,
         )
         self.vad_model.eval()
-        self.get_logger().info('Silero VAD загружен')
+        self.get_logger().info('Silero VAD loaded')
 
         # ── Speaker Verification (ECAPA-TDNN) ─────────────────────────────
         self._sv_encoder = None
         if self._sv_enabled:
             try:
                 from speechbrain.inference.classifiers import EncoderClassifier
-                self.get_logger().info('Загрузка ECAPA-TDNN (spkrec-ecapa-voxceleb)...')
+                self.get_logger().info('Loading ECAPA-TDNN (spkrec-ecapa-voxceleb)...')
                 self._sv_encoder = EncoderClassifier.from_hparams(
                     source='speechbrain/spkrec-ecapa-voxceleb',
                     savedir='/home/artur/.cache/speechbrain/spkrec-ecapa-voxceleb',
                     run_opts={'device': 'cpu'},
                 )
                 self.get_logger().info(
-                    f'Speaker Verification включена (ECAPA-TDNN, 192D, '
+                    f'Speaker Verification enabled (ECAPA-TDNN, 192D, '
                     f'threshold={self._sv_threshold}, segment={self._sv_seg_sec}s)')
             except Exception as e:
                 self._sv_enabled = False
-                self.get_logger().warn(f'ECAPA-TDNN не загружен: {e}')
+                self.get_logger().warn(f'ECAPA-TDNN not loaded: {e}')
 
-        # ── Буферы и состояние ────────────────────────────────────────────
+        # ── Buffers and state ─────────────────────────────────────────────
         self._chunk_size        = None
         self._silence_threshold = None
         self._max_chunks        = None
@@ -120,7 +159,7 @@ class VoiceDetectorNode(LifecycleNode):
         self._sv_seg_samples    = 0
         self._sv_gallery        = []
         self._sv_gallery_times  = []
-        self._sv_anchor_person_id = None  # чей якорь сейчас в _sv_gallery (None = живая сессия без анкора из БД)
+        self._sv_anchor_person_id = None  # whose anchor is currently in _sv_gallery (None = live session without a DB anchor)
         self._SV_GALLERY_MAX    = 10
         self._sv_last_gallery_add      = 0.0
         self._SV_GALLERY_ADD_INTERVAL  = 30.0
@@ -137,23 +176,23 @@ class VoiceDetectorNode(LifecycleNode):
         self._person_present_time  = 0.0
         self._person_last_seen     = 0.0
         self._person_present_grace = 120.0
-        # Живой баг 2026-08-28: сразу после wake word, ДО первой успешной фразы
-        # в этой сессии, _is_person_present() всегда False (_person_last_seen
-        # ещё не обновлялся ни от /person_present, ни от успешной отправки в
-        # STT) — если самая первая запись отбрасывается как слишком короткая
-        # (например, VAD зацепил только хвост произнесения будильного слова),
-        # авто-переактивация не срабатывает, и микрофон "умирает" до
-        # следующего wake word, будто человек вообще ничего не сказал. Даём
-        # отдельное окно грейса ПОСЛЕ wake word — не полагаемся только на
-        # _is_person_present().
+        # Live bug 2026-08-28: right after the wake word, BEFORE the first
+        # successful phrase in this session, _is_person_present() is always
+        # False (_person_last_seen hasn't been updated yet, neither from
+        # /person_present nor from a successful send to STT) — if the very
+        # first recording is dropped as too short (e.g. the VAD caught only the
+        # tail of the wake word utterance), auto-reactivation doesn't fire and
+        # the microphone "dies" until the next wake word, as if the person had
+        # said nothing at all. We give a separate grace window AFTER the wake
+        # word — we don't rely on _is_person_present() alone.
         self._last_wake_time          = 0.0
         self._POST_WAKE_LISTEN_GRACE_SEC = 15.0
 
-        sv_status = 'вкл' if self._sv_enabled else 'выкл'
+        sv_status = 'on' if self._sv_enabled else 'off'
         self.get_logger().info(
-            f'VAD нода готова. Жду wake word... '
-            f'(vad_threshold={self.vad_threshold}, silence={silence_duration_sec}с, '
-            f'max_phrase={self.max_phrase_sec}с, speaker_verification={sv_status})')
+            f'VAD node ready. Waiting for the wake word... '
+            f'(vad_threshold={self.vad_threshold}, silence={silence_duration_sec}s, '
+            f'max_phrase={self.max_phrase_sec}s, speaker_verification={sv_status})')
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
@@ -180,7 +219,7 @@ class VoiceDetectorNode(LifecycleNode):
     def on_error(self, state):
         return TransitionCallbackReturn.SUCCESS
 
-    # ── Колбэки управления ────────────────────────────────────────────────
+    # ── Control callbacks ─────────────────────────────────────────────────
 
     def wake_callback(self, msg: Bool):
         if not msg.data:
@@ -190,20 +229,20 @@ class VoiceDetectorNode(LifecycleNode):
             wake_msg = Bool()
             wake_msg.data = False
             self._sleep_pub.publish(wake_msg)
-            self.get_logger().info('Wake word во сне → публикую /robot_sleep False')
+            self.get_logger().info('Wake word while asleep → publishing /robot_sleep False')
 
         if self.tts_speaking:
             cancel_msg = Bool()
             cancel_msg.data = True
             self._tts_cancel_pub.publish(cancel_msg)
-            self.get_logger().info('Wake word во время TTS → отменяю TTS очередь')
+            self.get_logger().info('Wake word during TTS → cancelling the TTS queue')
 
-        # Галерею сбрасываем только если нет активного собеседника.
-        # В режиме INTERACTING (человек присутствует) галерея сохраняется между фразами.
+        # Reset the gallery only if there is no active interlocutor.
+        # In INTERACTING mode (a person is present) the gallery is kept between phrases.
         person_active = self._is_person_present()
 
         if self.is_active:
-            self.get_logger().warn('Wake word во время записи — сбрасываю буфер, начинаю заново')
+            self.get_logger().warn('Wake word during recording — resetting the buffer, starting over')
             self.audio_buffer    = []
             self.silence_counter = 0
             self.activation_time = time.time()
@@ -219,7 +258,7 @@ class VoiceDetectorNode(LifecycleNode):
         speech_chunks = [a for a, c in self._pre_roll_buffer if c > self.vad_threshold]
         self._pre_roll_buffer.clear()
         self._onset_buf.clear()
-        self.get_logger().info('Проснулся! Слушаю команду...')
+        self.get_logger().info('Woke up! Listening for a command...')
         self.is_active       = True
         self.audio_buffer    = speech_chunks
         self.silence_counter = 0
@@ -239,30 +278,30 @@ class VoiceDetectorNode(LifecycleNode):
         self._stt_sent_time = 0.0
         if not msg.data:
             if self._is_person_present() and not self._sleeping:
-                self.get_logger().info('STT: тишина — продолжаю слушать (человек рядом)')
+                self.get_logger().info('STT: silence — keep listening (person nearby)')
                 import threading
                 threading.Timer(0.5, self._activate_after_tts).start()
             else:
-                self.get_logger().info('STT: тишина — возвращаюсь к wake word')
+                self.get_logger().info('STT: silence — back to the wake word')
         else:
-            # STT вернул текст — LLM сейчас обрабатывает и должен запустить TTS.
-            # Если LLM заблокировал фразу (gaze gate, /introducing, busy) — TTS не придёт.
-            # Страховочный таймер: активируем через 6с если TTS так и не запустился.
-            # Если TTS всё же пришёл раньше — _activate_after_tts проверит tts_speaking и не продублирует.
+            # STT returned text — the LLM is now processing it and should start TTS.
+            # If the LLM blocked the phrase (gaze gate, /introducing, busy) — no TTS will come.
+            # Safety timer: activate after 6s if TTS never started.
+            # If TTS did arrive earlier — _activate_after_tts checks tts_speaking and won't duplicate.
             if self._is_person_present() and not self._sleeping:
                 import threading
                 threading.Timer(6.0, self._activate_after_tts).start()
 
     def _go_idle_cb(self, msg: Bool):
-        """Явное прощание от BT — немедленно прекращаем запись, сбрасываем grace period.
+        """Explicit goodbye from the BT — stop recording immediately, reset the grace period.
 
-        В отличие от person_present=False (grace 120с), go_idle означает: человек
-        попрощался и больше не ждёт ответа. Возвращаемся к wake word немедленно.
+        Unlike person_present=False (grace 120s), go_idle means: the person
+        said goodbye and no longer expects an answer. Return to the wake word immediately.
         """
         if not msg.data:
             return
         self._person_present   = False
-        self._person_last_seen = 0.0   # сбрасываем grace period — не ждём 120с
+        self._person_last_seen = 0.0   # reset the grace period — don't wait 120s
         self._stt_sent_time    = 0.0
         if self.is_active:
             self.audio_buffer    = []
@@ -275,12 +314,12 @@ class VoiceDetectorNode(LifecycleNode):
         self._sv_anchor_person_id = None
         self._sv_last_gallery_add = 0.0
         self._introducing = False
-        self.get_logger().info('go_idle: прекращаю запись, возвращаюсь к wake word')
+        self.get_logger().info('go_idle: stopping recording, back to the wake word')
 
     def _introducing_cb(self, msg: Bool):
         self._introducing = msg.data
         if not msg.data and self._stt_sent_time > 0.0:
-            self.get_logger().info('INTRODUCING завершён — сбрасываю pipeline timeout')
+            self.get_logger().info('INTRODUCING finished — resetting the pipeline timeout')
             self._stt_sent_time = 0.0
 
     def _robot_sleep_cb(self, msg: Bool):
@@ -297,9 +336,9 @@ class VoiceDetectorNode(LifecycleNode):
             self._sv_anchor_person_id = None
             self._sv_last_gallery_add = 0.0
             self._introducing = False
-            self.get_logger().info('Спящий режим: авто-активация отключена')
+            self.get_logger().info('Sleep mode: auto-activation disabled')
         else:
-            self.get_logger().info('Пробуждение: авто-активация восстановлена')
+            self.get_logger().info('Wake up: auto-activation restored')
 
     def _person_present_cb(self, msg: Bool):
         now = time.time()
@@ -319,7 +358,7 @@ class VoiceDetectorNode(LifecycleNode):
             self.speech_chunks   = 0
             self.activation_time = time.time()
             self._sv_buf.clear()
-            # Галерея НЕ сбрасывается — живёт всю сессию. Сброс только при go_idle / robot_sleep.
+            # The gallery is NOT reset — it lives for the whole session. Reset only on go_idle / robot_sleep.
 
             if speech_chunks:
                 dur = len(speech_chunks) * (self._chunk_size or 512) / self.rate
@@ -330,24 +369,24 @@ class VoiceDetectorNode(LifecycleNode):
                         self.audio_buffer = speech_chunks
                         self.speech_chunks = len(speech_chunks)
                         self.get_logger().info(
-                            f'Активация + pre-roll: захвачено {dur:.2f}с речи (SV: слишком коротко)')
+                            f'Activation + pre-roll: captured {dur:.2f}s of speech (SV: too short)')
                     else:
                         sim = self._sv_sim(emb)
                         if sim >= self._sv_threshold:
                             self.audio_buffer = speech_chunks
                             self.speech_chunks = len(speech_chunks)
                             self.get_logger().info(
-                                f'Активация + pre-roll: захвачено {dur:.2f}с речи '
-                                f'(SV sim={sim:.2f}, галерея={len(self._sv_gallery)})')
+                                f'Activation + pre-roll: captured {dur:.2f}s of speech '
+                                f'(SV sim={sim:.2f}, gallery={len(self._sv_gallery)})')
                         else:
                             self.get_logger().warn(
-                                f'Активация: pre-roll отброшен как чужой голос '
-                                f'(sim={sim:.2f}, галерея={len(self._sv_gallery)})')
+                                f'Activation: pre-roll dropped as a foreign voice '
+                                f'(sim={sim:.2f}, gallery={len(self._sv_gallery)})')
                 else:
                     self.audio_buffer = speech_chunks
                     self.speech_chunks = len(speech_chunks)
                     self.get_logger().info(
-                        f'Активация + pre-roll: захвачено {dur:.2f}с речи до активации')
+                        f'Activation + pre-roll: captured {dur:.2f}s of speech before activation')
 
     def _is_person_present(self) -> bool:
         now = time.time()
@@ -358,14 +397,15 @@ class VoiceDetectorNode(LifecycleNode):
         return False
 
     def _should_keep_listening(self) -> bool:
-        """_is_person_present() ИЛИ мы совсем недавно проснулись по wake word.
+        """_is_person_present() OR we woke up on the wake word very recently.
 
-        Нужно отдельно от _is_person_present(): сразу после wake word, до
-        первой успешно отправленной в STT фразы этой сессии, presence ещё
-        не подтверждён (_person_last_seen не обновлялся). Если самая первая
-        запись отброшена как слишком короткая (VAD зацепил только хвост
-        произнесения будильного слова) — без этой проверки микрофон "умирал"
-        насовсем, будто человек вообще не сказал ни слова после wake word."""
+        Needed separately from _is_person_present(): right after the wake word,
+        before the first phrase of this session has been successfully sent to
+        STT, presence is not yet confirmed (_person_last_seen hasn't been
+        updated). If the very first recording is dropped as too short (the VAD
+        caught only the tail of the wake word utterance) — without this check
+        the microphone "died" for good, as if the person had not said a single
+        word after the wake word."""
         if self._is_person_present():
             return True
         return (time.time() - self._last_wake_time) < self._POST_WAKE_LISTEN_GRACE_SEC
@@ -378,36 +418,37 @@ class VoiceDetectorNode(LifecycleNode):
             self._stt_sent_time = 0.0
             self._pre_roll_buffer.clear()
             if self.is_active:
-                self.get_logger().info('TTS заговорил во время записи — сбрасываю буфер')
+                self.get_logger().info('TTS started speaking during recording — resetting the buffer')
                 self.audio_buffer    = []
                 self.silence_counter = 0
                 self.speech_chunks   = 0
                 self.is_active       = False
                 self._sv_buf.clear()
-                # Галерея НЕ сбрасывается — следующая реплика фильтруется по той же галерее
+                # The gallery is NOT reset — the next utterance is filtered against the same gallery
         else:
             if was_speaking and not self.is_active:
                 if self._sleeping:
-                    self.get_logger().info('TTS закончил — спящий режим, авто-активация пропущена')
+                    self.get_logger().info('TTS finished — sleep mode, auto-activation skipped')
                 elif self._is_person_present():
-                    self.get_logger().info('TTS закончил — жду ответа пользователя...')
+                    self.get_logger().info('TTS finished — waiting for the user reply...')
                     import threading
                     threading.Timer(1.2, self._activate_after_tts).start()
                 else:
                     self.get_logger().info(
-                        'TTS закончил — человека нет в кадре, авто-активация отключена')
+                        'TTS finished — nobody in frame, auto-activation disabled')
 
     def _voice_anchor_cb(self, msg: String):
-        """Загружаем голосовую галерею из БД (identity_manager → voice_detector).
+        """Load the voice gallery from the DB (identity_manager → voice_detector).
 
-        Получаем полный JSON: {person_id, name, gallery: [{embedding, timestamp}]}
+        We receive the full JSON: {person_id, name, gallery: [{embedding, timestamp}]}
 
-        Если текущая живая галерея уже принадлежит ЭТОМУ ЖЕ person_id — не
-        перезаписываем (живые записи сессии точнее старого снимка из БД).
-        Но если анкор для ДРУГОГО человека (собеседник сменился, а живая
-        галерея не была сброшена — напр. тихий IDLE без /go_idle в грейс-окне
-        person_present) — заменяем гарантированно, иначе SV будет сверять
-        новый голос со старым и отбрасывать его как чужой (инцидент 2026-08-25).
+        If the current live gallery already belongs to THIS SAME person_id — we
+        don't overwrite it (the session's live entries are more accurate than
+        the old snapshot from the DB). But if the anchor is for a DIFFERENT
+        person (the interlocutor changed while the live gallery was not reset —
+        e.g. a quiet IDLE without /go_idle within the person_present grace
+        window) — we replace it unconditionally, otherwise SV would compare the
+        new voice against the old one and reject it as foreign (incident 2026-08-25).
         """
         if not self._sv_enabled or self._sv_encoder is None:
             return
@@ -416,21 +457,21 @@ class VoiceDetectorNode(LifecycleNode):
             data = _json.loads(msg.data)
             anchor_person_id = data.get('person_id')
         except Exception as e:
-            self.get_logger().warn(f'SV: ошибка парсинга голосовой галереи: {e}')
+            self.get_logger().warn(f'SV: failed to parse the voice gallery: {e}')
             return
         if self._sv_gallery:
             if anchor_person_id is not None and anchor_person_id == self._sv_anchor_person_id:
-                return  # живая галерея уже принадлежит этому же человеку — не перезаписываем
+                return  # the live gallery already belongs to the same person — don't overwrite
             self.get_logger().info(
-                f'SV: якорь сменился (было person_id={self._sv_anchor_person_id}, '
-                f'стало {anchor_person_id}) — заменяю живую галерею ({len(self._sv_gallery)} записей)')
+                f'SV: anchor changed (was person_id={self._sv_anchor_person_id}, '
+                f'now {anchor_person_id}) — replacing the live gallery ({len(self._sv_gallery)} entries)')
             self._sv_gallery.clear()
             self._sv_gallery_times.clear()
         self._sv_anchor_person_id = anchor_person_id
         try:
             gallery = data.get('gallery', [])
             if not gallery:
-                # Fallback: legacy single-embedding формат
+                # Fallback: legacy single-embedding format
                 emb_list = data.get('embedding')
                 if emb_list:
                     emb = np.array(emb_list, dtype=np.float32)
@@ -439,7 +480,7 @@ class VoiceDetectorNode(LifecycleNode):
                         emb /= norm
                         self._sv_gallery = [emb]
                         self._sv_gallery_times = [0.0]
-                        self.get_logger().info('SV: галерея загружена (1 legacy запись)')
+                        self.get_logger().info('SV: gallery loaded (1 legacy entry)')
                 return
             new_gallery, new_times = [], []
             for entry in gallery:
@@ -454,23 +495,23 @@ class VoiceDetectorNode(LifecycleNode):
                 self._sv_gallery = new_gallery
                 self._sv_gallery_times = new_times
                 self.get_logger().info(
-                    f'SV: галерея загружена из БД ({len(new_gallery)} записей)')
+                    f'SV: gallery loaded from the DB ({len(new_gallery)} entries)')
         except Exception as e:
-            self.get_logger().warn(f'SV: ошибка парсинга голосовой галереи: {e}')
+            self.get_logger().warn(f'SV: failed to parse the voice gallery: {e}')
 
     # ── Speaker Verification ──────────────────────────────────────────────
 
-    # ECAPA-TDNN требует минимум ~0.5с аудио (иначе conv padding > time_dim → RuntimeError)
-    _SV_MIN_SAMPLES = 8000  # 0.5с @ 16kHz
+    # ECAPA-TDNN needs at least ~0.5s of audio (otherwise conv padding > time_dim → RuntimeError)
+    _SV_MIN_SAMPLES = 8000  # 0.5s @ 16kHz
 
     def _sv_embed(self, audio_seg: np.ndarray) -> 'np.ndarray | None':
-        """L2-нормализованный 192-мерный ECAPA-TDNN эмбеддинг.
-        Возвращает None если аудио короче _SV_MIN_SAMPLES.
+        """L2-normalized 192-dim ECAPA-TDNN embedding.
+        Returns None if the audio is shorter than _SV_MIN_SAMPLES.
         """
         if len(audio_seg) < self._SV_MIN_SAMPLES:
             return None
-        # RMS-нормализация: ECAPA чувствителен к уровню входного сигнала.
-        # Выравниваем до RMS=0.05 чтобы эмбеддинги были сопоставимы между сессиями.
+        # RMS normalization: ECAPA is sensitive to the input signal level.
+        # Equalize to RMS=0.05 so embeddings are comparable across sessions.
         rms = float(np.sqrt(np.mean(audio_seg ** 2)))
         if rms > 1e-6:
             audio_seg = np.clip(audio_seg * (0.05 / rms), -1.0, 1.0)
@@ -483,10 +524,11 @@ class VoiceDetectorNode(LifecycleNode):
         return emb
 
     def _sv_sim(self, emb: np.ndarray) -> float:
-        """Максимальное косинусное сходство с голосовой галереей сессии.
+        """Maximum cosine similarity against the session's voice gallery.
 
-        max вместо mean: галерея содержит записи из разных сессий (якорь из БД) — стale-записи
-        при других акустических условиях тянут среднее вниз, скрывая совпадение с актуальными.
+        max instead of mean: the gallery contains entries from different sessions (anchor from
+        the DB) — stale entries recorded under different acoustic conditions drag the mean
+        down and hide a match with the current ones.
         """
         if not self._sv_gallery:
             return 0.0
@@ -496,11 +538,11 @@ class VoiceDetectorNode(LifecycleNode):
         return float(np.max(sims))
 
     def _sv_add_to_gallery(self, emb: np.ndarray) -> bool:
-        """Добавляет embedding в живую галерею сессии.
+        """Adds an embedding to the session's live gallery.
 
-        Ограничения: не чаще 1 раза в _SV_GALLERY_ADD_INTERVAL секунд,
-        максимум _SV_GALLERY_MAX записей (старая замещается новой).
-        Публикует embedding в /voice_embedding → identity_manager → БД.
+        Limits: at most once per _SV_GALLERY_ADD_INTERVAL seconds,
+        at most _SV_GALLERY_MAX entries (the oldest is replaced by the new one).
+        Publishes the embedding to /voice_embedding → identity_manager → DB.
         """
         now = time.time()
         if (now - self._sv_last_gallery_add) < self._SV_GALLERY_ADD_INTERVAL:
@@ -512,7 +554,7 @@ class VoiceDetectorNode(LifecycleNode):
         self._sv_gallery_times.append(now)
         self._sv_last_gallery_add = now
         n = len(self._sv_gallery)
-        self.get_logger().info(f'SV: запись {n}/{self._SV_GALLERY_MAX} добавлена в галерею')
+        self.get_logger().info(f'SV: entry {n}/{self._SV_GALLERY_MAX} added to the gallery')
         self._publish_voice_emb(emb, now)
         return True
 
@@ -527,25 +569,26 @@ class VoiceDetectorNode(LifecycleNode):
         self._voice_emb_pub.publish(emb_msg)
 
     def _sv_threshold_for(self, seg_sec: float) -> float:
-        """Прогрессивный порог SV: линейно растёт с длиной сегмента.
+        """Progressive SV threshold: grows linearly with the segment length.
 
-        Короткие сегменты дают менее надёжный ECAPA-TDNN эмбеддинг — снижаем порог.
-        0.5с (минимум ECAPA) → sv_threshold - 0.15
-        sv_seg_sec (полный сегмент) → sv_threshold
-        За пределами sv_seg_sec — sv_threshold (клип).
+        Short segments give a less reliable ECAPA-TDNN embedding — so we lower the threshold.
+        0.5s (ECAPA minimum) → sv_threshold - 0.15
+        sv_seg_sec (full segment) → sv_threshold
+        Beyond sv_seg_sec — sv_threshold (clipped).
         """
-        _SV_MIN_SEC   = 0.5   # минимум для ECAPA-TDNN
-        _SV_MAX_DELTA = 0.15  # максимальное снижение порога для коротких сегментов
+        _SV_MIN_SEC   = 0.5   # minimum for ECAPA-TDNN
+        _SV_MAX_DELTA = 0.15  # maximum threshold reduction for short segments
         span = max(0.01, self._sv_seg_sec - _SV_MIN_SEC)
         ratio = min(1.0, max(0.0, (seg_sec - _SV_MIN_SEC) / span))
         return max(0.20, self._sv_threshold - _SV_MAX_DELTA * (1.0 - ratio))
 
     def _sv_decide(self, log_reject: bool = True) -> bool:
-        """Принять решение по накопленному _sv_buf: сравнить с галереей или добавить первую запись.
+        """Decide on the accumulated _sv_buf: compare it with the gallery or add the first entry.
 
-        Возвращает True если сегмент принят (voice_buffer пополнен), False если отклонён.
-        silence_counter сбрасывается в 0 ТОЛЬКО при принятии — чтобы чужой голос (TV и др.)
-        не мешал счётчику тишины накапливаться и не растягивал запись до max_phrase_sec.
+        Returns True if the segment was accepted (voice_buffer extended), False if rejected.
+        silence_counter is reset to 0 ONLY on acceptance — so that a foreign voice (TV etc.)
+        doesn't keep the silence counter from accumulating and doesn't stretch the recording
+        up to max_phrase_sec.
         """
         if not self._sv_buf:
             return False
@@ -554,11 +597,11 @@ class VoiceDetectorNode(LifecycleNode):
 
         if emb is None:
             if self._sv_gallery:
-                # Галерея установлена — слишком короткий сегмент отклоняем,
-                # чтобы pre-roll чужого голоса не попадал в audio_buffer.
+                # The gallery is set — reject a too-short segment so that the
+                # pre-roll of a foreign voice doesn't end up in audio_buffer.
                 self._sv_buf.clear()
                 return False
-            # Галерея пуста (знакомство / первая сессия) — принимаем без проверки.
+            # The gallery is empty (introduction / first session) — accept without checking.
             self.silence_counter = 0
             self.audio_buffer.extend(self._sv_buf)
             self.speech_chunks += len(self._sv_buf)
@@ -567,20 +610,20 @@ class VoiceDetectorNode(LifecycleNode):
 
         if not self._sv_gallery:
             if not log_reject:
-                # Хвост при пустой галерее: принимаем, но галерею НЕ устанавливаем —
-                # для первой надёжной записи нужен полный sv_seg_sec сегмент.
+                # Tail with an empty gallery: accept it, but do NOT set the gallery —
+                # a full sv_seg_sec segment is needed for the first reliable entry.
                 self.silence_counter = 0
                 self.audio_buffer.extend(self._sv_buf)
                 self.speech_chunks += len(self._sv_buf)
-                # В IDLE публикуем embedding чтобы identity_manager мог попробовать
-                # распознать голос — галерея не устанавливается, только идентификация.
-                # Проверяем _person_present напрямую: None (старт) и False (IDLE) — публикуем;
-                # True (INTERACTING/RECOGNIZING) — пропускаем.
+                # In IDLE we publish the embedding so identity_manager can try to
+                # recognize the voice — the gallery is not set, identification only.
+                # Check _person_present directly: None (startup) and False (IDLE) — publish;
+                # True (INTERACTING/RECOGNIZING) — skip.
                 if self._person_present is not True:
                     self._publish_voice_emb(emb)
                 self._sv_buf.clear()
                 return True
-            # Первый полный сегмент — устанавливаем первую запись в галерею
+            # First full segment — set the first entry in the gallery
             self._sv_gallery.append(emb)
             self._sv_gallery_times.append(time.time())
             self._sv_last_gallery_add = time.time()
@@ -588,7 +631,7 @@ class VoiceDetectorNode(LifecycleNode):
             self.audio_buffer.extend(self._sv_buf)
             self.speech_chunks += len(self._sv_buf)
             self.get_logger().info(
-                f'SV: первая запись в галерею (1/{self._SV_GALLERY_MAX}, ECAPA-TDNN)')
+                f'SV: first gallery entry (1/{self._SV_GALLERY_MAX}, ECAPA-TDNN)')
             self._publish_voice_emb(emb)
         else:
             seg_sec = len(audio_seg) / self.rate
@@ -598,32 +641,32 @@ class VoiceDetectorNode(LifecycleNode):
                 self.silence_counter = 0
                 self.audio_buffer.extend(self._sv_buf)
                 self.speech_chunks += len(self._sv_buf)
-                # Добавляем в галерею во время знакомства или если есть место
+                # Add to the gallery during introduction or if there is room
                 if self._introducing or len(self._sv_gallery) < self._SV_GALLERY_MAX:
                     self._sv_add_to_gallery(emb)
                 if not log_reject:
                     self.get_logger().info(
-                        f'SV: хвост принят ({seg_sec:.1f}с, '
-                        f'сходство={sim:.2f} >= порог={thresh:.2f})')
+                        f'SV: tail accepted ({seg_sec:.1f}s, '
+                        f'similarity={sim:.2f} >= threshold={thresh:.2f})')
                 self._sv_buf.clear()
                 return True
             else:
                 if log_reject:
                     self.get_logger().warn(
-                        f'SV: отброшен чужой голос ({seg_sec:.1f}с, '
-                        f'сходство={sim:.2f} < порог={thresh:.2f})'
+                        f'SV: foreign voice rejected ({seg_sec:.1f}s, '
+                        f'similarity={sim:.2f} < threshold={thresh:.2f})'
                     )
                 else:
                     self.get_logger().info(
-                        f'SV: хвост отброшен ({seg_sec:.1f}с, '
-                        f'сходство={sim:.2f} < порог={thresh:.2f})'
+                        f'SV: tail rejected ({seg_sec:.1f}s, '
+                        f'similarity={sim:.2f} < threshold={thresh:.2f})'
                     )
                 self._sv_buf.clear()
                 return False
         self._sv_buf.clear()
-        return True  # первая запись в галерею — accepted
+        return True  # first gallery entry — accepted
 
-    # ── Основной аудио колбэк ─────────────────────────────────────────────
+    # ── Main audio callback ───────────────────────────────────────────────
 
     def _audio_callback(self, msg: Float32MultiArray):
         audio_float32 = np.array(msg.data, dtype=np.float32)
@@ -638,7 +681,7 @@ class VoiceDetectorNode(LifecycleNode):
             self._sv_seg_samples    = int(self._sv_seg_sec * self.rate)
             self.get_logger().info(
                 f'chunk_size={self._chunk_size} '
-                f'silence_threshold={self._silence_threshold} чанков'
+                f'silence_threshold={self._silence_threshold} chunks'
             )
 
         if self.tts_speaking:
@@ -658,39 +701,39 @@ class VoiceDetectorNode(LifecycleNode):
             if (self._stt_sent_time > 0.0
                     and (time.time() - self._stt_sent_time) > self.pipeline_timeout):
                 self.get_logger().warn(
-                    f'Таймаут пайплайна ({self.pipeline_timeout:.0f}с) — '
-                    f'возвращаюсь к wake word'
+                    f'Pipeline timeout ({self.pipeline_timeout:.0f}s) — '
+                    f'back to the wake word'
                 )
                 self._stt_sent_time = 0.0
             return
 
-        # Таймаут ожидания первого слова
+        # Timeout waiting for the first word
         if not self.audio_buffer and not self._sv_buf:
             if (time.time() - self.activation_time) > self.no_speech_timeout:
                 if self._should_keep_listening() and not self._sleeping:
                     self.activation_time = time.time()
                 else:
-                    self.get_logger().info('Таймаут ожидания речи — возвращаюсь к wake word')
+                    self.get_logger().info('Timed out waiting for speech — back to the wake word')
                     self.is_active       = False
                     self.activation_time = 0.0
                 return
 
         if confidence > self.vad_threshold:
             if self._sv_enabled and self._sv_encoder:
-                # Режим SV: silence_counter НЕ сбрасывается здесь.
-                # Сброс происходит внутри _sv_decide только при принятии сегмента.
-                # Это гарантирует что чужой голос (TV, другие люди) не обнуляет
-                # счётчик тишины и не растягивает запись до max_phrase_sec.
+                # SV mode: silence_counter is NOT reset here.
+                # The reset happens inside _sv_decide only when a segment is accepted.
+                # This guarantees that a foreign voice (TV, other people) doesn't zero
+                # the silence counter and doesn't stretch the recording to max_phrase_sec.
                 if not self.audio_buffer and not self._sv_buf and self._onset_buf:
                     self._sv_buf.extend(self._onset_buf)
                     self._onset_buf.clear()
                 self._sv_buf.append(audio_float32)
-                # Если накопили достаточно — принимаем решение
+                # If enough has accumulated — make the decision
                 sv_samples = sum(len(c) for c in self._sv_buf)
                 if sv_samples >= self._sv_seg_samples:
                     self._sv_decide(log_reject=True)
             else:
-                # Без SV: классическое поведение
+                # Without SV: classic behavior
                 self.silence_counter = 0
                 if not self.audio_buffer and self._onset_buf:
                     self.audio_buffer.extend(self._onset_buf)
@@ -700,7 +743,7 @@ class VoiceDetectorNode(LifecycleNode):
 
         else:
             if self.audio_buffer or self._sv_buf:
-                # Тишина после речи — сначала сбрасываем недозаполненный sv_buf
+                # Silence after speech — first flush the partially filled sv_buf
                 if self._sv_buf:
                     self._sv_decide(log_reject=False)
                 self.audio_buffer.append(audio_float32)
@@ -709,25 +752,25 @@ class VoiceDetectorNode(LifecycleNode):
                 if self.silence_counter >= self._silence_threshold:
                     self._finish_recording(reason='silence')
             else:
-                # Тишина до первой речи — накапливаем onset буфер
+                # Silence before the first speech — accumulate the onset buffer
                 self._onset_buf.append(audio_float32)
                 if self._onset_maxlen and len(self._onset_buf) > self._onset_maxlen:
                     self._onset_buf.popleft()
 
-        # Защита от бесконечной записи по количеству принятых чанков
+        # Protection against endless recording, by the number of accepted chunks
         if self.is_active and len(self.audio_buffer) >= self._max_chunks:
-            self.get_logger().warn('Достигнут лимит длины фразы — принудительно завершаю')
+            self.get_logger().warn('Phrase length limit reached — forcing the end of recording')
             self._finish_recording(reason='timeout')
 
-    # ── Завершение записи ─────────────────────────────────────────────────
+    # ── Finishing the recording ───────────────────────────────────────────
 
     def _finish_recording(self, reason: str = 'silence'):
-        # Сбрасываем незавершённый SV-сегмент перед отправкой
+        # Flush the unfinished SV segment before sending
         if self._sv_buf:
             self._sv_decide(log_reject=False)
 
-        # Во время знакомства ожидаются короткие ответы (имя, "Ника", "да") —
-        # порог минимальной длины речи снижается, чтобы их не отбрасывать.
+        # During an introduction, short answers are expected (a name, "Ника", "да") —
+        # the minimum speech length threshold is lowered so they aren't dropped.
         effective_min_speech_sec = (
             self.min_speech_sec_introducing if self._introducing else self.min_speech_sec
         )
@@ -740,23 +783,23 @@ class VoiceDetectorNode(LifecycleNode):
             duration   = len(full_audio) / self.rate
 
             self.get_logger().info(
-                f'Фраза записана ({duration:.1f}с, речь={speech_sec:.1f}с, причина={reason}, '
-                f'∆wake={time.time()-self.activation_time:.1f}с). Отправляю в STT...'
+                f'Phrase recorded ({duration:.1f}s, speech={speech_sec:.1f}s, reason={reason}, '
+                f'∆wake={time.time()-self.activation_time:.1f}s). Sending to STT...'
             )
             self._stt_sent_time = time.time()
-            # Реальная распознанная речь = прямое доказательство присутствия,
-            # даже если /person_present (по лицу/телу от identity_manager) ни
-            # разу не приходил True в этой сессии (чисто голосовой диалог,
-            # лицо не поймано). Без этого _is_person_present() всегда False
-            # (см. её реализацию — сверяет только с последним True по лицу),
-            # и авто-активация после TTS отключается насовсем — робот
-            # переставал слышать пользователя. Живой баг 2026-08-28.
+            # Real recognized speech = direct proof of presence, even if
+            # /person_present (by face/body from identity_manager) never came
+            # True in this session (a purely voice dialogue, no face caught).
+            # Without this, _is_person_present() is always False (see its
+            # implementation — it only checks the last True from the face),
+            # and auto-activation after TTS is disabled for good — the robot
+            # stopped hearing the user. Live bug 2026-08-28.
             self._person_last_seen = time.time()
             self._publish(full_audio)
         else:
             self.get_logger().info(
-                f'Фраза отброшена: речи {speech_sec:.1f}с < {effective_min_speech_sec:.1f}с'
-                f'{" (знакомство)" if self._introducing else ""} — игнорирую'
+                f'Phrase dropped: speech {speech_sec:.1f}s < {effective_min_speech_sec:.1f}s'
+                f'{" (introducing)" if self._introducing else ""} — ignoring'
             )
             if self._should_keep_listening() and not self._sleeping:
                 import threading
@@ -768,7 +811,7 @@ class VoiceDetectorNode(LifecycleNode):
         self.is_active       = False
         self._onset_buf.clear()
         self._sv_buf.clear()
-        # Галерея НЕ сбрасывается — живёт всю сессию до go_idle / robot_sleep
+        # The gallery is NOT reset — it lives for the whole session until go_idle / robot_sleep
 
     def _publish(self, audio: np.ndarray):
         msg = Float32MultiArray()

@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-inmoov_full.launch.py — полный стек InMoov.
+inmoov_full.launch.py — the full InMoov stack.
 
-Включает:
-  inmoov_control   — Arduino (серво, PIR, ультразвук) + face_expressions_node
+Includes:
+  inmoov_control   — Arduino (servos, PIR, ultrasonic) + face_expressions_node
   inmoov_voice     — wake word, VAD, STT, TTS
-  behavior_manager — поведенческое дерево + llm_node (генератор намерений)
-  inmoov_memory    — социальная память (SQLite, /memory/query)
-  inmoov_vision    — камера, детекция/трекинг/распознавание лиц, head tracker
+  behavior_manager — behavior tree + llm_node (intent generator)
+  inmoov_memory    — social memory (SQLite, /memory/query)
+  inmoov_vision    — camera, face detection/tracking/recognition, head tracker
 
-Использование:
+Usage:
   ros2 launch behavior_manager_node inmoov_full.launch.py
   ros2 launch behavior_manager_node inmoov_full.launch.py tavily_api_key:=tvly-...
   ros2 launch behavior_manager_node inmoov_full.launch.py vision:=false
   ros2 launch behavior_manager_node inmoov_full.launch.py port_right:=/dev/ttyUSB0
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import os
@@ -33,11 +37,11 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
 
-    # ── Аргументы ─────────────────────────────────────────────────────────────
+    # ── Arguments ─────────────────────────────────────────────────────────────
 
     args = [
-        # Серверы
-        # llm_url — OpenAI-совместимый chat.completions endpoint (сейчас vLLM).
+        # Servers
+        # llm_url — OpenAI-compatible chat.completions endpoint (currently vLLM).
         DeclareLaunchArgument('llm_url',
             default_value='http://192.168.10.118:18020/v1/chat/completions'),
         DeclareLaunchArgument('llm_fallback_url',
@@ -61,7 +65,7 @@ def generate_launch_description():
         DeclareLaunchArgument('wakeword_threshold',
             default_value='0.2'),
 
-        # Аудио
+        # Audio
         DeclareLaunchArgument('audio_device_name',
             default_value='pulse'),
 
@@ -82,7 +86,7 @@ def generate_launch_description():
             default_value='/home/artur/inmoov_memory.db',
             description='Path to SQLite face memory database'),
 
-        # Vision — можно отключить: vision:=false
+        # Vision — can be disabled: vision:=false
         DeclareLaunchArgument('vision',
             default_value='true',
             description='Enable vision pipeline (face detection, tracking, etc.)'),
@@ -92,7 +96,7 @@ def generate_launch_description():
             default_value='/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0'),
         DeclareLaunchArgument('greet_cooldown_sec', default_value='120.0'),
 
-        # Telegram Bridge — включить: telegram:=true
+        # Telegram Bridge — enable with: telegram:=true
         DeclareLaunchArgument('telegram',
             default_value='false',
             description='Enable Telegram bridge (requires TELEGRAM_BOT_TOKEN env var)'),
@@ -173,7 +177,7 @@ def generate_launch_description():
         }],
     )
 
-    # ── inmoov_vision (опционально) ───────────────────────────────────────────
+    # ── inmoov_vision (optional) ─────────────────────────────────────────────
 
     vision = GroupAction(
         condition=IfCondition(LaunchConfiguration('vision')),
@@ -192,7 +196,7 @@ def generate_launch_description():
         ],
     )
 
-    # ── Telegram Bridge (опционально) ────────────────────────────────────────
+    # ── Telegram Bridge (optional) ───────────────────────────────────────────
 
     telegram = GroupAction(
         condition=IfCondition(LaunchConfiguration('telegram')),
@@ -213,7 +217,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription(args + [
-        memory,    # memory первым — /memory/query нужен face_recognition
+        memory,    # memory first — /memory/query is needed by face_recognition
         control,
         voice,
         behavior,

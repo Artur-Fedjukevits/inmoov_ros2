@@ -1,9 +1,13 @@
 """
-WorkingMemory — слой рабочей памяти
-====================================
-Хранит текущее состояние только в RAM.
-Обновляется из ROS2-топиков или напрямую.
-Данные НЕ персистируются — при перезапуске сбрасываются.
+WorkingMemory — working memory layer
+======================================
+Holds current state in RAM only.
+Updated from ROS2 topics or directly.
+Data is NOT persisted — it resets on restart.
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from typing import Optional
 
 
 class WorkingMemory:
-    """Текущее состояние мира и робота — всегда передаётся в LLM."""
+    """Current state of the world and the robot — always passed to the LLM."""
 
     SEASONS = {
         12: "winter", 1: "winter", 2: "winter",
@@ -33,10 +37,10 @@ class WorkingMemory:
     ]
 
     TIME_OF_DAY = [
-        (5,  "night"),     # 00:00-04:59 → ночь
-        (12, "morning"),   # 05:00-11:59 → утро
-        (18, "afternoon"), # 12:00-17:59 → день
-        (22, "evening"),   # 18:00-21:59 → вечер
+        (5,  "night"),     # 00:00-04:59 → night
+        (12, "morning"),   # 05:00-11:59 → morning
+        (18, "afternoon"), # 12:00-17:59 → afternoon
+        (22, "evening"),   # 18:00-21:59 → evening
         # >= 22 → stays default "night"
     ]
 
@@ -52,7 +56,7 @@ class WorkingMemory:
                 "mode": "idle",          # idle | conversation | navigation | task
                 "battery": 100,
                 "current_task": None,
-                "facing": None,          # имя человека, на которого смотрит робот
+                "facing": None,          # name of the person the robot is looking at
             },
             "environment": {
                 "people_present": [],
@@ -63,11 +67,11 @@ class WorkingMemory:
         self.refresh_time()
 
     # ------------------------------------------------------------------
-    # Время
+    # Time
     # ------------------------------------------------------------------
 
     def refresh_time(self) -> None:
-        """Обновляет временной блок по системным часам."""
+        """Refreshes the time block from the system clock."""
         now = datetime.now()
         hour = now.hour
         season = self.SEASONS[now.month]
@@ -96,7 +100,7 @@ class WorkingMemory:
         }
 
     # ------------------------------------------------------------------
-    # Обновления из ROS2 / внешних источников
+    # Updates from ROS2 / external sources
     # ------------------------------------------------------------------
 
     def update_location(self, room: str, landmark: str = "",
@@ -138,11 +142,11 @@ class WorkingMemory:
             e["lighting"] = lighting
 
     # ------------------------------------------------------------------
-    # Форматирование для системного промпта
+    # Formatting for the system prompt
     # ------------------------------------------------------------------
 
     def to_text(self) -> str:
-        """Компактный текст для вставки в system prompt."""
+        """Compact text for insertion into the system prompt."""
         self.refresh_time()
         t = self.data["time"]
         l = self.data["location"]

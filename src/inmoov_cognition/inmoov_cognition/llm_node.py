@@ -1,35 +1,39 @@
 #!/usr/bin/env python3
 
 """
-llm_node.py  (v2 — Генератор Намерений)
+llm_node.py  (v2 — Intent Generator)
 =========================================
-LLM нода — OpenAI-совместимый chat.completions API (vLLM), function calling (tools API).
+LLM node — OpenAI-compatible chat.completions API (vLLM), function calling (tools API).
 
-Принцип: LLM НЕ управляет TTS и сервоприводами напрямую.
-Она публикует намерение в /llm_response (текст + голосовой стиль).
-Behavior Tree оркеструет Speak + Gesticulation параллельно; мимика лица теперь
-синхронизирована с длительностью самой речи — её держит tts_node (см.
-/face_expression_hold), а не BT.
+Principle: the LLM does NOT control TTS and servos directly.
+It publishes an intent to /llm_response (text + voice style).
+The Behavior Tree orchestrates Speak + Gesticulation in parallel; facial
+expression is now synchronized with the actual speech duration — held by
+tts_node (see /face_expression_hold), not by the BT.
 
 Tools:
-  - items_control        — управление OpenHAB устройствами
-  - get_openhab_states   — получить текущее состояние устройств (из кэша)
-  - search_openhab_items — найти устройства по комнате/типу/состоянию
-  - robot_control        — физические команды робота (→ /robot_events → BT)
-  - web_search           — поиск в интернете (→ /robot_events → BT)
-  - set_voice_style      — буферизует голосовой пресет (+ синхронную мимику
-                            лица на время речи) для /llm_response
-  - save_memory          — сохранение в SQLite через /memory/query
-  - search_memory        — поиск в памяти через /memory/query
+  - items_control        — control OpenHAB devices
+  - get_openhab_states   — get current device state (from cache)
+  - search_openhab_items — find devices by room/type/state
+  - robot_control        — physical robot commands (→ /robot_events → BT)
+  - web_search           — internet search (→ /robot_events → BT)
+  - set_voice_style      — buffers a voice preset (+ synced facial
+                            expression for the duration of speech) for /llm_response
+  - save_memory          — save to SQLite via /memory/query
+  - search_memory        — search memory via /memory/query
 
-Топики:
-  /voice_command   (in)  String — текст от Whisper STT
+Topics:
+  /voice_command   (in)  String — text from Whisper STT
   /llm_response    (out) String JSON {text, voice_instruct} → BT Blackboard
-  /robot_events    (out) String JSON — физические команды (move/arm/head/sleep/search) → BT
-  /search_result   (in)  String — результат поиска от behavior_manager
-  /openhab_schema  (in)  String — статичная схема устройств от openhab_bridge_node
-  /openhab_items   (in)  String — актуальные состояния устройств
-  - broadcast_message     — синтез WAV через TTS + трансляция на Chromecast в гостиной
+  /robot_events    (out) String JSON — physical commands (move/arm/head/sleep/search) → BT
+  /search_result   (in)  String — search result from behavior_manager
+  /openhab_schema  (in)  String — static device schema from openhab_bridge_node
+  /openhab_items   (in)  String — current device states
+  - broadcast_message     — WAV synthesis via TTS + broadcast to the living-room Chromecast
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import base64
@@ -56,7 +60,7 @@ from inmoov_msgs.action import Speak
 from inmoov_msgs.srv import MemoryQuery
 
 
-# ── Инструменты (OpenAI tools API) ──────────────────────────────────────────
+# ── Tools (OpenAI tools API) ──────────────────────────────────────────
 TOOLS = [
     {
         'type': 'function',
@@ -573,72 +577,71 @@ TOOLS = [
 # Regex for LLM stage directions: (Тихо, с улыбкой) / (Шёпотом) etc.
 _STAGE_DIR_RE = re.compile(r'\([А-ЯЁа-яё][^)]{0,60}\)')
 
-# CJK ideographs + CJK punctuation/symbols (Qwen иногда вставляет китайский текст)
+# CJK ideographs + CJK punctuation/symbols (Qwen sometimes inserts Chinese text)
 _CJK_RE = re.compile(r'[　-鿿豈-￯\U00020000-\U0002a6df]+')
 
-# Qwen3 иногда возвращает tool calls текстом вместо tool_calls API поля.
-# Формат 1: "ᐈ\n{...}" или "<tool_call>{...}</tool_call>"
-# Формат 2: "<tools>\n{...}\n{...}\n</tools>" (несколько вызовов)
-# ВАЖНО: жадный .*  (не .*?) — нужен для вложенного JSON {"arguments": {...}}
-# Нежадный останавливался бы на первом } → json.loads падал → tool call не извлекался
-# ᐈ[^{]* — Qwen3 иногда вставляет мусор между ᐈ и JSON (напр. "ᐈC\n{...}"),
-# поэтому матчим ᐈ + любые не-{ символы перед открывающей скобкой
+# Qwen3 sometimes returns tool calls as text instead of via the tool_calls API field.
+# Format 1: "ᐈ\n{...}" or "<tool_call>{...}</tool_call>"
+# Format 2: "<tools>\n{...}\n{...}\n</tools>" (multiple calls)
+# IMPORTANT: greedy .*  (not .*?) is needed for nested JSON {"arguments": {...}}
+# A non-greedy match would stop at the first } → json.loads would fail → tool call not extracted
+# ᐈ[^{]* — Qwen3 sometimes inserts junk between ᐈ and the JSON (e.g. "ᐈC\n{...}"),
+# so we match ᐈ + any non-{ characters before the opening brace
 _TEXT_TOOL_CALL_RE = re.compile(
     r'(?:ᐈ[^{]*|<tool_call>)\s*(\{.*\})\s*(?:</tool_call>)?',
     re.DOTALL,
 )
 _TOOLS_BLOCK_RE = re.compile(r'<tools>(.*?)</tools>', re.DOTALL)
 
-# Streaming sentence splitter: точка/!/?/… + пробел или конец строки
+# Streaming sentence splitter: period/!/?/… + whitespace or end of line
 _SENT_SPLIT_RE    = re.compile(r'(?<=[.!?…])\s+|(?<=[.!?…])$', re.MULTILINE)
-# Fallback split по запятой/точке-с-запятой/двоеточию когда предложение слишком длинное
+# Fallback split on comma/semicolon/colon when the sentence is too long
 _COMMA_SPLIT_RE   = re.compile(r'(?<=[,;:])\s+')
 _TOOL_START_TOKENS = ('<tool_call>', '<tools>')
-# ᐈ — отдельная проверка: только когда за ним идёт { (tool call JSON)
-# Qwen3 использует ᐈ и как декоративный символ ("ᐈ В одном..."), поэтому
-# нельзя детектировать его без следующего {
+# ᐈ — checked separately: only when followed by { (tool call JSON)
+# Qwen3 also uses ᐈ as a decorative character ("ᐈ In one..."), so it
+# can't be detected without a following {
 _TOOL_CALL_AE_RE = re.compile(r'ᐈ.{0,10}\{', re.DOTALL)
-_MIN_SENT_CHARS   = 12    # минимум символов до sentence split
-_MAX_CHUNK_CHARS  = 80    # максимум символов до принудительного split по запятой (~5-6с TTS)
-# Блок TTS-запроса (см. MIGRATION_NOTES.md): OmniVoice звучит менее стабильно
-# на очень коротких изолированных фразах — копим предложения до ~80-120 символов
-# ИЛИ 2 предложений (что раньше наступит), а не шлём буквально по одному короткому
-# предложению за раз. Замер: TTFA ≈1.1-1.2с, итог на 7-19% дольше чем одним запросом.
+_MIN_SENT_CHARS   = 12    # minimum characters before a sentence split
+_MAX_CHUNK_CHARS  = 80    # maximum characters before a forced comma split (~5-6s TTS)
+# TTS request batching (see MIGRATION_NOTES.md): OmniVoice sounds less stable
+# on very short isolated phrases — sentences are accumulated up to ~80-120 characters
+# OR 2 sentences (whichever comes first), instead of sending literally one short
+# sentence at a time. Measured: TTFA ≈1.1-1.2s, total 7-19% longer than a single request.
 _TTS_CHUNK_MIN_CHARS     = 80
 _TTS_CHUNK_MAX_SENTENCES = 2
-# Qwen3 иногда начинает ответ с переформулировки вопроса вида "Почему X?" — фильтруем
+# Qwen3 sometimes starts the answer by rephrasing the question as "Почему X?" — filtered out
 _ECHO_QUESTION_RE = re.compile(
     r'^(?:Почему|Почём|Почем|О\s+чём|Зачем|По\s+поводу)\b.{0,120}\?\s*',
     re.IGNORECASE | re.UNICODE,
 )
-# Qwen3 иногда переходит на китайский в творческих задачах — удаляем иероглифы из TTS-чанков
+# Qwen3 sometimes switches to Chinese on creative tasks — strip ideographs from TTS chunks
 _CJK_RE = re.compile(
     '[⺀-⿿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿'
     '豈-﫿\U00020000-\U0002A6DF\U0002A700-\U0002CEAF]+',
     re.UNICODE,
 )
 
-# Инлайн-теги неречевых звуков OmniVoice (см. MIGRATION_NOTES.md) — LLM
-# вставляет их прямо в текст ответа, в квадратных скобках, в любом месте
-# фразы. Список — весь набор, поддерживаемый сервером; system prompt
-# (build_system_prompt) даёт LLM ровно этот же список дословно. Любой
-# другой "[...]" в ответе — вероятная галлюцинация модели, а не реальный
-# тег сервера — вырезаем его, чтобы не улетел в TTS как есть.
+# OmniVoice non-speech inline tags (see MIGRATION_NOTES.md) — the LLM
+# inserts them directly into the response text, in square brackets, anywhere
+# in the phrase. The list is the full set supported by the server; the system
+# prompt (build_system_prompt) gives the LLM this exact same list verbatim. Any
+# other "[...]" in the response is a likely model hallucination rather than a
+# real server tag — it is stripped so it doesn't reach TTS as-is.
 _INLINE_TAGS = frozenset({
     'laughter', 'sigh', 'confirmation-en', 'question-en', 'question-ah',
     'question-oh', 'question-ei', 'question-yi', 'surprise-ah',
     'surprise-oh', 'surprise-wa', 'surprise-yo', 'dissatisfaction-hnn',
 })
-# Любое короткое "[...]" — не только латиница: LLM может "перевести" тег на
-# русский (напр. "[смеётся]") или выдумать что-то не из списка — такое тоже
-# должно вырезаться, а не проскакивать в TTS как есть.
+# Any short "[...]" — not just Latin script: the LLM may "translate" a tag into
+# Russian (e.g. "[смеётся]") or invent something not on the list — that must
+# also be stripped rather than passed through to TTS as-is.
 _INLINE_TAG_RE = re.compile(r'\[([^\[\]]{1,40})\]')
 
 
 def _filter_inline_tags(text: str) -> str:
-    """Оставляет только известные OmniVoice-теги (нормализует регистр —
-    сервер ожидает точное написание в нижнем регистре), остальные "[...]"
-    вырезает."""
+    """Keeps only known OmniVoice tags (normalizes case — the server expects
+    exact lowercase spelling), strips any other "[...]"."""
     def _sub(m):
         tag = m.group(1).strip().lower()
         return f'[{tag}]' if tag in _INLINE_TAGS else ''
@@ -646,15 +649,15 @@ def _filter_inline_tags(text: str) -> str:
 
 
 def _strip_cjk(text: str) -> str:
-    """Удаляет CJK-иероглифы (китайский/японский/корейский) и нормализует пробелы."""
+    """Removes CJK ideographs (Chinese/Japanese/Korean) and normalizes whitespace."""
     cleaned = _CJK_RE.sub('', text)
     return re.sub(r'  +', ' ', cleaned).strip()
 
 
 def _extract_text_tool_calls(text: str) -> list[dict]:
-    """Извлекает tool calls из текстового ответа (fallback для Qwen3)."""
+    """Extracts tool calls from a text response (fallback for Qwen3)."""
     calls = []
-    # Формат 1: ᐈ{...} или <tool_call>{...}</tool_call>
+    # Format 1: ᐈ{...} or <tool_call>{...}</tool_call>
     for json_str in _TEXT_TOOL_CALL_RE.findall(text):
         try:
             obj = json.loads(json_str)
@@ -662,7 +665,7 @@ def _extract_text_tool_calls(text: str) -> list[dict]:
                 calls.append({'function': {'name': obj['name'], 'arguments': obj['arguments']}})
         except (json.JSONDecodeError, KeyError):
             pass
-    # Формат 2: <tools>\n{...}\n{...}\n</tools>
+    # Format 2: <tools>\n{...}\n{...}\n</tools>
     for block in _TOOLS_BLOCK_RE.findall(text):
         for line in block.strip().splitlines():
             line = line.strip()
@@ -678,12 +681,12 @@ def _extract_text_tool_calls(text: str) -> list[dict]:
 
 
 def _build_user_content(text: str, image_b64: str | None):
-    """Content для user-сообщения: строка если без картинки, иначе OpenAI
-    vision content-array (text + image_url data URI). Картинка передаётся
-    только в ИСХОДЯЩЕМ запросе — в self.history остаётся текстовый плейсхолдер
-    (см. _query_llm), иначе base64 раздувал бы токены каждого следующего хода.
-    РОВНО ОДНА картинка — vLLM-сервер отдаёт 400 при >1 image_url в одном
-    промпте ("At most 1 image(s) may be provided", проверено 2026-08-26)."""
+    """Content for a user message: a plain string if there's no image, otherwise an
+    OpenAI vision content array (text + image_url data URI). The image is only
+    included in the OUTGOING request — self.history keeps a text placeholder
+    instead (see _query_llm), otherwise the base64 would bloat the token count
+    of every subsequent turn. EXACTLY ONE image — the vLLM server returns 400 for
+    >1 image_url in a single prompt ("At most 1 image(s) may be provided", verified 2026-08-26)."""
     if not image_b64:
         return text
     return [
@@ -694,16 +697,16 @@ def _build_user_content(text: str, image_b64: str | None):
 
 def _normalize_tool_calls(tool_calls: list[dict]) -> list[dict]:
     """
-    Гарантирует OpenAI-schema поля `id`/`type` у каждого tool call.
+    Guarantees the OpenAI-schema `id`/`type` fields on every tool call.
 
-    vLLM строго валидирует историю сообщений: assistant-сообщение с
-    tool_calls, отправленное обратно в следующем запросе (self.history
-    реплеится как есть в R1 нового хода), обязано иметь `id` (str) и
-    `type: "function"` на каждом элементе — иначе 400 Bad Request
+    vLLM strictly validates the message history: an assistant message with
+    tool_calls, sent back in the next request (self.history is replayed as-is
+    in the R1 of the new turn), must have `id` (str) and `type: "function"`
+    on every element — otherwise 400 Bad Request
     (ChatCompletionMessageFunctionToolCallParam.id/type: Field required).
-    Текстовый fallback (_extract_text_tool_calls) этих полей не даёт вовсе,
-    а SSE-парсер (_iter_sse_chunks) сохраняет id только если сервер его
-    прислал — на случай пропажи подставляем синтетический.
+    The text fallback (_extract_text_tool_calls) doesn't provide these fields
+    at all, and the SSE parser (_iter_sse_chunks) only keeps id if the server
+    sent one — a synthetic one is substituted if it's missing.
     """
     out = []
     for tc in tool_calls:
@@ -716,7 +719,7 @@ def _normalize_tool_calls(tool_calls: list[dict]) -> list[dict]:
 
 
 def _strip_tool_blocks(text: str) -> str:
-    """Удаляет блоки tool calls из текста перед отправкой в TTS."""
+    """Removes tool call blocks from the text before sending it to TTS."""
     text = _TOOLS_BLOCK_RE.sub('', text)
     text = _TEXT_TOOL_CALL_RE.sub('', text)
     return re.sub(r'  +', ' ', text).strip()
@@ -760,10 +763,10 @@ def _flatten_tool_history(history: list, reminder: str) -> list:
 
 
 def _strip_episodic_memory(raw: str) -> str:
-    """Оставляет только рабочую память («== Текущий момент ==»), отрезая эпизоды.
+    """Keeps only working memory («== Текущий момент ==»), cutting off episodes.
 
-    Эпизоды — личная история конкретного собеседника, её нельзя показывать
-    LLM пока человек не идентифицирован (person_id известен).
+    Episodes are the personal history of a specific interlocutor; they must not
+    be shown to the LLM until the person has been identified (person_id known).
     """
     marker = '\n\n== Последние события =='
     idx = raw.find(marker)
@@ -795,35 +798,36 @@ def _ru_direction(direction: str) -> str:
     return _SCENE_DIRECTION_RU.get(direction, direction)
 
 
-# ── Разбор голосовой подсказки направления (face-search retry) ─────────────
-# Намеренно НЕ матчим голые "право"/"лево" — коллизии с "направление",
-# "исправить", "справедливо" и т.п. Целые слова/фразы через границы \b.
+# ── Parsing voice direction hints (face-search retry) ─────────────
+# Deliberately NOT matching bare "право"/"лево" — collides with "направление",
+# "исправить", "справедливо" etc. Whole words/phrases with \b boundaries.
 _RIGHT_HINT_RE = re.compile(
     r'\b(направо|справа|правее|по правую руку|с правой стороны|правой рукой)\b',
     re.IGNORECASE)
 _LEFT_HINT_RE = re.compile(
     r'\b(налево|слева|левее|по левую руку|с левой стороны|левой рукой)\b',
     re.IGNORECASE)
-# Живой баг 2026-08-28: "Повернись направо" — это КОМАНДА роботу (уже
-# обрабатывается отдельно через robot_control/look_direction tool call), а
-# НЕ подсказка о том, где стоит собеседник — но по словам "направо"/"налево"
-# она неотличима от «я справа от тебя». Без этого исключения FaceSearchAttempt
-# ошибочно доворачивал корпус НА ТУ ЖЕ фразу, что уже легитимно повернула
-# голову через LLM tool call — лишнее/конфликтующее движение.
+# Live bug 2026-08-28: "Повернись направо" is a COMMAND to the robot (already
+# handled separately via the robot_control/look_direction tool call), NOT a
+# hint about where the interlocutor is standing — but by the words
+# "направо"/"налево" alone it's indistinguishable from «я справа от тебя».
+# Without this exclusion FaceSearchAttempt would erroneously turn the torso
+# again on the SAME phrase that had already legitimately turned the head via
+# the LLM tool call — an extra/conflicting movement.
 _ROBOT_TURN_COMMAND_RE = re.compile(
     r'\b(повернись|поверни\w*|обернись|оберн\w*|посмотри|погляди|взгляни|глянь|оглянись)\b',
     re.IGNORECASE)
 
 
 def _parse_direction_hint(text: str) -> tuple[str, str]:
-    """Возвращает (direction, phrase), direction ∈ {'left','right','none'}.
+    """Returns (direction, phrase), direction ∈ {'left','right','none'}.
 
-    Если в реплике встретились оба направления (например «не слева, а
-    справа») — побеждает ПОСЛЕДНЕЕ по позиции упоминание, обычно это и есть
-    исправленный/финальный ответ говорящего.
+    If both directions occur in the utterance (e.g. «не слева, а справа»),
+    the LAST mention by position wins — that's usually the speaker's
+    corrected/final answer.
 
-    Фразы-команды роботу ("повернись направо", "посмотри налево") исключены —
-    см. _ROBOT_TURN_COMMAND_RE.
+    Command phrases to the robot ("повернись направо", "посмотри налево") are
+    excluded — see _ROBOT_TURN_COMMAND_RE.
     """
     if _ROBOT_TURN_COMMAND_RE.search(text):
         return 'none', ''
@@ -839,7 +843,7 @@ def _parse_direction_hint(text: str) -> tuple[str, str]:
 
 
 def _build_scene_block(scene_ctx: dict | None) -> str:
-    """Короткое описание сцены (объекты + люди) для конца system prompt."""
+    """Short description of the scene (objects + people) for the end of the system prompt."""
     if not scene_ctx:
         return ''
 
@@ -864,9 +868,9 @@ def _build_scene_block(scene_ctx: dict | None) -> str:
 
     if not parts:
         return ''
-    # Явно маркируем как снимок "прямо сейчас": иначе модель на низкой
-    # температуре склонна повторять свой предыдущий ответ из истории диалога,
-    # даже если сцена перед камерой уже изменилась.
+    # Explicitly marked as a "right now" snapshot: otherwise at low temperature
+    # the model tends to repeat its previous answer from the dialogue history,
+    # even if the scene in front of the camera has already changed.
     return ('\nСцена ПРЯМО СЕЙЧАС (может отличаться от того, что ты говорил '
             'раньше в этом разговоре — доверяй этому, а не своим прошлым словам): '
             + ' '.join(parts) + '\n')
@@ -885,21 +889,22 @@ _LOST_AGAIN_EXAMPLES = [
 
 
 def _build_face_search_block(face_search_ctx: dict | None) -> str:
-    """Два независимых куска, оба из /behavior/face_search_status:
+    """Two independent pieces, both from /behavior/face_search_status:
 
-    1. Честность про "вижу/не вижу" (face_search_ctx['locked']) — ВСЕГДА,
-       когда лицо сейчас не поймано, независимо от ask_now. Живой баг
-       2026-08-31: на прямой вопрос "ты меня видишь?" LLM отвечал "да, вижу
-       тебя!" безо всякой проверки, хотя head_tracker трек не держал —
-       чистая галлюцинация. locked обновляется в behavior_manager_node
-       СРАЗУ на потере трека (не через грейс), поэтому здесь всегда актуален.
-    2. Просьба естественно спросить "где ты" — только когда поиск по звуку
-       не даёт результата 2+ раза подряд (ask_now). Разные примеры для
-       "ещё ни разу не нашли после wake word" (kind='never_found') и
-       "потеряли посреди уже идущего диалога" (kind='lost_again'). Не
-       требует ответа именно в формате "слева/справа" — направление всё
-       равно определяется отдельно, разбором голосовой подсказки и/или
-       /sound_direction (см. behavior_manager_node.FaceSearchAttempt).
+    1. Honesty about "I see you / I don't" (face_search_ctx['locked']) — ALWAYS,
+       whenever the face isn't currently tracked, regardless of ask_now. Live
+       bug 2026-08-31: on a direct "can you see me?" question the LLM would
+       answer "yes, I see you!" with no check at all, even though the
+       head_tracker track wasn't held — a pure hallucination. locked is
+       updated in behavior_manager_node IMMEDIATELY on track loss (not via a
+       grace period), so it's always current here.
+    2. A request to naturally ask "where are you" — only when sound-based
+       search yields no result 2+ times in a row (ask_now). Different examples
+       for "never found since wake word" (kind='never_found') and "lost mid an
+       already ongoing dialogue" (kind='lost_again'). Doesn't require an
+       answer strictly in "left/right" format — direction is determined
+       separately anyway, by parsing the voice hint and/or /sound_direction
+       (see behavior_manager_node.FaceSearchAttempt).
     """
     if not face_search_ctx:
         return ''
@@ -940,14 +945,14 @@ def _build_face_search_block(face_search_ctx: dict | None) -> str:
 def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
                         memory_context: str = '', scene_ctx: dict | None = None,
                         face_search_ctx: dict | None = None) -> str:
-    """Формирует системный промпт со схемой устройств и контекстом собеседника.
+    """Builds the system prompt with the device schema and the interlocutor's context.
 
-    oh_schema — JSON-строка со схемой OpenHAB (name/label/type/options, без state).
-                Передаётся один раз в начале диалога; состояния запрашиваются
-                через get_openhab_states / search_openhab_items по необходимости.
-    scene_ctx — сводка сцены от scene_manager_node (объекты + люди вокруг).
-    face_search_ctx — статус поиска лица от behavior_manager_node
-                       (/behavior/face_search_status), см. _build_face_search_block.
+    oh_schema — JSON string with the OpenHAB schema (name/label/type/options, no state).
+                Sent once at the start of the dialogue; states are queried
+                via get_openhab_states / search_openhab_items as needed.
+    scene_ctx — scene summary from scene_manager_node (objects + people around).
+    face_search_ctx — face-search status from behavior_manager_node
+                       (/behavior/face_search_status), see _build_face_search_block.
     """
     if person_ctx:
         name       = person_ctx.get('name') or 'Незнакомец'
@@ -1017,15 +1022,15 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
     scene_block       = _build_scene_block(scene_ctx)
     face_search_block = _build_face_search_block(face_search_ctx)
 
-    # ВАЖНО: весь ДИНАМИЧЕСКИЙ блок (person_block/memory_block/scene_block —
-    # время, собеседник, последние события, сцена вокруг — меняется КАЖДЫЙ
-    # запрос) вынесен в самый конец промпта. Всё, что выше, статично между
-    # запросами одной сессии (и часто между сессиями) — это нужно для
-    # prefix-кэша на сервере: если динамика стоит в середине, любой кэш
-    # общего префикса (system-prompt) рвётся с этого места на каждом ходе
-    # диалога, и все статичные блоки после неё (таблица OpenHAB и т.д.)
-    # приходится пересчитывать заново.
-    # Сначала статика, динамика — последней. См. project_llm_backend_bench.md.
+    # IMPORTANT: the whole DYNAMIC block (person_block/memory_block/scene_block —
+    # time, interlocutor, recent events, surrounding scene — changes on EVERY
+    # request) is moved to the very end of the prompt. Everything above is static
+    # between requests within one session (and often between sessions) — this is
+    # needed for the server's prefix cache: if the dynamic part sits in the middle,
+    # any cache of the common prefix (system prompt) breaks at that point on every
+    # turn of the dialogue, and all the static blocks after it (the OpenHAB table
+    # etc.) have to be recomputed from scratch.
+    # Static first, dynamic last. See project_llm_backend_bench.md.
     return f"""Ты робот по имени Лёня. Ты член семьи. Твоя главная задача - общение. Стараться узнать о собеседнике или семье что-то новое и сохранять в базу данных с помощью инструментов. Так же твоя задача отвечать на любые вопросы, и выполнять команды. Ты можешь управлять умным домом через OpenHAB, двигаться и выражать эмоции.
 Используй инструменты (tools) для выполнения команд.
 ВАЖНО: Никогда не используй азиатские языки в ответах, никаких иероглифов!
@@ -1077,10 +1082,10 @@ _RU_WEEKDAY = {
 
 
 def _resolve_reminder_date(date_str: str | None) -> str | None:
-    """Преобразует человекочитаемое название даты в ISO YYYY-MM-DD.
+    """Converts a human-readable date name into ISO YYYY-MM-DD.
 
-    Поддерживает: названия дней недели (рус/англ), 'завтра'/'послезавтра',
-    'tomorrow'/'day after tomorrow', готовую ISO-дату. None/пусто → None.
+    Supports: weekday names (Russian/English), 'завтра'/'послезавтра',
+    'tomorrow'/'day after tomorrow', a ready ISO date. None/empty → None.
     """
     if not date_str:
         return None
@@ -1101,7 +1106,7 @@ def _resolve_reminder_date(date_str: str | None) -> str | None:
         target = _RU_WEEKDAY[s]
         days_ahead = (target - today.weekday()) % 7
         if days_ahead == 0:
-            days_ahead = 7  # сегодня такой день → следующая неделя
+            days_ahead = 7  # today is that day → next week
         return (today + datetime.timedelta(days=days_ahead)).isoformat()
 
     # ISO YYYY-MM-DD
@@ -1109,18 +1114,18 @@ def _resolve_reminder_date(date_str: str | None) -> str | None:
         datetime.date.fromisoformat(date_str.strip())
         return date_str.strip()
     except ValueError:
-        return date_str  # вернём как есть, memory_node разберётся
+        return date_str  # return as-is, memory_node will figure it out
 
 
 def _resolve_reminder_time(time_str: str | None) -> str | None:
-    """Нормализует строку времени в формат HH:MM. None/пусто → None."""
+    """Normalizes a time string into HH:MM format. None/empty → None."""
     import re as _re
     if not time_str:
         return None
     s = time_str.strip()
     if not s:
         return None
-    # Уже в формате HH:MM или H:MM
+    # Already in HH:MM or H:MM format
     m = _re.fullmatch(r'(\d{1,2}):(\d{2})', s)
     if m:
         h, mn = int(m.group(1)), int(m.group(2))
@@ -1130,7 +1135,7 @@ def _resolve_reminder_time(time_str: str | None) -> str | None:
 
 
 def _base_url(chat_url: str) -> str:
-    """Извлекает базовый URL из endpoint-а: http://host:port/api/chat → http://host:port"""
+    """Extracts the base URL from an endpoint: http://host:port/api/chat → http://host:port"""
     from urllib.parse import urlparse
     p = urlparse(chat_url)
     return f'{p.scheme}://{p.netloc}'
@@ -1147,71 +1152,71 @@ class LLMNode(LifecycleNode):
     def __init__(self):
         super().__init__('llm_node')
 
-        # Гейт знакомства — инициализируется до subscriptions в on_configure
+        # Introduction gate — initialized before subscriptions in on_configure
         self._introducing = False
 
-        # ── Состояние ─────────────────────────────────────────────────────
+        # ── State ────────────────────────────────────────────────────────
         self.history         = []
         self._processing     = False
         self._lock           = threading.Lock()
-        self._tg_req_id:     str = ''   # request_id текущего Telegram-запроса
+        self._tg_req_id:     str = ''   # request_id of the current Telegram request
         self._person_context = None
-        # Кэш OpenHAB от openhab_bridge_node
-        self._oh_schema      = ''        # JSON-строка схемы (name/label/type/options)
-        self._oh_items       = []        # Список dict с актуальными state
-        # Последние кадры с глазных камер (JPEG bytes) — для look_and_describe/look_direction.
-        # Оба глаза кэшируются отдельно: одно фото может быть смазано/не в фокусе,
-        # поэтому обе камеры уходят в vision-запрос одновременно (см. _call_vision_model).
+        # OpenHAB cache from openhab_bridge_node
+        self._oh_schema      = ''        # schema JSON string (name/label/type/options)
+        self._oh_items       = []        # list of dicts with the current state
+        # Latest frames from the eye cameras (JPEG bytes) — for look_and_describe/look_direction.
+        # Both eyes are cached separately: one photo may be blurry/out of focus,
+        # so both cameras go into the vision request at once (see _call_vision_model).
         self._latest_eye_jpeg:       bytes | None = None   # left
         self._latest_eye_jpeg_right: bytes | None = None
-        # Стиль голоса (+ синхронная мимика лица на время речи, см. tts_node) —
-        # буферизуется set_voice_style, включается в /llm_response
+        # Voice style (+ synchronized facial expression for the duration of speech,
+        # see tts_node) — buffered by set_voice_style, included in /llm_response
         self._voice_style    = {'emotion': ''}
-        # Взгляд собеседника: True/False/None (None = нет данных от детектора)
-        # Используется для фильтрации речи, не адресованной роботу.
+        # Interlocutor's gaze: True/False/None (None = no data from the detector)
+        # Used to filter out speech not addressed to the robot.
         self._looking_at_robot: bool | None = None
         self._person_present_in_ctx: bool   = False
 
-        # Синхронизация web_search: фоновый поток ждёт результата от BM
+        # web_search sync: a background thread waits for the result from BM
         self._search_event          = threading.Event()
         self._search_result_data: str | None = None
         self._waiting_for_search    = False
 
-        # Контекст памяти из memory_node — вставляется в system prompt
+        # Memory context from memory_node — inserted into the system prompt
         self._memory_context: str = ''
-        # Сводка сцены (объекты + люди) от scene_manager_node — вставляется в system prompt
+        # Scene summary (objects + people) from scene_manager_node — inserted into the system prompt
         self._scene_context: dict = {}
-        # Статус поиска лица от behavior_manager_node (/behavior/face_search_status)
-        # — вставляется в system prompt через _build_face_search_block
+        # Face-search status from behavior_manager_node (/behavior/face_search_status)
+        # — inserted into the system prompt via _build_face_search_block
         self._face_search_status: dict = {}
-        # Накапливаем transcript текущего диалога
+        # Accumulates the transcript of the current dialogue
         self._dialogue_lines: list[str] = []
 
     @property
     def model(self) -> str:
-        """Модель выбирается в зависимости от активного сервера."""
+        """The model is chosen depending on the active server."""
         return self.model_primary if self._active_url == self.llm_url else self.model_fallback
 
-    # ── Проверка серверов ──────────────────────────────────────────────────
+    # ── Server check ─────────────────────────────────────────────────────
 
     def _check_servers(self):
-        """Проверяет оба сервера и устанавливает активный."""
+        """Checks both servers and sets the active one."""
         primary_ok  = self._probe_llm(self.llm_url,  self.model_primary, self.bearer_token)
         fallback_ok = self._probe_llm(self.llm_fallback_url, self.model_fallback,
                                        self.bearer_token_fallback)
 
         if primary_ok:
             self._active_url = self.llm_url
-            self.get_logger().info(f'LLM: основной сервер доступен ({self.llm_url})')
+            self.get_logger().info(f'LLM: primary server available ({self.llm_url})')
         elif fallback_ok:
             self._active_url = self.llm_fallback_url
             self.get_logger().warn(
-                f'Основной LLM-сервер недоступен! Используем резервный: {self.llm_fallback_url}')
+                f'Primary LLM server unavailable! Using fallback: {self.llm_fallback_url}')
         else:
-            self.get_logger().error('Оба LLM-сервера недоступны!')
+            self.get_logger().error('Both LLM servers unavailable!')
 
     def _probe_llm(self, chat_url: str, model: str, bearer: str) -> bool:
-        """Проверяет доступность LLM-сервера через GET /v1/models. Возвращает True если OK."""
+        """Checks LLM server availability via GET /v1/models. Returns True if OK."""
         try:
             headers = {'Authorization': f'Bearer {bearer}'} if bearer else {}
             r = requests.get(_models_url(chat_url), headers=headers,
@@ -1220,31 +1225,31 @@ class LLMNode(LifecycleNode):
             models = [m['id'] for m in r.json().get('data', [])]
             model_base = model.split(':')[0]
             if any(model_base in m for m in models):
-                self.get_logger().info(f'  {chat_url}: модель {model} найдена')
+                self.get_logger().info(f'  {chat_url}: model {model} found')
             else:
                 self.get_logger().warn(
-                    f'  {chat_url}: модель {model} не найдена среди {models}')
+                    f'  {chat_url}: model {model} not found among {models}')
             return True
         except Exception:
             return False
 
-    # ── Стриминг LLM → TTS ────────────────────────────────────────────────
+    # ── LLM → TTS streaming ──────────────────────────────────────────────
 
     @staticmethod
     def _iter_sse_chunks(resp: requests.Response):
         """
-        Читает OpenAI/vLLM SSE-стрим (`data: {...}` построчно, конец — `data: [DONE]`).
-        tool_calls приходят фрагментами по чанкам (id/name отдельно от arguments,
-        arguments — по несколько символов за чанк, все привязаны к одному и тому же
-        index) — аккумулируем и отдаём наружу единым разом только когда поток
-        завершён (иначе вызывающий код получил бы недо-собранный JSON в arguments).
-        Финал стрима — отдельный чанк с пустым choices и заполненным usage
-        (из-за stream_options.include_usage), ПОСЛЕ чанка с finish_reason —
-        именно по нему считаем поток done для лог-статистики токенов.
+        Reads the OpenAI/vLLM SSE stream (`data: {...}` line by line, ends with `data: [DONE]`).
+        tool_calls arrive in fragments across chunks (id/name separate from arguments,
+        arguments — a few characters per chunk, all tied to the same
+        index) — we accumulate them and hand them out as a single unit only once the
+        stream is done (otherwise the calling code would get a half-assembled JSON in arguments).
+        The end of the stream is a separate chunk with empty choices and a filled-in usage
+        (because of stream_options.include_usage), AFTER the chunk with finish_reason —
+        that's the one we use to consider the stream done for token log statistics.
         Yields (delta_content, done, tool_calls, raw_line, log_chunk, ttft_signal).
-        ttft_signal=True на первом реальном токене активности (текст ИЛИ первый
-        фрагмент tool_call) — т.к. сами tool_calls копятся и отдаются только в
-        done-чанке, одного `tc` недостаточно для точного TTFT (см. ниже).
+        ttft_signal=True on the first real token of activity (text OR the first
+        tool_call fragment) — since the tool_calls themselves accumulate and are only
+        handed out in the done-chunk, `tc` alone isn't enough for an accurate TTFT (see below).
         """
         tc_acc: dict[int, dict] = {}
         for line in resp.iter_lines():
@@ -1259,7 +1264,7 @@ class LLMNode(LifecycleNode):
                 continue
             choices = chunk.get('choices') or []
             if not choices:
-                # Финальный usage-чанк (пустой choices) — конец потока.
+                # The final usage chunk (empty choices) — end of the stream.
                 if chunk.get('usage'):
                     yield '', True, [dict(v) for v in tc_acc.values()], line, chunk, False
                 continue
@@ -1269,9 +1274,9 @@ class LLMNode(LifecycleNode):
                 idx = tcd.get('index', 0)
                 if idx not in tc_acc:
                     first_tc_fragment = True
-                    # id обычно приходит только в первом фрагменте этого index —
-                    # сохраняем сразу; _normalize_tool_calls подставит синтетический,
-                    # если сервер id не прислал (нужен для истории — см. её докстринг).
+                    # id usually only arrives in the first fragment of this index —
+                    # save it right away; _normalize_tool_calls will substitute a synthetic one
+                    # if the server didn't send one (needed for history — see its docstring).
                     tc_acc[idx] = {'id': tcd.get('id') or '',
                                    'function': {'name': '', 'arguments': ''}}
                 slot = tc_acc[idx]
@@ -1286,26 +1291,26 @@ class LLMNode(LifecycleNode):
             if content:
                 yield content, False, [], line, chunk, True
             elif first_tc_fragment:
-                # tool_calls собираются целиком и отдаются только в done-чанке (см.
-                # докстринг), но первый фрагмент — реальный момент первого токена:
-                # шлём пустой "пинг" (tc=[], ttft_signal=True) — иначе TTFT в
-                # _stream_llm залогируется как "время до конца генерации".
+                # tool_calls are assembled in full and only handed out in the done chunk (see
+                # the docstring), but the first fragment is the real moment of the first token:
+                # send an empty "ping" (tc=[], ttft_signal=True) — otherwise the TTFT in
+                # _stream_llm would be logged as "time to the end of generation".
                 yield '', False, [], line, chunk, True
-        # Соединение закрылось без финального usage-чанка (сервер не прислал
-        # include_usage, либо оборвался) — отдаём то, что успели собрать.
+        # The connection closed without a final usage chunk (the server didn't send
+        # include_usage, or it dropped) — hand out whatever we managed to collect.
         if tc_acc:
             yield '', True, [dict(v) for v in tc_acc.values()], b'', {}, False
 
     def _stream_llm(self, payload: dict, read_timeout: float):
         """
-        Стримит ответ LLM через OpenAI chat.completions (stream=True).
-        Yields (delta, done, api_tool_calls). При ошибке соединения пробует
-        резервный сервер.
+        Streams the LLM's response via OpenAI chat.completions (stream=True).
+        Yields (delta, done, api_tool_calls). On a connection error, tries the
+        fallback server.
 
-        `payload` — уже готовое тело OpenAI-запроса (model/messages/tools/
-        temperature/max_tokens/chat_template_kwargs), собранное вызывающим
-        кодом; здесь только форсируется stream=True и добавляется
-        stream_options для usage-статистики в done-чанке.
+        `payload` — the already-built body of the OpenAI request (model/messages/tools/
+        temperature/max_tokens/chat_template_kwargs), assembled by the calling
+        code; here we only force stream=True and add
+        stream_options for usage statistics in the done chunk.
         """
         payload = dict(payload)
         payload['stream'] = True
@@ -1326,7 +1331,7 @@ class LLMNode(LifecycleNode):
                     self._active_url = url
                     payload = dict(payload)
                     payload['model'] = self.model
-                    self.get_logger().warn(f'Стриминг: переключился на резервный сервер: {url}')
+                    self.get_logger().warn(f'Streaming: switched to the fallback server: {url}')
 
                 bearer  = (self.bearer_token if url == self.llm_url
                            else self.bearer_token_fallback)
@@ -1379,12 +1384,12 @@ class LLMNode(LifecycleNode):
                         try:
                             shutil.copy2(_DBG_LAST, _DBG_ERROR)
                             self.get_logger().warn(
-                                f'Payload ошибки сохранён: {_DBG_ERROR}')
+                                f'Error payload saved: {_DBG_ERROR}')
                         except OSError:
                             pass
                 return
             except requests.exceptions.ConnectionError as e:
-                self.get_logger().warn(f'LLM stream {url} недоступен: {e}')
+                self.get_logger().warn(f'LLM stream {url} unavailable: {e}')
                 last_exc = e
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 0
@@ -1395,36 +1400,36 @@ class LLMNode(LifecycleNode):
                     try:
                         shutil.copy2(_DBG_LAST, _DBG_ERROR)
                         self.get_logger().warn(
-                            f'LLM stream HTTP {status}: payload сохранён в {_DBG_ERROR}')
+                            f'LLM stream HTTP {status}: payload saved to {_DBG_ERROR}')
                     except OSError:
                         pass
                     raise
         raise requests.exceptions.ConnectionError(
-            'Оба LLM сервера недоступны') from last_exc
+            'Both LLM servers unavailable') from last_exc
 
     def _send_tts_chunk(self, text: str, voice_style: str = '') -> None:
-        """Отправляет блок текста (одно-два предложения, см. _TTS_CHUNK_*)
-        в tts_node как отдельный Speak-goal, либо в Telegram (в TG-режиме)."""
+        """Sends a block of text (one or two sentences, see _TTS_CHUNK_*)
+        to tts_node as a separate Speak goal, or to Telegram (in TG mode)."""
         text = text.strip()
         if not text:
             return
         with self._lock:
             tg_req_id = self._tg_req_id
         if tg_req_id:
-            # TG-режим: вместо TTS стримим текст обратно в Telegram
+            # TG mode: instead of TTS, stream the text back into Telegram
             self._tg_stream_partial(text, tg_req_id)
             return
         if not self._tts_direct_client.wait_for_server(timeout_sec=0.5):
-            self.get_logger().warn('TTS server недоступен для стриминг-чанка')
+            self.get_logger().warn('TTS server unavailable for a streaming chunk')
             return
         goal = Speak.Goal()
         goal.text  = text
         goal.voice = voice_style
         self._tts_direct_client.send_goal_async(goal)
-        self.get_logger().debug(f'TTS чанк: "{text[:50]}"')
+        self.get_logger().debug(f'TTS chunk: "{text[:50]}"')
 
     def _tg_stream_partial(self, text: str, tg_req_id: str) -> None:
-        """Публикует частичный текст в /telegram_response (partial=True)."""
+        """Publishes a partial text to /telegram_response (partial=True)."""
         msg = String()
         msg.data = json.dumps(
             {'request_id': tg_req_id, 'text': text, 'partial': True},
@@ -1435,12 +1440,12 @@ class LLMNode(LifecycleNode):
 
     def _stream_with_tts(self, payload: dict) -> tuple[str, list]:
         """
-        Стримит ответ LLM и озвучивает по мере готовности через action 'speak'
-        (POST /tts/stream на TTS-сервере, см. MIGRATION_NOTES.md — OmniVoice
-        не предоставляет WS bistream, поэтому один Speak-goal на блок текста,
-        а не один WS-сеанс на весь ответ).
-        Возвращает (полный_контент, api_tool_calls).
-        При обнаружении маркера tool call прекращает отправку в TTS.
+        Streams the LLM's response and speaks it as it becomes ready via the 'speak'
+        action (POST /tts/stream on the TTS server, see MIGRATION_NOTES.md — OmniVoice
+        does not provide a WS bistream, hence one Speak goal per text block,
+        rather than one WS session for the whole response).
+        Returns (full_content, api_tool_calls).
+        Stops sending to TTS once a tool-call marker is detected.
         """
         with self._lock:
             voice_style = self._voice_style.get('emotion', '')
@@ -1451,15 +1456,15 @@ class LLMNode(LifecycleNode):
         api_tool_calls: list      = []
         tool_call_detected        = False
         first_chunk_sent          = False
-        chunk_buf: list[str]      = []  # предложения, ждущие отправки одним TTS-запросом
+        chunk_buf: list[str]      = []  # sentences waiting to be sent as one TTS request
         chunk_chars                = 0
 
         def _flush_chunk(force: bool = False):
-            """Отправляет накопленный блок как один Speak-goal.
-            По умолчанию ждёт _TTS_CHUNK_MIN_CHARS или _TTS_CHUNK_MAX_SENTENCES —
-            OmniVoice звучит менее стабильно на очень коротких изолированных
-            фразах (см. MIGRATION_NOTES.md), поэтому не шлём по одному
-            предложению за раз. force=True — конец ответа, шлём остаток как есть."""
+            """Sends the accumulated block as a single Speak goal.
+            By default waits for _TTS_CHUNK_MIN_CHARS or _TTS_CHUNK_MAX_SENTENCES —
+            OmniVoice sounds less stable on very short isolated
+            phrases (see MIGRATION_NOTES.md), so we don't send one
+            sentence at a time. force=True — end of the response, send the rest as-is."""
             nonlocal chunk_buf, chunk_chars
             if not chunk_buf:
                 return
@@ -1488,11 +1493,11 @@ class LLMNode(LifecycleNode):
                     detected = bool(_TOOL_CALL_AE_RE.search(buf))
                 if detected:
                     tool_call_detected = True
-                    # Уже собранные, но не отправленные предложения — отбрасываем,
-                    # они не должны звучать (относятся к части ответа с tool call).
+                    # Already-collected but not-yet-sent sentences — discard them,
+                    # they must not be spoken (they belong to the part of the response with the tool call).
                     chunk_buf   = []
                     chunk_chars = 0
-                    self.get_logger().debug('Стриминг: tool call — TTS остановлен')
+                    self.get_logger().debug('Streaming: tool call — TTS stopped')
 
             if not tool_call_detected:
                 while True:
@@ -1505,7 +1510,7 @@ class LLMNode(LifecycleNode):
                         if sentence:
                             if not first_chunk_sent and _ECHO_QUESTION_RE.match(sentence):
                                 self.get_logger().warn(
-                                    f'Фильтр эхо-вопроса: отброшено "{sentence[:60]}"')
+                                    f'Echo-question filter: dropped "{sentence[:60]}"')
                             elif tg_req_id:
                                 self._tg_stream_partial(sentence, tg_req_id)
                             else:
@@ -1516,23 +1521,23 @@ class LLMNode(LifecycleNode):
                     else:
                         break
 
-        # Хвост: отправить остаток если нет tool calls.
-        # NOTE: при stream:False цикл выше сразу делает break (done=True), поэтому
-        #   tool_call_detected всегда False и api_tool_calls — единственный сигнал наличия
-        #   API tool calls. Текстовые tool calls (ᐈ/xml формат) попадают сюда же.
+        # Tail: send the remainder if there are no tool calls.
+        # NOTE: with stream:False the loop above breaks immediately (done=True), so
+        #   tool_call_detected is always False and api_tool_calls is the only signal of
+        #   API tool calls. Text tool calls (ᐈ/xml format) end up here too.
         if buf.strip() and (not tool_call_detected or tg_req_id) and not api_tool_calls:
             tail = buf.strip()
             has_text_tool_call = bool(
                 _TEXT_TOOL_CALL_RE.search(tail) or _TOOLS_BLOCK_RE.search(tail)
             )
             if has_text_tool_call:
-                self.get_logger().debug('Хвост содержит text tool call — не отправляем в TTS/TG')
+                self.get_logger().debug('Tail contains a text tool call — not sending to TTS/TG')
             else:
                 if not first_chunk_sent and _ECHO_QUESTION_RE.match(tail):
                     m_end = _ECHO_QUESTION_RE.match(tail).end()
                     tail = tail[m_end:].strip()
                     self.get_logger().warn(
-                        f'Фильтр эхо-вопроса: отброшено "{buf.strip()[:m_end][:60]}"')
+                        f'Echo-question filter: dropped "{buf.strip()[:m_end][:60]}"')
                 if tail:
                     if tg_req_id:
                         self._tg_stream_partial(tail, tg_req_id)
@@ -1540,41 +1545,41 @@ class LLMNode(LifecycleNode):
                         chunk_buf.append(tail)
                         chunk_chars += len(tail)
 
-        # Финальный флаш: то, что осталось в буфере, отправляем как есть,
-        # даже если оно короче обычного порога (это конец ответа, ждать нечего).
+        # Final flush: whatever is left in the buffer is sent as-is,
+        # even if it's shorter than the usual threshold (this is the end of the response, nothing to wait for).
         _flush_chunk(force=True)
 
         return ''.join(content_parts), api_tool_calls
 
-    # ── Приём голосовой команды ────────────────────────────────────────────
+    # ── Receiving a voice command ───────────────────────────────────────
 
     def _memory_context_cb(self, msg: String):
-        """Получает рабочую память + эпизоды от memory_node для вставки в system prompt.
+        """Receives working memory + episodes from memory_node for insertion into the system prompt.
 
-        Сохраняем всегда (рабочая память — время/место/режим — нужна в контексте
-        независимо от того, известен ли собеседник). Персональные эпизоды
-        отрезаются в _query_llm, если person_id ещё не определён.
+        Always saved (working memory — time/place/mode — is needed in the context
+        regardless of whether the interlocutor is known). Personal episodes
+        are cut off in _query_llm if person_id is not yet determined.
         """
         with self._lock:
             self._memory_context = msg.data
 
     def _introducing_cb(self, msg: Bool):
-        """Гейт: когда True — identity_manager собирает имя, мы не обрабатываем команды."""
+        """Gate: when True — identity_manager is collecting the name, we don't process commands."""
         with self._lock:
             self._introducing = msg.data
         if msg.data:
-            self.get_logger().info('LLM: режим знакомства — voice_command заблокирован')
+            self.get_logger().info('LLM: introduction mode — voice_command blocked')
         else:
-            self.get_logger().info('LLM: режим знакомства завершён — ready')
+            self.get_logger().info('LLM: introduction mode finished — ready')
 
     def _go_idle_cb(self, msg: Bool):
-        """Явное прощание: полный сброс LLM-контекста.
+        """Explicit farewell: a full reset of the LLM context.
 
-        _person_context_callback тоже опубликует conversation_end когда получит
-        пустой контекст от identity_manager, но к тому моменту история уже пустая —
-        двойной публикации не будет. _memory_context не трогаем — рабочая память
-        (время/место/режим) должна оставаться в контексте даже без собеседника;
-        персональные эпизоды отрезаются в _query_llm по person_id.
+        _person_context_callback will also publish conversation_end when it receives
+        an empty context from identity_manager, but by then the history is already
+        empty — there won't be a double publish. We don't touch _memory_context — working
+        memory (time/place/mode) must stay in context even without an interlocutor;
+        personal episodes are cut off in _query_llm by person_id.
         """
         if not msg.data:
             return
@@ -1587,59 +1592,59 @@ class LLMNode(LifecycleNode):
             self._person_context  = None
         if history_snapshot:
             self._publish_conversation_end(history_snapshot, person_ctx)
-        self.get_logger().info('go_idle: LLM контекст очищен (история, person_context, memory)')
+        self.get_logger().info('go_idle: LLM context cleared (history, person_context, memory)')
 
     def _robot_sleep_cb(self, msg: Bool):
-        """Сбрасываем историю диалога при входе/выходе из спящего режима."""
+        """Resets the dialogue history on entering/leaving sleep mode."""
         with self._lock:
             history_snapshot = self.history[:]
             person_ctx       = self._person_context
             if self.history:
                 self.get_logger().info(
-                    f'robot_sleep={msg.data} — сброс истории ({len(self.history)} сообщ.)')
+                    f'robot_sleep={msg.data} — history reset ({len(self.history)} msgs)')
             self.history          = []
             self._dialogue_lines  = []
             self._voice_style     = {'emotion': ''}
-            # Страховка: если /introducing застрял True (identity_manager перешёл
-            # в сон из State.INTRODUCING до своего фикса, либо был перезапущен и
-            # не переслал False) — сон обязан снимать гейт сам, иначе telegram_ask
-            # и voice_command будут вечно отвечать "занят", даже во сне.
+            # Safety net: if /introducing got stuck True (identity_manager went
+            # to sleep from State.INTRODUCING before its fix, or was restarted and
+            # didn't resend False) — sleep must lift the gate itself, otherwise telegram_ask
+            # and voice_command would forever reply "busy", even while asleep.
             if msg.data and self._introducing:
                 self.get_logger().warn(
-                    'robot_sleep=True при /introducing=True — гейт снят принудительно')
+                    'robot_sleep=True while /introducing=True — gate forcibly lifted')
                 self._introducing = False
-        # При засыпании — публикуем завершение диалога (если было что-то)
+        # On falling asleep — publish the end of the dialogue (if there was one)
         if msg.data and history_snapshot:
             self._publish_conversation_end(history_snapshot, person_ctx)
 
-    # Варианты имени робота, которые Whisper может распознать (в нижнем регистре).
-    # Если фраза начинается с одного из этих слов — считаем её адресованной роботу
-    # независимо от направления взгляда.
+    # Robot-name variants that Whisper might recognize (lowercase).
+    # If the phrase starts with one of these words — consider it addressed to the robot
+    # regardless of gaze direction.
     _ROBOT_NAMES = frozenset({
         'лёня', 'леня', 'лена', 'лёне', 'лене', 'лёню', 'леню', 'лёной',
         'лёнечка', 'ленечка', 'лёнь', 'лёней', 'леней',
-        'эй',  # "Эй, Лёня" — первое слово достаточно
+        'эй',  # "Эй, Лёня" ("Hey, Lyonya") — the first word is enough
     })
 
     def _addressed_to_robot(self, text: str) -> bool:
-        """True если текст адресован роботу: смотрит в глаза ИЛИ начинается с имени.
+        """True if the text is addressed to the robot: looking it in the eye OR starts with its name.
 
-        Gate отключён только когда нет активного диалога (person_present=False) —
-        это команды после wake word без человека в кадре, имя там не ожидается.
-        Если человек в кадре (present=True), но looking_at_robot=None (трекер не
-        дал данных о взгляде) — это НЕ повод пропускать всё подряд: считаем как
-        looking=False и требуем имя в начале фразы.
+        The gate is disabled only when there is no active dialogue (person_present=False) —
+        those are commands after the wake word with no person in frame, no name is expected there.
+        If a person is in frame (present=True) but looking_at_robot=None (the tracker gave
+        no gaze data) — that is NOT a reason to let everything through: we treat it as
+        looking=False and require the name at the start of the phrase.
         """
         with self._lock:
             looking = self._looking_at_robot
             present = self._person_present_in_ctx
 
-        # Нет активного диалога (никого в кадре) → не фильтруем
+        # No active dialogue (nobody in frame) → don't filter
         if not present:
             return True
         if looking:
             return True
-        # Не смотрит в камеру или нет данных о взгляде — проверяем имя (первые 3 слова)
+        # Not looking at the camera or no gaze data — check the name (first 3 words)
         first_words = {w.strip('.,!?-—') for w in text.lower().split()[:3]}
         if first_words & self._ROBOT_NAMES:
             return True
@@ -1648,19 +1653,19 @@ class LLMNode(LifecycleNode):
     def command_callback(self, msg: String):
         text = msg.data.strip()
         if not text:
-            return  # voice_detector публикует пустую строку при тишине — игнорируем
+            return  # voice_detector publishes an empty string on silence — ignore it
 
-        # Фильтр адресности: если человек не смотрит на робота и имя не произнесено — игнор.
-        # Выполняется до лока: _addressed_to_robot имеет собственную блокировку.
+        # Addressee filter: if the person isn't looking at the robot and the name wasn't spoken — ignore.
+        # Runs before the lock: _addressed_to_robot has its own lock.
         if not self._addressed_to_robot(text):
             self.get_logger().info(
-                f'LLM: речь не адресована роботу (gaze=False) — пропускаю: "{text[:60]}"')
+                f'LLM: speech not addressed to the robot (gaze=False) — skipping: "{text[:60]}"')
             return
 
-        # Разбор голосовой подсказки направления — независимо от и до LLM-запроса
-        # (не блокирует/не замедляет ответ). Публикуется на КАЖДОЙ адресованной
-        # реплике (даже direction='none') — это одновременно и подсказка, и
-        # триггер "реплика произошла" для face-search retry в behavior_manager_node.
+        # Parsing the voice direction hint — independent of, and before, the LLM request
+        # (doesn't block/slow down the response). Published on EVERY addressed
+        # utterance (even direction='none') — this is both a hint and the
+        # "an utterance happened" trigger for face-search retry in behavior_manager_node.
         direction, phrase = _parse_direction_hint(text)
         hint_msg = String()
         hint_msg.data = json.dumps(
@@ -1669,13 +1674,13 @@ class LLMNode(LifecycleNode):
 
         with self._lock:
             if self._introducing:
-                self.get_logger().debug('LLM: /introducing=True — команда проигнорирована')
+                self.get_logger().debug('LLM: /introducing=True — command ignored')
                 return
             if self._processing:
-                self.get_logger().warn('LLM занята — команда пропущена')
+                self.get_logger().warn('LLM is busy — command skipped')
                 return
             self._processing = True
-        # Отменяем все ещё воспроизводящиеся/ожидающие TTS чанки предыдущего ответа
+        # Cancel any TTS chunks of the previous response still playing/pending
         _cancel = Bool()
         _cancel.data = True
         self._tts_cancel_pub.publish(_cancel)
@@ -1684,18 +1689,18 @@ class LLMNode(LifecycleNode):
         ).start()
 
     def _telegram_ask_cb(self, msg: String):
-        """Запрос от telegram_bridge_node: JSON {request_id, text, person_ctx?, image_base64?}.
+        """Request from telegram_bridge_node: JSON {request_id, text, person_ctx?, image_base64?}.
 
-        Использует тот же _query_llm пайплайн что и voice_command — все tool calls,
-        память и контекст SmartHome работают. person_ctx инжектируется из Telegram-профиля.
-        image_base64 (опционально) — фото, присланное пользователем в Telegram;
-        уходит в LLM только текущим ходом (см. _build_user_content/_query_llm),
-        в self.history остаётся текстовый плейсхолдер.
+        Uses the same _query_llm pipeline as voice_command — all tool calls,
+        memory and SmartHome context work. person_ctx is injected from the Telegram profile.
+        image_base64 (optional) — a photo sent by the user in Telegram;
+        it only goes to the LLM on the current turn (see _build_user_content/_query_llm),
+        self.history keeps a text placeholder.
         """
         try:
             data = json.loads(msg.data)
         except json.JSONDecodeError as e:
-            self.get_logger().warn(f'telegram_ask: невалидный JSON: {e}')
+            self.get_logger().warn(f'telegram_ask: invalid JSON: {e}')
             return
         req_id     = data.get('request_id', '').strip()
         text       = data.get('text', '').strip()
@@ -1715,7 +1720,7 @@ class LLMNode(LifecycleNode):
                     {'request_id': req_id, 'text': '__busy__'}, ensure_ascii=False)
                 self._tg_resp_pub.publish(busy)
                 self.get_logger().info(
-                    f'telegram_ask: LLM занята — req_id={req_id[:8]}')
+                    f'telegram_ask: LLM is busy — req_id={req_id[:8]}')
                 return
             self._processing = True
             self._tg_req_id  = req_id
@@ -1728,9 +1733,9 @@ class LLMNode(LifecycleNode):
         ).start()
         self.get_logger().info(
             f'telegram_ask: req_id={req_id[:8]}, text="{text[:60]}"'
-            + (f', +фото ({len(image_b64)} b64 chars)' if image_b64 else ''))
+            + (f', +photo ({len(image_b64)} b64 chars)' if image_b64 else ''))
 
-    # ── Основной запрос к LLM ───────────────────────────────────────────────
+    # ── Main LLM request ────────────────────────────────────────────────
 
     def _query_llm(self, user_text: str, person_ctx_override: dict | None = None,
                     image_b64: str | None = None):
@@ -1743,9 +1748,9 @@ class LLMNode(LifecycleNode):
                     else self._person_context
                 )
                 oh_schema         = self._oh_schema
-                # Рабочая память (время/место/режим) — всегда в контексте.
-                # Эпизодическая (личная история собеседника) — только при известном
-                # person_id, иначе раскрыла бы имя/факты до идентификации человека.
+                # Working memory (time/place/mode) — always in context.
+                # Episodic (the interlocutor's personal history) — only when
+                # person_id is known, otherwise it would reveal name/facts before identification.
                 _pid = (person_ctx or {}).get('person_id')
                 memory_context    = (self._memory_context if _pid is not None
                                       else _strip_episodic_memory(self._memory_context))
@@ -1758,15 +1763,15 @@ class LLMNode(LifecycleNode):
                 _scene_age = time.time() - scene_ctx.get('updated_at', 0)
                 _scene_labels = [o['label'] for o in scene_ctx.get('objects', [])]
                 self.get_logger().info(
-                    f'Scene context для этого хода: person_count={scene_ctx.get("person_count")}, '
-                    f'objects={_scene_labels}, age={_scene_age:.1f}с')
+                    f'Scene context for this turn: person_count={scene_ctx.get("person_count")}, '
+                    f'objects={_scene_labels}, age={_scene_age:.1f}s')
             else:
                 self.get_logger().info(
-                    'Scene context для этого хода: пусто (scene_manager_node не отвечает?)')
+                    'Scene context for this turn: empty (scene_manager_node not responding?)')
 
             self.history.append({'role': 'user', 'content': user_text})
-            # Обрезаем историю: считаем user-сообщения как ходы (не сырые записи).
-            # Один ход с tool call = 3-4 записи, поэтому raw count неверен.
+            # Trim the history: count user messages as turns (not raw entries).
+            # One turn with a tool call = 3-4 entries, so a raw count would be wrong.
             while sum(1 for m in self.history if m['role'] == 'user') > self.history_max:
                 self.history.pop(0)
                 while self.history and self.history[0]['role'] != 'user':
@@ -1776,9 +1781,9 @@ class LLMNode(LifecycleNode):
             messages += self.history if self.keep_history else \
                         [{'role': 'user', 'content': user_text}]
             if image_b64:
-                # self.history хранит текстовый плейсхолдер (см. append выше) —
-                # картинка подставляется только в исходящий messages, последним
-                # user-сообщением всегда является именно этот ход.
+                # self.history holds a text placeholder (see the append above) —
+                # the image is only substituted into the outgoing messages; the last
+                # user message is always this very turn.
                 messages[-1] = {**messages[-1],
                                  'content': _build_user_content(user_text, image_b64)}
 
@@ -1799,35 +1804,35 @@ class LLMNode(LifecycleNode):
                 'tool_calls': api_tool_calls_r1,
             }
 
-            # ── Обработка tool calls ───────────────────────────────────────
+            # ── Handling tool calls ──────────────────────────────────────────
             tool_calls = response_msg.get('tool_calls', [])
-            # Fallback: Qwen3 иногда эмитирует tool calls текстом в content
+            # Fallback: Qwen3 sometimes emits tool calls as text in content
             if not tool_calls:
                 content_text = response_msg.get('content', '')
                 tool_calls = _extract_text_tool_calls(content_text)
                 if tool_calls:
                     self.get_logger().info(
-                        f'Fallback: извлечено {len(tool_calls)} tool call(s) из текста')
+                        f'Fallback: extracted {len(tool_calls)} tool call(s) from text')
             if tool_calls:
-                # id/type обязательны у каждого tool call, когда это сообщение
-                # попадёт в self.history и уедет в следующем запросе (см.
-                # докстринг _normalize_tool_calls). Тем же вызовом чиним и
-                # response_msg['tool_calls'] на случай текстового fallback выше —
-                # иначе в history попал бы assistant с пустыми tool_calls
-                # прямо перед tool-результатами.
+                # id/type are mandatory on every tool call once this message
+                # ends up in self.history and goes out in the next request (see
+                # the _normalize_tool_calls docstring). The same call also fixes
+                # response_msg['tool_calls'] in case of the text fallback above —
+                # otherwise an assistant with empty tool_calls would end up in
+                # history right before the tool results.
                 tool_calls = _normalize_tool_calls(tool_calls)
                 response_msg['tool_calls'] = tool_calls
                 self.history.append(response_msg)
 
                 tool_results    = []
-                speak_texts     = []   # speak_text из аргументов action-инструментов
-                needs_llm_reply = False  # True если инструмент возвращает данные (запрос)
-                any_tool_failed = False  # True если хотя бы один tool вернул success:False
+                speak_texts     = []   # speak_text from the arguments of action tools
+                needs_llm_reply = False  # True if a tool returns data (a query)
+                any_tool_failed = False  # True if at least one tool returned success:False
 
-                # ── Параллельное выполнение tool calls ────────────────────────────
-                # Мета-инструмент (set_voice_style) мгновенен;
-                # HTTP-инструменты (items_control × N, get_weather) могут идти
-                # одновременно — экономит время при N > 1 action-инструментах.
+                # ── Running tool calls in parallel ──────────────────────────────
+                # The meta tool (set_voice_style) is instant;
+                # HTTP tools (items_control × N, get_weather) can run
+                # simultaneously — saves time when there is more than 1 action tool.
                 _QUERY_FNS = frozenset(('get_openhab_states', 'search_openhab_items',
                                         'web_search', 'get_weather', 'search_memory',
                                         'look_and_describe', 'look_direction'))
@@ -1838,7 +1843,7 @@ class LLMNode(LifecycleNode):
                     if isinstance(args, str):
                         args = json.loads(args)
                     args = dict(args)
-                    st   = args.pop('speak_text', None)  # мета-параметр TTS
+                    st   = args.pop('speak_text', None)  # TTS meta-parameter
                     self.get_logger().info(f'Tool call: {fn}({args})')
                     res  = self._execute_tool(fn, args)
                     self.get_logger().info(f'Tool result: {res}')
@@ -1848,7 +1853,7 @@ class LLMNode(LifecycleNode):
                     max_workers=min(len(tool_calls), 4),
                     thread_name_prefix='llm_tc',
                 ) as _pool:
-                    # Результаты в оригинальном порядке tool_calls
+                    # Results in the original order of tool_calls
                     _tc_results = list(_pool.map(_exec_one, tool_calls))
 
                 for fn_name, speak_text, result, tc_id in _tc_results:
@@ -1866,25 +1871,25 @@ class LLMNode(LifecycleNode):
 
                 self.history.extend(tool_results)
 
-                # Дедупликация: LLM может дать одинаковый speak_text нескольким tool calls
-                # (например, items_control для Dimmer + Color одной комнаты).
+                # Deduplication: the LLM may give the same speak_text to several tool calls
+                # (e.g. items_control for a Dimmer + Color of the same room).
                 _seen: set = set()
                 speak_texts = [st for st in speak_texts
                                if not (_seen.__contains__(st) or _seen.add(st))]
 
-                # Инструменты, за которые BT сам произносит текст (через robot_events).
-                # R2 для них не нужен — он создаёт дублирующую речь и повторные Speak goals.
+                # Tools for which the BT itself speaks the text (via robot_events).
+                # R2 isn't needed for them — it creates duplicate speech and repeated Speak goals.
                 _BT_SPEECH_TOOLS = frozenset({'robot_control', 'broadcast_message'})
                 any_bt_speech_tool = any(
                     tc['function']['name'] in _BT_SPEECH_TOOLS for tc in tool_calls
                 )
 
                 if speak_texts and not needs_llm_reply and not any_tool_failed:
-                    # Все инструменты успешны, LLM уже написал ответ — второй запрос не нужен
+                    # All tools succeeded, the LLM already wrote a reply — no second request needed
                     final_text = ' '.join(speak_texts)
                     self.history.append({'role': 'assistant', 'content': final_text})
                     self.get_logger().info(
-                        f'Ответ из speak_text за {time.time()-_t0:.1f}с: "{final_text}"')
+                        f'Reply from speak_text in {time.time()-_t0:.1f}s: "{final_text}"')
                     with self._lock:
                         _vs = self._voice_style.get('emotion', '')
                         _tg = self._tg_req_id
@@ -1895,29 +1900,29 @@ class LLMNode(LifecycleNode):
                         self._send_tts_chunk(final_text, _vs)
                     self._publish_response('', streamed=True)
                 elif any_bt_speech_tool and not needs_llm_reply and not any_tool_failed:
-                    # BT обрабатывает речь через robot_events — R2 не нужен.
-                    # _publish_response НЕ вызываем: иначе person_present=True вызовет
-                    # повторный тик BT и второй Speak goal.
-                    # Если инструмент упал (any_tool_failed=True) — падаем в else → R2 с ошибкой.
+                    # The BT handles speech via robot_events — R2 not needed.
+                    # We do NOT call _publish_response: otherwise person_present=True would trigger
+                    # another BT tick and a second Speak goal.
+                    # If a tool failed (any_tool_failed=True) — fall through to else → R2 with the error.
                     self.get_logger().info(
-                        f'robot_control/broadcast_message: пропускаем R2 — '
-                        f'BT обрабатывает речь ({time.time()-_t0:.1f}с)')
+                        f'robot_control/broadcast_message: skipping R2 — '
+                        f'the BT handles speech ({time.time()-_t0:.1f}s)')
                 else:
-                    # Инструменты вернули данные — нужен LLM для формирования ответа
-                    # web_search убран из tools: если поиск уже выполнен (успешно или нет),
-                    # повторная попытка не нужна — LLM должен сформировать текстовый ответ
-                    # В R2 только мета-инструменты: установка эмоции/голоса.
-                    # Action-инструменты (save_memory, items_control, robot_control,
-                    # get_weather, web_search) в R2 недопустимы — там нет новых данных
-                    # от пользователя, LLM будет их галлюцинировать.
-                    # items_control включён: после search_openhab_items в R1 LLM должен
-                    # уметь вызвать его в R2 через правильный tool call API.
+                    # The tools returned data — the LLM is needed to form the reply.
+                    # web_search removed from tools: if the search already ran (successfully or
+                    # not), retrying is not needed — the LLM should form a text reply.
+                    # Only meta tools in R2: setting emotion/voice.
+                    # Action tools (save_memory, items_control, robot_control,
+                    # get_weather, web_search) are not allowed in R2 — there is no new data
+                    # from the user there, the LLM would hallucinate them.
+                    # items_control is included: after search_openhab_items in R1 the LLM must
+                    # be able to call it in R2 via a proper tool-call API.
                     tools_r2 = [t for t in TOOLS
                                 if t['function']['name'] in (
                                     'set_voice_style', 'items_control')]
-                    # Инъекция краткого напоминания прямо перед финальным ответом:
-                    # LLM должен ответить на конкретный вопрос пользователя,
-                    # а не пересказывать все поля из результата инструмента.
+                    # Injecting a brief reminder right before the final answer:
+                    # the LLM must answer the user's specific question,
+                    # not recount every field from the tool result.
                     _r2_reminder = (
                         'ОБЯЗАТЕЛЬНО дай короткий разговорный ответ пользователю — 1-2 предложения. '
                         'Не начинай ответ с повтора или перефразировки вопроса — отвечай сразу по существу. '
@@ -1942,24 +1947,24 @@ class LLMNode(LifecycleNode):
                     resp2 = {'role': 'assistant',
                              'content': r2_content, 'tool_calls': api_tc_r2}
 
-                    # Проверяем tool calls во втором ответе (proper API или текстовый формат)
+                    # Check for tool calls in the second response (proper API or text format)
                     tool_calls2 = resp2.get('tool_calls', [])
                     if not tool_calls2:
                         c2 = resp2.get('content', '')
                         tool_calls2 = _extract_text_tool_calls(c2)
                         if tool_calls2:
                             self.get_logger().info(
-                                f'Fallback R2: {len(tool_calls2)} tool call(s) из текста')
+                                f'Fallback R2: {len(tool_calls2)} tool call(s) from text')
 
                     _R2_ALLOWED = frozenset(
                         ('set_voice_style', 'items_control'))
 
                     if tool_calls2:
-                        # Выполняем только мета-инструменты и items_control.
-                        # Собираем speak_text: если R2 вызвал set_voice_style только с speak_text
-                        # и без content — используем speak_text напрямую, без R3.
-                        # id/type + пара 'tool' сообщений на каждый tool_call обязательны —
-                        # см. докстринг _normalize_tool_calls и R1 выше (тот же класс бага).
+                        # Only run the meta tools and items_control.
+                        # Collect speak_text: if R2 called set_voice_style with only speak_text
+                        # and no content — use speak_text directly, without R3.
+                        # id/type + a pair of 'tool' messages for every tool_call are mandatory —
+                        # see the _normalize_tool_calls docstring and R1 above (same class of bug).
                         tool_calls2 = _normalize_tool_calls(tool_calls2)
                         resp2['tool_calls'] = tool_calls2
                         self.history.append(resp2)
@@ -1969,7 +1974,7 @@ class LLMNode(LifecycleNode):
                             fn2   = tc['function']['name']
                             if fn2 not in _R2_ALLOWED:
                                 self.get_logger().warn(
-                                    f'R2 text-fallback: пропускаем запрещённый инструмент {fn2}')
+                                    f'R2 text-fallback: skipping disallowed tool {fn2}')
                                 _tool_results2.append({
                                     'role': 'tool', 'tool_call_id': tc['id'],
                                     'content': json.dumps(
@@ -1991,20 +1996,20 @@ class LLMNode(LifecycleNode):
                                 'content': json.dumps(res2, ensure_ascii=False),
                             })
                         self.history.extend(_tool_results2)
-                        # Текстовый ответ: сначала content, fallback — speak_text мета-инструментов
+                        # Text response: content first, fallback — speak_text of the meta tools
                         final_text = _strip_tool_blocks(resp2.get('content', '').strip())
                         _r2_from_speak = False
                         if not final_text and _r2_speak:
                             final_text = ' '.join(_r2_speak)
                             _r2_from_speak = True
                             self.get_logger().info(
-                                f'R2 speak_text из meta tool → "{final_text[:60]}"')
+                                f'R2 speak_text from meta tool → "{final_text[:60]}"')
                         if final_text:
                             self.history.append({'role': 'assistant', 'content': final_text})
                             self.get_logger().info(
-                                f'Финальный ответ R2 за {time.time()-_t0:.1f}с: "{final_text}"')
+                                f'Final R2 response in {time.time()-_t0:.1f}s: "{final_text}"')
                             if _r2_from_speak:
-                                # Текст ещё не был отправлен в TTS — отправляем
+                                # The text hasn't been sent to TTS yet — send it
                                 with self._lock:
                                     _vs2 = self._voice_style.get('emotion', '')
                                     _tg2 = self._tg_req_id
@@ -2013,9 +2018,9 @@ class LLMNode(LifecycleNode):
                                 else:
                                     self._send_tts_chunk(final_text, _vs2)
                         else:
-                            # LLM вернул пустой R2 даже без speak_text — редкий случай, нужен R3
+                            # The LLM returned an empty R2 with no speak_text either — a rare case, R3 needed
                             self.get_logger().warn(
-                                'R2: пустой content и нет speak_text — запускаем R3')
+                                'R2: empty content and no speak_text — running R3')
                             payload3 = {
                                 'model':    self.model,
                                 'messages': (
@@ -2038,26 +2043,26 @@ class LLMNode(LifecycleNode):
                                     self.history.append(
                                         {'role': 'assistant', 'content': final_text})
                                     self.get_logger().info(
-                                        f'Финальный ответ R3 за {time.time()-_t0:.1f}с: '
+                                        f'Final R3 response in {time.time()-_t0:.1f}s: '
                                         f'"{final_text}"')
                                 else:
-                                    self.get_logger().warn('R3 пуст после R2 set_voice_style — молчим')
+                                    self.get_logger().warn('R3 empty after R2 set_voice_style — staying silent')
                             except Exception as _e3:
-                                self.get_logger().warn(f'R3 ошибка (после R2 set_voice_style): {_e3}')
-                        # Текст уже стримился в TTS через _stream_with_tts; BT обработает жест
+                                self.get_logger().warn(f'R3 error (after R2 set_voice_style): {_e3}')
+                        # The text has already been streamed to TTS via _stream_with_tts; the BT will handle the gesture
                         self._publish_response('', streamed=True)
                     else:
                         final_text = _strip_tool_blocks(resp2.get('content', '').strip())
                         if final_text:
                             self.history.append({'role': 'assistant', 'content': final_text})
                             self.get_logger().info(
-                                f'Финальный ответ за {time.time()-_t0:.1f}с: "{final_text}"')
+                                f'Final response in {time.time()-_t0:.1f}s: "{final_text}"')
                             self._publish_response('', streamed=True)
                         else:
-                            # R2 пуст — если были только action-инструменты (не query),
-                            # делаем минимальный R3 с требованием ответить
+                            # R2 is empty — if there were only action tools (not query),
+                            # do a minimal R3 requiring a reply
                             if not needs_llm_reply:
-                                self.get_logger().warn('R2 пуст после action tool — пробуем R3')
+                                self.get_logger().warn('R2 empty after an action tool — trying R3')
                                 payload3 = {
                                     'model':    self.model,
                                     'messages': (
@@ -2079,36 +2084,36 @@ class LLMNode(LifecycleNode):
                                         self.history.append(
                                             {'role': 'assistant', 'content': final_text})
                                         self.get_logger().info(
-                                            f'Финальный ответ R3 за {time.time()-_t0:.1f}с: "{final_text}"')
+                                            f'Final R3 response in {time.time()-_t0:.1f}s: "{final_text}"')
                                         self._publish_response('', streamed=True)
                                     else:
-                                        self.get_logger().warn('Пустой финальный ответ LLM (R3) — молчим')
+                                        self.get_logger().warn('Empty final LLM response (R3) — staying silent')
                                 except Exception as _e3:
-                                    self.get_logger().warn(f'R3 ошибка: {_e3}')
+                                    self.get_logger().warn(f'R3 error: {_e3}')
                             else:
-                                self.get_logger().warn('Пустой финальный ответ LLM — молчим')
+                                self.get_logger().warn('Empty final LLM response — staying silent')
 
             else:
                 text = response_msg.get('content', '').strip()
                 self.history.append({'role': 'assistant', 'content': text})
-                self.get_logger().info(f'Текстовый ответ за {time.time()-_t0:.1f}с: "{text}"')
-                # Текст уже стримился в TTS; BT обрабатывает только эмоцию/жест
+                self.get_logger().info(f'Text response in {time.time()-_t0:.1f}s: "{text}"')
+                # The text has already been streamed to TTS; the BT only handles the emotion/gesture
                 self._publish_response('', streamed=True)
 
         except requests.exceptions.ConnectionError as e:
-            self.get_logger().error(f'LLM недоступен (оба сервера): {e}')
+            self.get_logger().error(f'LLM unavailable (both servers): {e}')
             self._publish_response('Извини, не могу связаться с сервером обработки. Попробуй позже.')
         except requests.exceptions.Timeout:
-            self.get_logger().error(f'Таймаут LLM после {time.time()-_t0:.1f}с (лимит={self.timeout_sec}с)')
+            self.get_logger().error(f'LLM timeout after {time.time()-_t0:.1f}s (limit={self.timeout_sec}s)')
             self._publish_response('Извини, сервер слишком долго не отвечает. Попробуй задать вопрос покороче.')
         except Exception as e:
-            self.get_logger().error(f'Ошибка LLM: {e}')
+            self.get_logger().error(f'LLM error: {e}')
             self._publish_response('Извини, произошла ошибка. Попробуй ещё раз.')
         finally:
             with self._lock:
                 self._processing = False
 
-    # ── Выполнение tool calls ──────────────────────────────────────────────
+    # ── Executing tool calls ────────────────────────────────────────────
 
     def _execute_tool(self, fn_name: str, args: dict) -> dict:
         if fn_name == 'get_weather':
@@ -2146,10 +2151,10 @@ class LLMNode(LifecycleNode):
 
     def _call_vision_model(self, images_b64: list[str], query: str,
                             system_content: str, max_tokens: int = 200) -> dict:
-        """Один запрос к ОТДЕЛЬНОЙ vision-модели (self.vision_llm_url, не self.llm_url —
-        та ограничена 1 картинкой на промпт, см. историю 2026-08-26). Эта модель
-        принимает 2-4 картинки за раз (проверено на сервере пользователем). Обычный
-        блокирующий POST, без стриминга — короткий self-contained запрос вне self.history."""
+        """A single request to a SEPARATE vision model (self.vision_llm_url, not self.llm_url —
+        that one is limited to 1 image per prompt, see the 2026-08-26 history). This model
+        accepts 2-4 images at once (verified by the user on the server). A plain
+        blocking POST, no streaming — a short self-contained request outside self.history."""
         if not images_b64:
             return {'success': False, 'error': 'Нет ни одного кадра с камер'}
         content = [{'type': 'text', 'text': query}]
@@ -2175,7 +2180,7 @@ class LLMNode(LifecycleNode):
             data = r.json()
             description = (data['choices'][0]['message']['content'] or '').strip()
         except Exception as e:
-            self.get_logger().warn(f'vision-модель ({len(images_b64)} кадр(ов)): ошибка {e}')
+            self.get_logger().warn(f'vision model ({len(images_b64)} frame(s)): error {e}')
             return {'success': False, 'error': str(e)}
         if not description:
             return {'success': False, 'error': 'Vision-модель не дала ответа'}
@@ -2189,8 +2194,8 @@ class LLMNode(LifecycleNode):
     )
 
     def _tool_look_and_describe(self, args: dict) -> dict:
-        """Снимок ПРЯМО СЕЙЧАС с ОБЕИХ глазных камер (левой и правой — на случай, если
-        одна не в фокусе/смазана) → анализ через отдельную vision-модель."""
+        """A snapshot RIGHT NOW from BOTH eye cameras (left and right — in case
+        one is out of focus/blurry) → analysis via a separate vision model."""
         query = (args.get('query') or '').strip() or 'Опиши коротко и по делу, что видишь.'
         with self._lock:
             left, right = self._latest_eye_jpeg, self._latest_eye_jpeg_right
@@ -2199,20 +2204,20 @@ class LLMNode(LifecycleNode):
             return {'success': False, 'error': 'Камера недоступна или кадр ещё не пришёл'}
         return self._call_vision_model(images_b64, query, self._VISION_SYS_HINT)
 
-    # Сколько реально занимает физический поворот (см. ExecuteRobotCommand._do_head/
-    # _send_head_cmd в behavior_manager_node.py) — голова стартует через 0.2с
-    # после event, сам поворот ~1.2-1.8с. С корпусом (scope=partial/full) чуть дольше.
+    # How long the physical turn actually takes (see ExecuteRobotCommand._do_head/
+    # _send_head_cmd in behavior_manager_node.py) — the head starts 0.2s
+    # after the event, the turn itself takes ~1.2-1.8s. With the torso (scope=partial/full) a bit longer.
     _LOOK_SETTLE_HEAD_SEC  = 2.0
     _LOOK_SETTLE_TORSO_SEC = 2.3
-    _LOOK_FRAME_GAP_SEC    = 1.0   # интервал между 2 захватами по пути поворота
+    _LOOK_FRAME_GAP_SEC    = 1.0   # interval between 2 captures along the turn
 
     def _tool_look_direction(self, args: dict) -> dict:
-        """Поворот головы/корпуса (через тот же /robot_events, что и robot_control) +
-        ОЖИДАНИЕ реального завершения поворота + 2 снимка с каждого глаза (с каждой
-        камеры — до и в конце поворота) + анализ всех кадров одной vision-моделью.
-        В одном tool call, синхронно в этом же потоке — так гарантируется правильный
-        порядок (поворот → снимки), в отличие от отдельных robot_control+look_and_describe,
-        которые ThreadPoolExecutor запускает параллельно (см. _exec_one/_pool.map выше)."""
+        """Turns the head/torso (via the same /robot_events as robot_control) +
+        WAITS for the turn to actually finish + 2 shots from each eye (from each
+        camera — before and at the end of the turn) + analysis of all frames by one vision model.
+        In a single tool call, synchronously in this same thread — this guarantees the correct
+        order (turn → shots), unlike separate robot_control+look_and_describe calls,
+        which the ThreadPoolExecutor runs in parallel (see _exec_one/_pool.map above)."""
         pan   = float(args.get('pan', 0) or 0)
         tilt  = float(args.get('tilt', 0) or 0)
         scope = str(args.get('scope') or 'head').strip().lower()
@@ -2224,13 +2229,13 @@ class LLMNode(LifecycleNode):
         msg = String()
         msg.data = json.dumps(event, ensure_ascii=False)
         self.event_pub.publish(msg)
-        self.get_logger().info(f'look_direction: поворот pan={pan:+.0f}° tilt={tilt:+.0f}° scope={scope}')
+        self.get_logger().info(f'look_direction: turn pan={pan:+.0f}° tilt={tilt:+.0f}° scope={scope}')
 
         settle = self._LOOK_SETTLE_HEAD_SEC if scope == 'head' else self._LOOK_SETTLE_TORSO_SEC
-        # 2 захвата с обеих камер с интервалом ~1с — первый незадолго до конца
-        # поворота (на случай overshoot), второй сразу после устаканивания.
-        # Отдельная vision-модель принимает 2-4 картинки за запрос (в отличие от
-        # self.llm_url, ограниченного 1 картинкой — см. историю 2026-08-26).
+        # 2 captures from both cameras ~1s apart — the first shortly before the end
+        # of the turn (in case of overshoot), the second right after settling.
+        # A separate vision model accepts 2-4 images per request (unlike
+        # self.llm_url, limited to 1 image — see the 2026-08-26 history).
         t1 = max(0.0, settle - self._LOOK_FRAME_GAP_SEC)
         time.sleep(t1)
         with self._lock:
@@ -2252,13 +2257,13 @@ class LLMNode(LifecycleNode):
         result.update({'pan': pan, 'scope': scope})
         return result
 
-    # Координаты по умолчанию — Bødalen, Asker, Норвегия
+    # Default coordinates — Bødalen, Asker, Norway
     _DEFAULT_LAT  = 59.835
     _DEFAULT_LON  = 10.440
     _DEFAULT_LOC  = 'Bødalen, Asker'
     _YR_UA        = 'InMoov-Robot/1.0 (fedjukevitsh@gmail.com)'
 
-    # Символы yr.no → русские описания
+    # yr.no symbols → Russian descriptions (spoken to the user, kept in Russian)
     _YR_SYMBOLS = {
         'clearsky':           'ясно',
         'fair':               'малооблачно',
@@ -2290,7 +2295,7 @@ class LLMNode(LifecycleNode):
         location = (args.get('location') or '').strip() or self._DEFAULT_LOC
         date_arg  = (args.get('date') or '').strip().lower()
 
-        # Определяем целевую дату
+        # Determine the target date
         today = datetime.date.today()
         if not date_arg or date_arg in ('today', 'сегодня'):
             target = today
@@ -2302,7 +2307,7 @@ class LLMNode(LifecycleNode):
             except ValueError:
                 target = today
 
-        # Геокодирование через Nominatim (если не дефолтная локация)
+        # Geocoding via Nominatim (if not the default location)
         lat, lon = self._DEFAULT_LAT, self._DEFAULT_LON
         resolved_loc = location
         if location.lower() not in ('bødalen, asker', 'bødalen', 'бодален'):
@@ -2319,10 +2324,10 @@ class LLMNode(LifecycleNode):
                     lon = float(g['lon'])
                     resolved_loc = g.get('display_name', location).split(',')[0]
             except Exception as e:
-                self.get_logger().warn(f'Геокодирование не удалось ({e}), используем Bødalen')
+                self.get_logger().warn(f'Geocoding failed ({e}), using Bødalen')
                 resolved_loc = self._DEFAULT_LOC
 
-        # Запрос к api.met.no
+        # Request to api.met.no
         try:
             wr = requests.get(
                 'https://api.met.no/weatherapi/locationforecast/2.0/compact',
@@ -2335,7 +2340,7 @@ class LLMNode(LifecycleNode):
         except Exception as e:
             return {'error': f'Ошибка yr.no API: {e}'}
 
-        # Фильтрация по дате
+        # Filter by date
         entries = []
         for entry in ts_list:
             if entry['time'][:10] == str(target):
@@ -2362,12 +2367,12 @@ class LLMNode(LifecycleNode):
         winds   = [e['wind']   for e in entries if e['wind']   is not None]
         precips = [e['precip'] for e in entries]
 
-        # Главное описание — самый частый символ (без суффикса _day/_night/_polartwilight)
+        # Main description — the most frequent symbol (without the _day/_night/_polartwilight suffix)
         symbols = [e['symbol'].split('_')[0] for e in entries if e['symbol']]
         main_sym  = Counter(symbols).most_common(1)[0][0] if symbols else ''
         main_desc = self._YR_SYMBOLS.get(main_sym, main_sym)
 
-        # Почасовой прогноз (каждые 3 часа, дневное время 7–22)
+        # Hourly forecast (every 3 hours, daytime 7-22)
         hourly = [
             f"{e['hour']:02d}:00 {e['temp']}°C "
             f"{self._YR_SYMBOLS.get(e['symbol'].split('_')[0], e['symbol'])}"
@@ -2390,11 +2395,11 @@ class LLMNode(LifecycleNode):
         name  = args.get('name', '')
         state = str(args.get('state', ''))
 
-        # Валидация имени по кэшу — до вызова API
+        # Validate the name against the cache — before calling the API
         with self._lock:
             known = {it['name'] for it in self._oh_items}
         if known and name not in known:
-            # Ищем похожие имена (общий префикс по '_')
+            # Look for similar names (common prefix by '_')
             prefix = name.rsplit('_', 1)[0] if '_' in name else name
             suggestions = sorted(n for n in known if prefix.lower() in n.lower())[:5]
             return {
@@ -2419,7 +2424,7 @@ class LLMNode(LifecycleNode):
             return {'success': False, 'error': str(e)}
 
     def _tool_save_memory(self, args: dict) -> dict:
-        """Сохранить заметку о человеке или общее знание в БД через /memory/query."""
+        """Save a note about the person or general knowledge to the DB via /memory/query."""
         key       = args.get('key', '')
         value     = args.get('value', '')
         person_id = args.get('person_id')
@@ -2432,7 +2437,7 @@ class LLMNode(LifecycleNode):
         else:
             req = {'op': 'set_knowledge', 'key': key, 'value': value}
 
-        # Вызываем синхронно из фонового потока (LLM уже в thread)
+        # Call synchronously from the background thread (the LLM is already in a thread)
         if not self._mem_client.wait_for_service(timeout_sec=2.0):
             return {'error': '/memory/query недоступен'}
         request = MemoryQuery.Request()
@@ -2453,7 +2458,7 @@ class LLMNode(LifecycleNode):
 
     def _tool_robot_control(self, args: dict) -> dict:
         event    = dict(args)
-        event.setdefault('priority', 10)   # голосовые команды — высокий приоритет
+        event.setdefault('priority', 10)   # voice commands — high priority
         msg      = String()
         msg.data = json.dumps(event, ensure_ascii=False)
         self.event_pub.publish(msg)
@@ -2472,7 +2477,7 @@ class LLMNode(LifecycleNode):
         msg.data = json.dumps(event, ensure_ascii=False)
         self.event_pub.publish(msg)
 
-        # Блокируем фоновый поток до получения реального результата от BM (Tavily)
+        # Block the background thread until we get a real result from BM (Tavily)
         got = self._search_event.wait(timeout=30.0)
 
         with self._lock:
@@ -2484,16 +2489,16 @@ class LLMNode(LifecycleNode):
         return {'success': False, 'error': 'поиск не вернул результат за 30 секунд', 'query': query}
 
     def _tool_set_voice_style(self, args: dict) -> dict:
-        """Буферизует голосовой пресет. tts_node сам покажет ту же эмоцию на
-        лице на всё время произнесения фразы (см. /face_expression_hold) —
-        отдельного tool call для мимики больше нет."""
+        """Buffers a voice preset. tts_node itself will show the same emotion on
+        the face for the whole duration of the phrase (see /face_expression_hold) —
+        there is no separate mimicry tool call anymore."""
         style = (args.get('style') or 'neutral').lower()
         if style not in ('neutral', 'happy', 'sad', 'surprise', ''):
-            self.get_logger().warn(f'set_voice_style: неизвестный пресет "{style}" → neutral')
+            self.get_logger().warn(f'set_voice_style: unknown preset "{style}" → neutral')
             style = 'neutral'
         with self._lock:
             self._voice_style = {'emotion': style or 'neutral'}
-        self.get_logger().info(f'Голосовой пресет: "{style or "neutral"}"')
+        self.get_logger().info(f'Voice preset: "{style or "neutral"}"')
         return {'success': True, 'style': style or 'neutral'}
 
     def _tool_get_openhab_states(self, args: dict) -> dict:
@@ -2517,7 +2522,7 @@ class LLMNode(LifecycleNode):
                 result.append({'name': name, 'error': 'not found'})
         return {'items': result}
 
-    # Русские названия комнат → английские подстроки для поиска в OpenHAB
+    # Russian room names → English substrings for searching in OpenHAB
     _RU_ROOM_MAP = {
         'гостиная':  'living',
         'гостевая':  'guest',
@@ -2538,7 +2543,7 @@ class LLMNode(LifecycleNode):
         group_filter  = args.get('group_filter',  '').strip()
         state_filter  = args.get('state_filter',  '').strip()
         name_contains = args.get('name_contains', '').strip().lower()
-        # Переводим русское название комнаты в английское для поиска
+        # Translate the Russian room name into English for searching
         name_contains = self._RU_ROOM_MAP.get(name_contains, name_contains)
 
         if not group_filter and not state_filter and not name_contains:
@@ -2558,15 +2563,15 @@ class LLMNode(LifecycleNode):
 
         result = []
         for it in items:
-            # фильтр по семантической группе (точное совпадение имени группы)
+            # filter by semantic group (exact group-name match)
             if group_filter and group_filter not in it.get('groups', []):
                 continue
-            # фильтр по имени/лейблу
+            # filter by name/label
             if name_contains:
                 if (name_contains not in it['name'].lower() and
                         name_contains not in it.get('label', '').lower()):
                     continue
-            # фильтр по состоянию
+            # filter by state
             if state_filter:
                 state = it.get('state', '')
                 sf    = state_filter.upper()
@@ -2607,39 +2612,39 @@ class LLMNode(LifecycleNode):
             })
         return {'count': len(result), 'items': result}
 
-    # ── Callbacks для OpenHAB bridge ──────────────────────────────────────
+    # ── Callbacks for the OpenHAB bridge ───────────────────────────────────
 
     def _oh_schema_callback(self, msg: String):
         with self._lock:
             self._oh_schema = msg.data
-        self.get_logger().debug('OpenHAB schema получена')
+        self.get_logger().debug('OpenHAB schema received')
 
     def _oh_items_callback(self, msg: String):
         try:
             items = json.loads(msg.data)
             with self._lock:
                 self._oh_items = items
-            self.get_logger().debug(f'OpenHAB items обновлены: {len(items)} устройств')
+            self.get_logger().debug(f'OpenHAB items updated: {len(items)} devices')
         except json.JSONDecodeError as e:
-            self.get_logger().warn(f'Невалидный openhab_items JSON: {e}')
+            self.get_logger().warn(f'Invalid openhab_items JSON: {e}')
 
     def _eye_camera_cb(self, msg: CompressedImage):
-        """Кэширует последний кадр с левой глазной камеры для look_and_describe/
-        look_direction (снимок по запросу, не стрим — просто держим самый свежий JPEG)."""
+        """Caches the latest frame from the left eye camera for look_and_describe/
+        look_direction (a snapshot on request, not a stream — just keep the freshest JPEG)."""
         with self._lock:
             self._latest_eye_jpeg = bytes(msg.data)
 
     def _eye_camera_right_cb(self, msg: CompressedImage):
-        """То же самое для правой глазной камеры — см. _eye_camera_cb."""
+        """Same for the right eye camera — see _eye_camera_cb."""
         with self._lock:
             self._latest_eye_jpeg_right = bytes(msg.data)
 
     def _social_context_cb(self, msg: String):
-        """Перехватываем looking_at_robot из social_context."""
+        """Intercepts looking_at_robot from social_context."""
         try:
             data = json.loads(msg.data)
             with self._lock:
-                # looking_at_robot: True/False от identity_manager, None если нет данных
+                # looking_at_robot: True/False from identity_manager, None if no data
                 raw = data.get('looking_at_robot')
                 if raw is not None:
                     self._looking_at_robot = bool(raw)
@@ -2648,23 +2653,23 @@ class LLMNode(LifecycleNode):
             pass
 
     def _scene_context_cb(self, msg: String):
-        """Сводка сцены (объекты + люди) от scene_manager_node → кэш для system prompt."""
+        """Scene summary (objects + people) from scene_manager_node → cache for the system prompt."""
         try:
             ctx = json.loads(msg.data)
             with self._lock:
                 self._scene_context = ctx
         except json.JSONDecodeError as e:
-            self.get_logger().warn(f'Невалидный /scene/objects JSON: {e}')
+            self.get_logger().warn(f'Invalid /scene/objects JSON: {e}')
 
     def _face_search_status_cb(self, msg: String):
-        """Статус поиска лица от behavior_manager_node → кэш для system prompt
-        (см. _build_face_search_block)."""
+        """Face-search status from behavior_manager_node → cache for the system prompt
+        (see _build_face_search_block)."""
         try:
             ctx = json.loads(msg.data)
             with self._lock:
                 self._face_search_status = ctx
         except json.JSONDecodeError as e:
-            self.get_logger().warn(f'Невалидный /behavior/face_search_status JSON: {e}')
+            self.get_logger().warn(f'Invalid /behavior/face_search_status JSON: {e}')
 
     def _person_context_callback(self, msg: String):
         try:
@@ -2674,22 +2679,22 @@ class LLMNode(LifecycleNode):
                 history_snapshot = self.history[:]
             old_name = old_ctx.get('name') if old_ctx else None
             new_name = ctx.get('name')
-            # Сменился человек → публикуем conversation_end для предыдущего
+            # The person changed → publish conversation_end for the previous one
             if old_name and new_name != old_name and history_snapshot:
                 self._publish_conversation_end(history_snapshot, old_ctx)
                 with self._lock:
                     self.history         = []
                     self._dialogue_lines = []
             with self._lock:
-                # Храним контекст только при известном человеке; иначе явно None.
-                # Это гарантирует что person_block пуст в system_prompt до INTERACTING.
-                # _memory_context не трогаем: рабочая память остаётся в контексте,
-                # персональные эпизоды отрезаются в _query_llm по person_id.
+                # Keep the context only when the person is known; otherwise explicitly None.
+                # This guarantees person_block is empty in system_prompt until INTERACTING.
+                # We don't touch _memory_context: working memory stays in context,
+                # personal episodes are cut off in _query_llm by person_id.
                 self._person_context = ctx if ctx.get('person_id') else None
             name = ctx.get('name') or 'Незнакомец'
             self.get_logger().debug(f'Person context: {name}')
         except json.JSONDecodeError as e:
-            self.get_logger().warn(f'Невалидный person_context JSON: {e}')
+            self.get_logger().warn(f'Invalid person_context JSON: {e}')
 
     def _search_result_callback(self, msg: String):
         search_text = msg.data.strip()
@@ -2697,26 +2702,26 @@ class LLMNode(LifecycleNode):
             return
         with self._lock:
             if not self._waiting_for_search:
-                self.get_logger().warn('Результат поиска получен без активного web_search — игнорируем')
+                self.get_logger().warn('Search result received with no active web_search — ignoring')
                 return
             self._search_result_data = search_text
             self._waiting_for_search = False
         self._search_event.set()
 
     def _publish_response(self, text: str, user_text: str = '', streamed: bool = False):
-        """Публикует ответ LLM в /llm_response → BT читает из Blackboard и оркеструет речь.
+        """Publishes the LLM's response to /llm_response → the BT reads it from the Blackboard and orchestrates speech.
 
-        Формат: {text, voice_instruct, streamed, telegram}
-        Если streamed=True: текст уже отправлен в TTS напрямую;
-        BT запускает только Gesticulation (SpeakBehaviour получает пустой текст).
-        Мимика лица больше не идёт через BT/ExpressEmotion — её на всё время
-        речи держит tts_node, синхронно с voice_instruct (см. /face_expression_hold).
-        telegram=True: запрос пришёл через Telegram — BM не должен ставить person_present=True.
+        Format: {text, voice_instruct, streamed, telegram}
+        If streamed=True: the text has already been sent to TTS directly;
+        the BT only starts the Gesticulation (SpeakBehaviour gets empty text).
+        The facial expression no longer goes through the BT/ExpressEmotion — tts_node
+        holds it for the whole duration of speech, in sync with voice_instruct (see /face_expression_hold).
+        telegram=True: the request came via Telegram — the BM must not set person_present=True.
         """
         if not streamed:
             if not text or not text.strip():
                 return
-            # Защитная очистка: убираем остатки tool call блоков если regex не сработал выше
+            # Defensive cleanup: strip any leftover tool-call blocks if the regex above didn't catch them
             text = _strip_tool_blocks(text)
             text = _clean_llm_text(text)
             if not text:
@@ -2730,10 +2735,10 @@ class LLMNode(LifecycleNode):
 
         payload = {
             'text':           '' if streamed else text,
-            # Поле сохранило старое имя (voice_instruct) для совместимости с
-            # behavior_manager_node.py: раньше содержало instruct-фразу для
-            # CosyVoice3, теперь — имя голосового пресета OmniVoice
-            # (neutral/happy/sad/surprise), см. MIGRATION_NOTES.md.
+            # The field kept its old name (voice_instruct) for compatibility with
+            # behavior_manager_node.py: it used to hold the instruct phrase for
+            # CosyVoice3, now it's the OmniVoice voice-preset name
+            # (neutral/happy/sad/surprise), see MIGRATION_NOTES.md.
             'voice_instruct': voice_preset,
             'streamed':       streamed,
             'telegram':       bool(tg_req_id),
@@ -2754,10 +2759,10 @@ class LLMNode(LifecycleNode):
                 + (f' voice="{voice_preset}"' if voice_preset else '')
             )
 
-        # Переслать ответ в Telegram если запрос пришёл через /telegram_ask
+        # Forward the response to Telegram if the request came via /telegram_ask
         if tg_req_id:
-            # streamed=True: текст уже доставлен через partial-чанки, шлём пустой сигнал "стоп"
-            # streamed=False: текст — это error-строка (недоступен LLM и т.п.)
+            # streamed=True: the text was already delivered via partial chunks, send an empty "stop" signal
+            # streamed=False: the text is an error string (LLM unavailable, etc.)
             tg_text = '' if streamed else text
             tg_resp = String()
             tg_resp.data = json.dumps(
@@ -2771,7 +2776,7 @@ class LLMNode(LifecycleNode):
             )
 
     def _publish_conversation_end(self, history: list, person_ctx: dict | None):
-        """Публикует транскрипт завершённого диалога → memory_node сохранит эпизод."""
+        """Publishes the transcript of a finished dialogue → memory_node saves the episode."""
         lines = []
         for m in history:
             role    = m.get('role', '')
@@ -2795,10 +2800,10 @@ class LLMNode(LifecycleNode):
         msg.data = json.dumps(payload, ensure_ascii=False)
         self._conv_end_pub.publish(msg)
         self.get_logger().info(
-            f'conversation_end: {len(lines)} строк, участники: {participants}')
+            f'conversation_end: {len(lines)} lines, participants: {participants}')
 
     def _tool_search_memory(self, args: dict) -> dict:
-        """Поиск в долговременной семантической памяти через memory_node."""
+        """Search long-term semantic memory via memory_node."""
         query    = args.get('query', '')
         category = args.get('category', '') or ''
         req      = {'op': 'search_semantic', 'query': query,
@@ -2815,13 +2820,13 @@ class LLMNode(LifecycleNode):
         try:
             result = json.loads(future.result().response_json)
             facts  = result.get('facts', [])
-            self.get_logger().info(f'search_memory: "{query}" → {len(facts)} фактов')
+            self.get_logger().info(f'search_memory: "{query}" → {len(facts)} facts')
             return result
         except Exception as e:
             return {'error': str(e)}
 
     def _tool_set_reminder(self, args: dict) -> dict:
-        """Сохранить напоминание для пользователя через /memory/query."""
+        """Save a reminder for the user via /memory/query."""
         person_name = args.get('person_name', '')
         message     = args.get('message', '')
         date        = _resolve_reminder_date(args.get('date', '') or None)
@@ -2868,7 +2873,7 @@ class LLMNode(LifecycleNode):
             return {'error': str(e)}
 
     def _tool_confirm_reminder(self, args: dict) -> dict:
-        """Удалить показанные напоминания после подтверждения пользователем."""
+        """Delete shown reminders after the user confirms."""
         person_id = args.get('person_id')
         if person_id is None:
             with self._lock:
@@ -2895,14 +2900,14 @@ class LLMNode(LifecycleNode):
         except Exception as e:
             return {'error': str(e)}
 
-    # ── Chromecast broadcast ───────────────────────────────────────────────
+    # ── Chromecast broadcast ─────────────────────────────────────────────
 
     def _tool_broadcast_message(self, args: dict) -> dict:
         """
-        1. POST /tts/to_file на TTS сервер (192.168.10.118:8000):
-           сервер синтезирует WAV, пишет в /etc/openhab/html/, возвращает URL.
-        2. Устанавливает громкость LivingRoom_Chromecast_volume.
-        3. Отправляет URL в LivingRoom_Chromecast_uri → Chromecast воспроизводит.
+        1. POST /tts/to_file to the TTS server (192.168.10.118:8000):
+           the server synthesizes a WAV, writes it to /etc/openhab/html/, returns a URL.
+        2. Sets the LivingRoom_Chromecast_volume.
+        3. Sends the URL to LivingRoom_Chromecast_uri → the Chromecast plays it.
         """
         text   = (args.get('text') or '').strip()
         volume = int(args.get('volume') or self._cast_volume)
@@ -2910,7 +2915,7 @@ class LLMNode(LifecycleNode):
         if not text:
             return {'success': False, 'error': 'text обязателен'}
 
-        # ── TTS сервер синтезирует и сохраняет файл ───────────────────────
+        # ── The TTS server synthesizes and saves the file ─────────────────
         try:
             r = requests.post(
                 self._cast_to_file_url,
@@ -2922,12 +2927,12 @@ class LLMNode(LifecycleNode):
             file_url = data['url']
             self.get_logger().info(
                 f'Cast to_file: {data.get("file")} '
-                f'({data.get("bytes", "?")} байт) → {file_url}')
+                f'({data.get("bytes", "?")} bytes) → {file_url}')
         except Exception as e:
-            self.get_logger().error(f'Cast to_file ошибка: {e}')
+            self.get_logger().error(f'Cast to_file error: {e}')
             return {'success': False, 'error': str(e)}
 
-        # ── Устанавливаем громкость ────────────────────────────────────────
+        # ── Setting the volume ──────────────────────────────────────────────
         try:
             requests.post(
                 f'{self.openhab_url}/rest/items/LivingRoom_Chromecast_volume',
@@ -2937,9 +2942,9 @@ class LLMNode(LifecycleNode):
             )
             time.sleep(0.3)
         except Exception as e:
-            self.get_logger().warn(f'Cast: громкость не установлена: {e}')
+            self.get_logger().warn(f'Cast: volume not set: {e}')
 
-        # ── Отправляем URI на Chromecast ───────────────────────────────────
+        # ── Sending the URI to the Chromecast ───────────────────────────────
         try:
             r = requests.post(
                 f'{self.openhab_url}/rest/items/LivingRoom_Chromecast_uri',
@@ -2959,18 +2964,18 @@ class LLMNode(LifecycleNode):
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores a repeated declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
     def on_configure(self, state):
-        # llm_url — основной бэкенд, OpenAI-совместимый chat.completions endpoint
-        # (сейчас vLLM). bearer_token обязателен для него. llm_fallback_url — резервный
-        # (сейчас локальный NUC — станет OpenAI-совместимым позже, пока не рабочий).
+        # llm_url — the primary backend, an OpenAI-compatible chat.completions endpoint
+        # (currently vLLM). bearer_token is required for it. llm_fallback_url — the fallback
+        # (currently the local NUC — will become OpenAI-compatible later, not working yet).
         self._dp('llm_url',             'http://192.168.10.118:18020/v1/chat/completions')
         self._dp('llm_fallback_url',    'http://localhost:11434/v1/chat/completions')
-        self._dp('bearer_token',          '')  # для llm_url (vLLM)
-        self._dp('bearer_token_fallback', '')  # для llm_fallback_url, если понадобится
+        self._dp('bearer_token',          '')  # for llm_url (vLLM)
+        self._dp('bearer_token_fallback', '')  # for llm_fallback_url, if ever needed
         self._dp('model',               'qwen3.8-27b')
         self._dp('model_fallback',      'qwen2.5:7b')
         self._dp('temperature',         0.1)
@@ -2985,12 +2990,12 @@ class LLMNode(LifecycleNode):
         self._dp('cast_volume',         80)
         self._dp('cast_to_file_url',    'http://192.168.10.118:8000/tts/to_file')
 
-        # Отдельная vision-модель (look_and_describe/look_direction) — принимает
-        # 2-4 картинки base64 в одном запросе, OpenAI-совместимый /v1/chat/completions.
-        # Добавлено 2026-08-28: раньше картинки шли на self.llm_url (текстовая модель),
-        # но та ограничена 1 картинкой на промпт ("At most 1 image(s) may be provided").
-        # vision_bearer_token пуст по умолчанию → используем тот же bearer_token, что и
-        # у llm_url (сервер за тем же прокси/токеном), если не задан отдельно.
+        # A separate vision model (look_and_describe/look_direction) — accepts
+        # 2-4 base64 images in one request, an OpenAI-compatible /v1/chat/completions.
+        # Added 2026-08-28: images used to go to self.llm_url (the text model),
+        # but that one is limited to 1 image per prompt ("At most 1 image(s) may be provided").
+        # vision_bearer_token is empty by default → falls back to the same bearer_token as
+        # llm_url (server behind the same proxy/token), unless set separately.
         self._dp('vision_llm_url',      'http://192.168.10.118:18090/v1/chat/completions')
         self._dp('vision_model',        'qwen3vl')
         self._dp('vision_bearer_token', '')
@@ -3048,14 +3053,14 @@ class LLMNode(LifecycleNode):
         self._tg_resp_pub        = self.create_lifecycle_publisher(String, '/telegram_response', 10)
         self._tts_cancel_pub     = self.create_lifecycle_publisher(Bool,   '/tts_cancel_queue',  10)
         self._conv_end_pub       = self.create_lifecycle_publisher(String, '/conversation_end',  10)
-        # Разобранная голосовая подсказка направления ("я справа" и т.п.) — на
-        # каждой адресованной реплике, потребитель: behavior_manager_node
-        # (face-search retry). См. _parse_direction_hint/command_callback.
+        # Parsed voice direction hint ("I'm on the right" etc.) — on
+        # every addressed utterance, consumer: behavior_manager_node
+        # (face-search retry). See _parse_direction_hint/command_callback.
         self._direction_hint_pub = self.create_lifecycle_publisher(String, '/voice/direction_hint', 10)
 
         self._mem_client         = self.create_client(MemoryQuery, '/memory/query')
         self._tts_direct_client  = ActionClient(self, Speak, 'speak')
-        self.get_logger().info('LLM нода настроена')
+        self.get_logger().info('LLM node configured')
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
@@ -3066,15 +3071,15 @@ class LLMNode(LifecycleNode):
         self._conv_end_pub.on_activate(state)
         self._direction_hint_pub.on_activate(state)
         self._check_servers()
-        # Фоновый прогрев: ждём схему от openhab_bridge (10-15с), затем
-        # отправляем минимальный запрос — загружаем модель и наполняем KV-cache.
+        # Background warmup: wait for the schema from openhab_bridge (10-15s), then
+        # send a minimal request — loads the model and fills the KV cache.
         threading.Thread(target=self._warmup_llm, daemon=True).start()
-        self.get_logger().info(f'LLM нода готова. Модель: {self.model}')
+        self.get_logger().info(f'LLM node ready. Model: {self.model}')
         return TransitionCallbackReturn.SUCCESS
 
     def _warmup_llm(self):
-        """Прогрев: загрузить модель в GPU и наполнить KV-cache системного промпта."""
-        time.sleep(15.0)  # ждём openhab_bridge_node публикует схему (каждые 10с)
+        """Warmup: load the model onto the GPU and fill the system-prompt KV cache."""
+        time.sleep(15.0)  # wait for openhab_bridge_node to publish the schema (every 10s)
         _t = time.time()
         try:
             with self._lock:
@@ -3094,9 +3099,9 @@ class LLMNode(LifecycleNode):
             }
             for _ in self._stream_llm(payload, read_timeout=120.0):
                 pass
-            self.get_logger().info(f'LLM прогрев завершён за {time.time()-_t:.1f}с')
+            self.get_logger().info(f'LLM warmup finished in {time.time()-_t:.1f}s')
         except Exception as e:
-            self.get_logger().warn(f'LLM прогрев: ошибка {e}')
+            self.get_logger().warn(f'LLM warmup: error {e}')
 
     def on_deactivate(self, state):
         self.event_pub.on_deactivate(state)
@@ -3111,12 +3116,12 @@ class LLMNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def _tool_merge_persons(self, args: dict) -> dict:
-        """Слить дубликат person_id → target person_id.
+        """Merges a duplicate person_id → target person_id.
 
-        Шаги:
-        1. lookup_by_name для обоих имён
-        2. merge_persons с check_similarity=True
-        3. Если similarity_too_low — сообщаем пользователю
+        Steps:
+        1. lookup_by_name for both names
+        2. merge_persons with check_similarity=True
+        3. If similarity_too_low — tell the user
         """
         dup_name    = (args.get('duplicate_name') or '').strip()
         target_name = (args.get('target_name') or '').strip()
@@ -3173,7 +3178,7 @@ class LLMNode(LifecycleNode):
         else:
             reason = result.get('reason', 'unknown')
             msg    = result.get('message', '')
-            self.get_logger().warn(f'merge_persons отклонён: {reason} — {msg}')
+            self.get_logger().warn(f'merge_persons rejected: {reason} — {msg}')
             return {'success': False, 'reason': reason, 'message': msg}
 
     def on_shutdown(self, state):

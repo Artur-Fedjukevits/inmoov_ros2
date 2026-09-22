@@ -1,9 +1,13 @@
 """
-EpisodicMemory — слой эпизодической памяти
-============================================
-Хранит краткосрочные события и диалоги в SQLite.
-Скользящее окно: 7 дней / 200 записей.
-Важные эпизоды мигрируют в семантическую память.
+EpisodicMemory — episodic memory layer
+========================================
+Stores short-term events and dialogues in SQLite.
+Sliding window: 7 days / 200 records.
+Important episodes migrate into semantic memory.
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 from __future__ import annotations
@@ -16,21 +20,21 @@ from typing import Optional
 
 
 class EpisodicMemory:
-    """Краткосрочная эпизодическая память на базе SQLite."""
+    """Short-term episodic memory backed by SQLite."""
 
     CREATE_SQL = """
     CREATE TABLE IF NOT EXISTS episodes (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp   TEXT    NOT NULL,
-        date        TEXT    NOT NULL,      -- YYYY-MM-DD для быстрой фильтрации
+        date        TEXT    NOT NULL,      -- YYYY-MM-DD for fast filtering
         type        TEXT    NOT NULL DEFAULT 'conversation',
-        participants TEXT   NOT NULL DEFAULT '[]',  -- JSON-массив имён
+        participants TEXT   NOT NULL DEFAULT '[]',  -- JSON array of names
         summary     TEXT    NOT NULL,
         raw_text    TEXT,
         location    TEXT,
         emotion_tag TEXT    NOT NULL DEFAULT 'neutral',
         importance  REAL    NOT NULL DEFAULT 0.3,
-        migrated    INTEGER NOT NULL DEFAULT 0  -- 1 = перенесён в semantic
+        migrated    INTEGER NOT NULL DEFAULT 0  -- 1 = migrated to semantic
     );
     CREATE INDEX IF NOT EXISTS idx_ep_date ON episodes(date);
     CREATE INDEX IF NOT EXISTS idx_ep_importance ON episodes(importance);
@@ -50,7 +54,7 @@ class EpisodicMemory:
         return conn
 
     # ------------------------------------------------------------------
-    # Запись
+    # Writing
     # ------------------------------------------------------------------
 
     def save(
@@ -63,7 +67,7 @@ class EpisodicMemory:
         ep_type: str = "conversation",
         emotion_tag: str = "neutral",
     ) -> int:
-        """Сохраняет новый эпизод. Возвращает ID."""
+        """Saves a new episode. Returns its ID."""
         now = datetime.now()
         with self._conn() as conn:
             cur = conn.execute(
@@ -86,11 +90,11 @@ class EpisodicMemory:
             return cur.lastrowid
 
     # ------------------------------------------------------------------
-    # Чтение
+    # Reading
     # ------------------------------------------------------------------
 
     def get_recent(self, limit: int = 5, date: Optional[str] = None) -> list[dict]:
-        """Последние N эпизодов. Если date задан — только за этот день; иначе — любые последние."""
+        """Last N episodes. If date is given — only that day; otherwise the latest overall."""
         with self._conn() as conn:
             if date:
                 rows = conn.execute(
@@ -109,13 +113,13 @@ class EpisodicMemory:
         return [dict(r) for r in rows]
 
     def get_recent_text(self, limit: int = 5) -> str:
-        """Форматированный текст для вставки в системный промпт."""
+        """Formatted text for insertion into the system prompt."""
         episodes = self.get_recent(limit=limit)
         if not episodes:
             return ""
         lines = []
-        for ep in reversed(episodes):  # хронологический порядок
-            ts = ep["timestamp"][:16]  # YYYY-MM-DDTHH:MM → берём дату+время
+        for ep in reversed(episodes):  # chronological order
+            ts = ep["timestamp"][:16]  # YYYY-MM-DDTHH:MM → take date+time
             date_part = ts[:10]
             time_part = ts[11:16]
             today = datetime.now().strftime("%Y-%m-%d")
@@ -128,7 +132,7 @@ class EpisodicMemory:
         return "\n".join(lines)
 
     def search(self, keyword: str, date: Optional[str] = None, limit: int = 10) -> list[dict]:
-        """Полнотекстовый поиск по summary и raw_text."""
+        """Full-text search across summary and raw_text."""
         like = f"%{keyword}%"
         with self._conn() as conn:
             if date:
@@ -154,11 +158,11 @@ class EpisodicMemory:
             return conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
 
     # ------------------------------------------------------------------
-    # Обслуживание
+    # Maintenance
     # ------------------------------------------------------------------
 
     def cleanup(self, older_than_days: int = 7, max_importance: float = 0.5) -> int:
-        """Удаляет старые малозначимые эпизоды. Возвращает кол-во удалённых."""
+        """Deletes old, low-importance episodes. Returns the number deleted."""
         cutoff = (datetime.now() - timedelta(days=older_than_days)).strftime("%Y-%m-%d")
         with self._conn() as conn:
             cur = conn.execute(
@@ -168,7 +172,7 @@ class EpisodicMemory:
             return cur.rowcount
 
     def get_unmigrated_important(self, min_importance: float = 0.7) -> list[dict]:
-        """Эпизоды с высокой важностью, ещё не перенесённые в semantic."""
+        """High-importance episodes not yet migrated to semantic memory."""
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT id, timestamp, summary, raw_text

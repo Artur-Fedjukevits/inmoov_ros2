@@ -1,15 +1,21 @@
+# telegram_params.yaml — parameters for telegram_bridge_node.
+#
+# Author: Artur Fedjukevits
+# Assisted by: Claude Code (Anthropic)
+# License: GNU General Public License v3.0 (see repository root LICENSE)
+
 telegram_bridge_node:
   ros__parameters:
-    # ОБЯЗАТЕЛЬНО: Telegram chat_id которому разрешены команды.
-    # Узнать свой chat_id: написать боту @userinfobot или @RawDataBot.
+    # REQUIRED: the Telegram chat_id allowed to send commands.
+    # Find your chat_id: message @userinfobot or @RawDataBot.
     allowed_chat_id: 0
 
-    # Таймаут ожидания ответа от llm_node (сек).
-    # Ставьте чуть больше чем timeout_sec в llm_node (по умолчанию 30).
+    # Timeout waiting for a reply from llm_node (sec).
+    # Set it a bit higher than timeout_sec in llm_node (default 30).
     llm_timeout_sec: 35.0
 
-    # Путь к SQLite БД для поиска telegram_id → person
+    # Path to the SQLite DB for looking up telegram_id → person
     memory_db_path: "/home/artur/inmoov_memory.db"
 
-    # Устройство камеры для /photo (левый глаз)
+    # Camera device for /photo (left eye)
     cam_device: "/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0"

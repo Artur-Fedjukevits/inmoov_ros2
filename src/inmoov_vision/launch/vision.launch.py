@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """
-vision.launch.py — запуск vision pipeline для InMoov.
+vision.launch.py — launches the vision pipeline for InMoov.
 
-Поток данных:
-  PIR (/pir_state) → inmoov_cognition → /face_detection/enable
-  /face_detection/enable → face_detection_node_{left,right}
-                         → face_tracker_node_{left,right}
-  inmoov_cognition  → /head_tracker/enable → vision_head_tracker_node
+Data flow:
+  PIR (/pir_state) -> inmoov_cognition -> /face_detection/enable
+  /face_detection/enable -> face_detection_node_{left,right}
+                         -> face_tracker_node_{left,right}
+  inmoov_cognition  -> /head_tracker/enable -> vision_head_tracker_node
 
-  face_capture_node           → /camera/eye_{left,right}/compressed
-  face_detection_node_left    → /face/detections/left
-  face_detection_node_right   → /face/detections/right  (buffalo_l)
-  face_tracker_node_left      → /face/tracks/left
-  face_tracker_node_right     → /face/tracks/right
-  face_recognition_node       → /face/identity  (из /face/tracks/left)
-  emotion_recognition_node    → /face/emotion   (из /face/tracks/left)
-  vision_head_tracker_node    → /joint_command, /face_command
+  face_capture_node           -> /camera/eye_{left,right}/compressed
+  face_detection_node_left    -> /face/detections/left
+  face_detection_node_right   -> /face/detections/right  (buffalo_l)
+  face_tracker_node_left      -> /face/tracks/left
+  face_tracker_node_right     -> /face/tracks/right
+  face_recognition_node       -> /face/identity  (from /face/tracks/left)
+  emotion_recognition_node    -> /face/emotion   (from /face/tracks/left)
+  vision_head_tracker_node    -> /joint_command, /face_command
 
-  identity_manager_node живёт в inmoov_cognition пакете.
+  identity_manager_node lives in the inmoov_cognition package.
 
-Использование:
+Usage:
   ros2 launch inmoov_vision vision.launch.py
   ros2 launch inmoov_vision vision.launch.py cam_left:=... cam_right:=...
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 from launch import LaunchDescription
@@ -44,15 +48,15 @@ def generate_launch_description():
         DeclareLaunchArgument('gain_eye',             default_value='0.6'),
         DeclareLaunchArgument('rest_rothead',         default_value='90.0'),
         DeclareLaunchArgument('rest_neck',            default_value='40.0'),
-        # OAK-D Lite (depthai v3 — модель из Luxonis HubAI)
+        # OAK-D Lite (depthai v3 — model from Luxonis HubAI)
         DeclareLaunchArgument('oak_model',            default_value='yolov6-nano'),
         DeclareLaunchArgument('oak_conf_threshold',   default_value='0.5'),
-        # Scene manager — статичное имя текущего места робота (робот на колёсах,
-        # переносится вручную; можно менять на лету через `ros2 param set`)
+        # Scene manager — static name of the robot's current location (the robot
+        # is on wheels and is moved by hand; can be changed on the fly via `ros2 param set`)
         DeclareLaunchArgument('scene_location',       default_value=''),
     ]
 
-    # 1. Камера — всегда запущена (лёгкий процесс)
+    # 1. Camera — always running (lightweight process)
     face_capture = Node(
         package='inmoov_vision',
         executable='face_capture_node',
@@ -68,7 +72,7 @@ def generate_launch_description():
         }],
     )
 
-    # 2a. Детекция лиц — левый глаз (buffalo_l: bbox + embedding)
+    # 2a. Face detection — left eye (buffalo_l: bbox + embedding)
     face_detection_left = Node(
         package='inmoov_vision',
         executable='face_detection_node',
@@ -83,10 +87,10 @@ def generate_launch_description():
         }],
     )
 
-    # 2b. Детекция лиц — правый глаз (buffalo_l: bbox + embedding для fallback/redundancy)
-    # Настоящий fallback-по-требованию: insightface на правом включается только
-    # когда левый (primary) реально не публикует >1.5с, а не гоняется постоянно
-    # параллельно с левым — экономия CPU.
+    # 2b. Face detection — right eye (buffalo_l: bbox + embedding for fallback/redundancy)
+    # A true on-demand fallback: insightface on the right eye is switched on only
+    # when the left (primary) really has not published for >1.5 s, rather than
+    # running constantly in parallel with the left — saves CPU.
     face_detection_right = Node(
         package='inmoov_vision',
         executable='face_detection_node',
@@ -103,7 +107,7 @@ def generate_launch_description():
         }],
     )
 
-    # 3a. Трекер левого глаза
+    # 3a. Left-eye tracker
     face_tracker_left = Node(
         package='inmoov_vision',
         executable='face_tracker_node',
@@ -117,7 +121,7 @@ def generate_launch_description():
         }],
     )
 
-    # 3b. Трекер правого глаза
+    # 3b. Right-eye tracker
     face_tracker_right = Node(
         package='inmoov_vision',
         executable='face_tracker_node',
@@ -131,7 +135,7 @@ def generate_launch_description():
         }],
     )
 
-    # 4. Распознавание — требует /memory/query сервис
+    # 4. Recognition — requires the /memory/query service
     face_recognition = Node(
         package='inmoov_vision',
         executable='face_recognition_node',
@@ -142,7 +146,7 @@ def generate_launch_description():
         }],
     )
 
-    # 5. Эмоции лица
+    # 5. Face emotion
     emotion_recognition = Node(
         package='inmoov_vision',
         executable='emotion_recognition_node',
@@ -180,7 +184,7 @@ def generate_launch_description():
         }],
     )
 
-    # 11. Scene manager — сводка сцены (объекты + люди) из /objects/detections
+    # 11. Scene manager — scene summary (objects + people) from /objects/detections
     scene_manager = Node(
         package='inmoov_vision',
         executable='scene_manager_node',
@@ -197,7 +201,7 @@ def generate_launch_description():
         }],
     )
 
-    # 7. Галерея фотографий — автосъёмка лиц для gallery-based распознавания
+    # 7. Photo gallery — automatic face capture for gallery-based recognition
     face_gallery = Node(
         package='inmoov_vision',
         executable='face_gallery_node',
@@ -212,7 +216,7 @@ def generate_launch_description():
         }],
     )
 
-    # 8. Head tracker — поворот головы/глаз к лицу (dual-eye leader/follower)
+    # 8. Head tracker — turns the head/eyes towards the face (dual-eye leader/follower)
     head_tracker = Node(
         package='inmoov_vision',
         executable='vision_head_tracker_node',
@@ -232,7 +236,7 @@ def generate_launch_description():
             'dead_zone_px':        20,
             'head_dead_zone_px':   80,
             'eye_limit_deg':       8.0,
-            'return_timeout_sec':  10.0,  # синхронизировано с inmoov_bringup/inmoov.launch.py (2026-09-01)
+            'return_timeout_sec':  10.0,  # synchronized with inmoov_bringup/inmoov.launch.py (2026-09-01)
             'track_hz':            10.0,
             'max_step_deg':        2.0,
             'bbox_ema_alpha':      0.4,

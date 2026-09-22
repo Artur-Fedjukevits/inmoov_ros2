@@ -1,14 +1,22 @@
 """
-joint_state_publisher.py — Publishes /joint_states и /face_joint_states.
+joint_state_publisher.py — Publishes /joint_states and /face_joint_states.
 
-Читает текущие позиции серво через echo-канал (Arduino публикует свои
-значения только при изменении, либо по запросу). Для дебага и visualisation
-в rviz2 — подписывается на /joint_command и /face_command и ретранслирует
-их как /joint_states / /face_joint_states с корректным header.stamp.
+Reads the current servo positions via an echo channel (the Arduino publishes
+its values only on change, or on request). For debugging and visualisation in
+rviz2 — subscribes to /joint_command and /face_command and re-publishes them
+as /joint_states / /face_joint_states with a proper header.stamp.
 
-Использование:
-  Запустить рядом с arduino_right_node и arduino_left_node.
-  Подписчики: policy inference node, rviz2, rosbag для сбора данных.
+NOTE: in the current implementation no echo channel is read — the node only
+re-publishes the last *commanded* positions (see the JointStatePublisher
+class docstring).
+
+Usage:
+  Run alongside arduino_right_node and arduino_left_node.
+  Subscribers: policy inference node, rviz2, rosbag for data collection.
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import math

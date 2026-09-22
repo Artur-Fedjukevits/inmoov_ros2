@@ -1,14 +1,14 @@
-# Goal — что сказать
+# Goal — what to say
 string text
-string voice        # имя голосового пресета OmniVoice ("neutral"/"happy"/"sad"/"surprise", "" = neutral)
-float32 rate        # скорость: 0.0/1.0 = нормальная, 0.5 = медленно, 2.0 = быстро
+string voice        # OmniVoice preset name ("neutral"/"happy"/"sad"/"surprise", "" = neutral)
+float32 rate        # speed: 0.0/1.0 = normal, 0.5 = slow, 2.0 = fast
 ---
 # Result
 bool success
-string message      # описание ошибки если !success
-float32 audio_sec   # фактическая длительность воспроизведения
+string message      # error description if !success
+float32 audio_sec   # actual playback duration
 ---
-# Feedback (публикуется во время синтеза и воспроизведения)
+# Feedback (published during synthesis and playback)
 string status       # "connecting" | "synthesizing" | "playing" | "done"
-float32 progress    # 0.0..1.0 если Content-Length известен, иначе -1.0
-int32 bytes_played  # байт воспроизведено (для синхронизации жестов)
+float32 progress    # 0.0..1.0 if Content-Length is known, else -1.0
+int32 bytes_played  # bytes played back (for gesture sync)

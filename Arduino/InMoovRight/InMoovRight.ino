@@ -1,6 +1,10 @@
 /**
  * InMoovRight.ino — Right Arduino Mega 2560
  *
+ * Author: Artur Fedjukevits
+ * Assisted by: Claude Code (Anthropic)
+ * License: GNU General Public License v3.0 (see repository root LICENSE)
+ *
  * Replaces xicro. Same servo logic, min/max/rest/step/pins preserved.
  * Protocol: binary batch frame from ROS2 over USB Serial.
  *

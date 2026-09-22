@@ -23,8 +23,8 @@ setup(
     zip_safe=True,
     maintainer='artur',
     maintainer_email='fedjukevitsh@gmail.com',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Cognition layer for the InMoov robot: Behavior Tree, IdentityManager, LLM dialogue, openHAB/Telegram bridges',
+    license='GPL-3.0-only',
     extras_require={
         'test': [
             'pytest',

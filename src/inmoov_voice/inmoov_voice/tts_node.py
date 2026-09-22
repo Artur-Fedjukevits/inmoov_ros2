@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-tts_node.py — ROS2 Action Server для синтеза и воспроизведения речи.
+tts_node.py — ROS2 Action Server for speech synthesis and playback.
 
 Action: /speak (inmoov_msgs/action/Speak)
   Goal:     text, voice, rate
   Feedback: status, progress, bytes_played
   Result:   success, message, audio_sec
 
-Особенности:
-  - Preemption: новый goal мгновенно прерывает текущее воспроизведение
-  - Fallback: при недоступности основного TTS сервера — локальный
-  - Публикует tts_speaking (Bool) для voice_detector (обратная совместимость)
+Features:
+  - Preemption: a new goal immediately interrupts the current playback
+  - Fallback: if the primary TTS server is unavailable — a local one
+  - Publishes tts_speaking (Bool) for voice_detector (backward compatibility)
 
-Клиенты:
-  - llm_node      — текстовые ответы на голосовые команды
-  - inmoov_cognition — речь как часть поведения (жесты + речь)
+Clients:
+  - llm_node      — text replies to voice commands
+  - inmoov_cognition — speech as part of behavior (gestures + speech)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import math
@@ -38,51 +42,54 @@ from inmoov_msgs.action import Speak
 
 
 class TTSNode(LifecycleNode):
-    # Инцидент 2026-08-07: при обрыве PipeWire/ALSA (Jabra) stream.write()
-    # у PortAudio уходит во внутренний C-level busy-retry XRun-цикл
-    # (AlsaRestart/PaAlsaStream_HandleXrun) без сна между попытками —
-    # Python-флаги (my_abort) внутри такого write() не проверяются, поэтому
-    # штатно прервать это нельзя. За секунды это забивает CPU и заваливает
-    # journald (наблюдалось 386к сообщений/с), из-за чего виснет вся машина.
-    # Watchdog ниже — единственный надёжный выход: если после начала
-    # воспроизведения нет прогресса дольше _STALL_TIMEOUT_SEC, считаем
-    # процесс безнадёжно зависшим и убиваем его целиком; respawn=True
-    # в launch-файле поднимет чистый процесс через respawn_delay секунд.
+    # Incident 2026-08-07: when PipeWire/ALSA (Jabra) drops out, PortAudio's
+    # stream.write() falls into an internal C-level busy-retry XRun loop
+    # (AlsaRestart/PaAlsaStream_HandleXrun) with no sleep between attempts —
+    # Python flags (my_abort) are not checked inside such a write(), so it
+    # cannot be interrupted gracefully. Within seconds this hogs the CPU and
+    # floods journald (386k messages/s were observed), which hangs the whole
+    # machine. The watchdog below is the only reliable way out: if there is
+    # no progress for longer than _STALL_TIMEOUT_SEC after playback has
+    # started, the process is considered hopelessly stuck and is killed
+    # entirely; respawn=True in the launch file brings up a clean process
+    # after respawn_delay seconds.
     _STALL_TIMEOUT_SEC = 8.0
 
     def __init__(self):
         super().__init__('tts_node')
 
-        # Threading state остаётся в __init__ — не зависит от lifecycle
+        # Threading state stays in __init__ — independent of the lifecycle
         self._execute_lock       = threading.Lock()
         self._abort_lock         = threading.Lock()
         self._abort_event        = threading.Event()
         self._goals_pending      = 0
         self._goals_pending_lock = threading.Lock()
         self._cancel_queued      = threading.Event()
-        # Эмоция лица, показанная для текущей речи (см. _execute_speak) —
-        # держится на /face_expression_hold пока не завершится ПОСЛЕДНЯЯ
-        # ожидающая цель (тот же паттерн, что и tts_speaking ниже), защищена
-        # тем же _goals_pending_lock.
+        # Face emotion shown for the current speech (see _execute_speak) —
+        # held on /face_expression_hold until the LAST pending goal finishes
+        # (same pattern as tts_speaking below), protected by the same
+        # _goals_pending_lock.
         self._active_face_emotion: str | None = None
         self._FACE_EMOTIONS = frozenset(('neutral', 'happy', 'sad', 'surprise'))
 
-        # Stall-watchdog (см. комментарий у _STALL_TIMEOUT_SEC)
+        # Stall-watchdog (see the comment at _STALL_TIMEOUT_SEC)
         self._playback_active      = threading.Event()
         self._last_write_ts        = 0.0
-        # Инцидент 2026-08-15: watchdog сравнивал "сейчас" с моментом ПОСЛЕДНЕГО
-        # УСПЕШНОГО write() — это путает две разные вещи. Между HTTP-чанками
-        # /tts/stream есть законные паузы (сервер ещё генерирует следующий
-        # кусок аудио) — тогда write() вообще не вызывается, writes_in_progress=0.
-        # Раньше watchdog принимал такую паузу за "write() завис" и убивал
-        # процесс через 8с, хотя ALSA/PortAudio были ни при чём. Теперь watchdog
-        # смотрит только на время ВНУТРИ самого вызова write() — т.е. реальный
-        # симптом busy-retry XRun-петли (инцидент 2026-08-07), а не на паузы
-        # между приходом данных по сети.
+        # Incident 2026-08-15: the watchdog compared "now" with the moment of
+        # the LAST SUCCESSFUL write() — which conflates two different things.
+        # Between the HTTP chunks of /tts/stream there are legitimate pauses
+        # (the server is still generating the next piece of audio) — during
+        # which write() is not called at all, writes_in_progress=0. The
+        # watchdog used to take such a pause for a "hung write()" and killed
+        # the process after 8s, although ALSA/PortAudio had nothing to do with
+        # it. Now the watchdog looks only at the time INSIDE the write() call
+        # itself — i.e. the real symptom of the busy-retry XRun loop
+        # (incident 2026-08-07), not at pauses between data arriving over the
+        # network.
         self._write_in_progress_since = 0.0
         self._stall_watchdog_ready = False
 
-        # Заглушки — заполняются в on_configure / on_activate
+        # Placeholders — filled in on_configure / on_activate
         self._session       = None
         self._speaking_pub  = None
         self._jaw_pub       = None
@@ -94,7 +101,7 @@ class TTSNode(LifecycleNode):
     # ── Lifecycle: Phase 2 ─────────────────────────────────────────────────
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores re-declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -129,8 +136,8 @@ class TTSNode(LifecycleNode):
         self.create_subscription(Bool,   '/tts_cancel_queue',  self._cancel_queue_cb, 10)
         self._speaking_pub = self.create_lifecycle_publisher(Bool, 'tts_speaking', 10)
         self._jaw_pub      = self.create_lifecycle_publisher(JointState, '/face_command', 10)
-        # Held-мимика на время речи (см. _execute_speak) — отдельно от
-        # анимированного одноразового /face_expression (greet/farewell/BT).
+        # Held facial expression for the duration of speech (see _execute_speak) —
+        # separate from the animated one-shot /face_expression (greet/farewell/BT).
         self._face_expr_pub = self.create_lifecycle_publisher(
             String, '/face_expression_hold', 10)
         return TransitionCallbackReturn.SUCCESS
@@ -140,21 +147,23 @@ class TTSNode(LifecycleNode):
         self._jaw_pub.on_activate(state)
         self._face_expr_pub.on_activate(state)
 
-        # Инцидент 2026-08-15: при аварийном os._exit(1) из _stall_watchdog_loop
-        # процесс убивается посреди speaking=True — finally-блок с
-        # self._publish_speaking(False) не успевает выполниться. После рестарта
-        # voice_detector_node навсегда остаётся уверен, что TTS говорит, и
-        # игнорирует весь микрофонный ввод (voice_detector_node._audio_callback:
-        # `if self.tts_speaking: return`). Публикуем False сразу при активации —
-        # при штатном старте это no-op (получатели уже инициализированы как
-        # False), но снимает залипание после аварийного рестарта.
+        # Incident 2026-08-15: on an emergency os._exit(1) from
+        # _stall_watchdog_loop the process is killed in the middle of
+        # speaking=True — the finally block with self._publish_speaking(False)
+        # has no time to run. After the restart voice_detector_node stays
+        # convinced forever that TTS is speaking and ignores all microphone
+        # input (voice_detector_node._audio_callback:
+        # `if self.tts_speaking: return`). We publish False right on activation
+        # — on a normal start this is a no-op (the receivers are already
+        # initialized as False), but it clears the stuck state after an
+        # emergency restart.
         self._publish_speaking(False)
 
-        # Находим output device (нужен живой PipeWire)
+        # Find the output device (needs a live PipeWire)
         self._output_device = self._find_output_device(
             self.get_parameter('output_device_name').value)
 
-        # Проверяем серверы — WARN если недоступны, но не FAILURE (fallback есть)
+        # Check the servers — WARN if unavailable, but not FAILURE (a fallback exists)
         self._check_servers()
 
         if not self._stall_watchdog_ready:
@@ -172,11 +181,11 @@ class TTSNode(LifecycleNode):
             cancel_callback=self._cancel_callback,
             callback_group=ReentrantCallbackGroup(),
         )
-        self.get_logger().info(f'TTS Action Server готов. Сервер: {self._active_url}')
+        self.get_logger().info(f'TTS Action Server ready. Server: {self._active_url}')
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
-        # Прерываем текущее воспроизведение
+        # Interrupt the current playback
         with self._abort_lock:
             self._abort_event.set()
 
@@ -207,37 +216,37 @@ class TTSNode(LifecycleNode):
             self._session.close()
         return TransitionCallbackReturn.SUCCESS
 
-    # ── Stall-watchdog (см. комментарий у _STALL_TIMEOUT_SEC) ─────────────
+    # ── Stall-watchdog (see the comment at _STALL_TIMEOUT_SEC) ────────────
 
     def _stall_watchdog_loop(self):
-        """Живёт всё время работы процесса (не привязан к lifecycle-состоянию:
-        застрять в C-петле можно и во время on_deactivate).
+        """Lives for the whole lifetime of the process (not tied to the lifecycle
+        state: one can get stuck in the C loop during on_deactivate too).
 
-        Смотрит ТОЛЬКО на время внутри активного вызова stream.write() —
-        см. комментарий у self._write_in_progress_since в __init__. Паузы
-        между чанками (ждём данные по сети/WS) сюда не попадают."""
+        Looks ONLY at the time spent inside an active stream.write() call —
+        see the comment at self._write_in_progress_since in __init__. Pauses
+        between chunks (waiting for data over the network/WS) don't count."""
         while True:
             time.sleep(1.0)
             if not self._playback_active.is_set():
                 continue
             started = self._write_in_progress_since
             if started <= 0.0:
-                continue  # сейчас не внутри write() — ждём данные, это нормально
+                continue  # not inside write() right now — waiting for data, that's normal
             stalled = time.time() - started
             if stalled > self._STALL_TIMEOUT_SEC:
                 self.get_logger().fatal(
-                    f'TTS: stream.write() не прогрессирует {stalled:.1f}с — '
-                    f'похоже на зависшую ALSA/PipeWire XRun-петлю внутри '
-                    f'PortAudio. Аварийный перезапуск процесса.'
+                    f'TTS: stream.write() has made no progress for {stalled:.1f}s — '
+                    f'looks like a stuck ALSA/PipeWire XRun loop inside '
+                    f'PortAudio. Emergency process restart.'
                 )
                 import sys
                 sys.stderr.flush()
-                os._exit(1)  # SIGKILL-подобный выход: рвём C-уровень немедленно
+                os._exit(1)  # SIGKILL-like exit: cut the C level off immediately
 
     def _write_chunk(self, stream, data: bytes):
-        """stream.write() с heartbeat для stall-watchdog.
-        _write_in_progress_since отмечает окно РЕАЛЬНОГО вызова write() —
-        watchdog реагирует только пока мы внутри него."""
+        """stream.write() with a heartbeat for the stall watchdog.
+        _write_in_progress_since marks the window of the REAL write() call —
+        the watchdog reacts only while we are inside it."""
         self._write_in_progress_since = time.time()
         try:
             stream.write(data)
@@ -245,18 +254,18 @@ class TTSNode(LifecycleNode):
             self._write_in_progress_since = 0.0
         self._last_write_ts = time.time()
 
-    # ── Проверка серверов ──────────────────────────────────────────────────
+    # ── Server checks ──────────────────────────────────────────────────────
 
     def _check_servers(self):
         if self._probe_server(self.primary_url):
             self._active_url = self.primary_url
-            self.get_logger().info(f'TTS: основной сервер доступен ({self.primary_url})')
+            self.get_logger().info(f'TTS: primary server is reachable ({self.primary_url})')
         elif self._probe_server(self.fallback_url):
             self._active_url = self.fallback_url
             self.get_logger().warn(
-                f'Основной TTS недоступен! Резервный: {self.fallback_url}')
+                f'Primary TTS unavailable! Fallback: {self.fallback_url}')
         else:
-            self.get_logger().error('Оба TTS сервера недоступны!')
+            self.get_logger().error('Both TTS servers are unavailable!')
 
     def _probe_server(self, url: str) -> bool:
         try:
@@ -272,57 +281,57 @@ class TTSNode(LifecycleNode):
         except Exception:
             return False
 
-    # ── Сброс очереди TTS (preemption при пользовательском прерывании) ────
+    # ── TTS queue flush (preemption on user interruption) ─────────────────
 
     def _cancel_queue_cb(self, msg: Bool):
-        """Отменяет текущий goal и помечает все ожидающие для отклонения."""
+        """Cancels the current goal and marks all pending ones for rejection."""
         if not msg.data:
             return
         with self._goals_pending_lock:
             if self._goals_pending == 0:
-                return  # action server не играет — нечего отменять
+                return  # the action server is not playing — nothing to cancel
             self._cancel_queued.set()
         with self._abort_lock:
-            self._abort_event.set()  # прерывает текущее воспроизведение
-        self.get_logger().info('TTS: сброс очереди (пользовательское прерывание)')
+            self._abort_event.set()  # interrupts the current playback
+        self.get_logger().info('TTS: queue flushed (user interruption)')
 
     # ── Action callbacks ───────────────────────────────────────────────────
 
     def _goal_callback(self, goal_request):
-        """Принимаем все goals. Preemption происходит внутри execute."""
+        """Accept all goals. Preemption happens inside execute."""
         text_preview = (goal_request.text[:40] + '...') if len(goal_request.text) > 40 else goal_request.text
         style_info = ''
         if goal_request.voice:
             style_info += f' emotion="{goal_request.voice}"'
         if goal_request.rate not in (0.0, 1.0):
             style_info += f' speed={goal_request.rate:.2f}'
-        self.get_logger().info(f'Новый Speak goal: "{text_preview}"{style_info}')
+        self.get_logger().info(f'New Speak goal: "{text_preview}"{style_info}')
         with self._goals_pending_lock:
             self._goals_pending += 1
         return GoalResponse.ACCEPT
 
     def _cancel_callback(self, goal_handle):
-        """Принимаем запросы на отмену от клиентов."""
-        self.get_logger().info('Запрос отмены TTS goal')
+        """Accept cancellation requests from clients."""
+        self.get_logger().info('TTS goal cancellation request')
         return CancelResponse.ACCEPT
 
-    # ── Execute: основная логика ───────────────────────────────────────────
+    # ── Execute: main logic ────────────────────────────────────────────────
 
     def _execute_speak(self, goal_handle):
         """
-        Выполняется в отдельном потоке (ReentrantCallbackGroup).
+        Runs in a separate thread (ReentrantCallbackGroup).
 
-        Preemption: при старте создаём новый abort_event, сигнализируем старому.
-        Старый execute loop проверяет свой event и выходит.
+        Preemption: on start we create a new abort_event and signal the old one.
+        The old execute loop checks its own event and exits.
         """
-        # ── Ждём завершения предыдущего goal (очередь, не preemption) ────────
-        # Таймаут: если предыдущий завис — пропускаем через 35с
+        # ── Wait for the previous goal to finish (queueing, not preemption) ──
+        # Timeout: if the previous one is stuck — skip it after 35s
         if not self._execute_lock.acquire(timeout=35.0):
-            self.get_logger().warn('TTS: предыдущий goal завис — пропускаю')
+            self.get_logger().warn('TTS: previous goal is stuck — skipping')
             goal_handle.abort()
             result = Speak.Result()
             result.success = False
-            result.message = 'Таймаут очереди'
+            result.message = 'Queue timeout'
             with self._goals_pending_lock:
                 self._goals_pending -= 1
             return result
@@ -337,18 +346,18 @@ class TTSNode(LifecycleNode):
             goal_handle.abort()
             result = Speak.Result()
             result.success = False
-            result.message = 'Пустой текст'
+            result.message = 'Empty text'
             with self._goals_pending_lock:
                 self._goals_pending -= 1
             self._execute_lock.release()
             return result
 
-        # Если очередь была сброшена (пользователь перебил) — отклоняем этот чанк
+        # If the queue was flushed (the user interrupted) — reject this chunk
         if self._cancel_queued.is_set():
             goal_handle.abort()
             result = Speak.Result()
             result.success = False
-            result.message = 'Очередь сброшена'
+            result.message = 'Queue flushed'
             with self._goals_pending_lock:
                 self._goals_pending -= 1
                 if self._goals_pending == 0:
@@ -368,7 +377,7 @@ class TTSNode(LifecycleNode):
 
         _fb('connecting')
 
-        # ── Выбор URL с fallback ───────────────────────────────────────────
+        # ── URL selection with fallback ────────────────────────────────────
         urls = [self._active_url]
         other = self.fallback_url if self._active_url == self.primary_url else self.primary_url
         if other != self._active_url:
@@ -378,8 +387,8 @@ class TTSNode(LifecycleNode):
         error_msg = ''
 
         self._publish_speaking(True)
-        # Мимика лица синхронно с голосом на всё время этой фразы (см.
-        # set_voice_style в llm_node). Пусто (greet/farewell) — лицо не трогаем.
+        # Facial expression in sync with the voice for the whole phrase (see
+        # set_voice_style in llm_node). Empty (greet/farewell) — leave the face alone.
         face_emotion = emotion.lower()
         if face_emotion in self._FACE_EMOTIONS:
             with self._goals_pending_lock:
@@ -395,22 +404,21 @@ class TTSNode(LifecycleNode):
                     )
                     if success or error_msg not in ('connection_error',):
                         if url != self._active_url:
-                            self.get_logger().warn(f'Переключился на резервный TTS: {url}')
+                            self.get_logger().warn(f'Switched to the fallback TTS: {url}')
                             self._active_url = url
                         break
                 except Exception as e:
                     error_msg = str(e)
-                    self.get_logger().error(f'TTS ошибка [{url}]: {e}')
+                    self.get_logger().error(f'TTS error [{url}]: {e}')
         finally:
             revert_face = False
             with self._goals_pending_lock:
                 self._goals_pending -= 1
                 if self._goals_pending == 0:
                     self._cancel_queued.clear()
-                    # Последняя ожидающая цель — если для неё была показана
-                    # не-нейтральная эмоция, возвращаем лицо в neutral. Работает
-                    # и при обычном завершении, и при cancel/abort (оба пути
-                    # приходят сюда же).
+                    # Last pending goal — if a non-neutral emotion was shown
+                    # for it, return the face to neutral. Works both on normal
+                    # completion and on cancel/abort (both paths end up here).
                     if self._active_face_emotion not in (None, 'neutral'):
                         revert_face = True
                     self._active_face_emotion = None
@@ -419,19 +427,19 @@ class TTSNode(LifecycleNode):
             self._publish_speaking(False)
             self._execute_lock.release()
 
-        # ── Результат ─────────────────────────────────────────────────────
+        # ── Result ────────────────────────────────────────────────────────
         audio_sec = time.time() - start_time
 
         if goal_handle.is_cancel_requested:
             goal_handle.canceled()
             result = Speak.Result()
             result.success   = False
-            result.message   = 'Отменено клиентом'
+            result.message   = 'Canceled by client'
             result.audio_sec = audio_sec
             return result
 
         if success:
-            self.get_logger().info(f'TTS воспроизведён за {audio_sec:.1f}с')
+            self.get_logger().info(f'TTS played in {audio_sec:.1f}s')
             goal_handle.succeed()
         else:
             goal_handle.abort()
@@ -447,23 +455,24 @@ class TTSNode(LifecycleNode):
         goal_handle, my_abort: threading.Event, fb
     ) -> tuple[bool, int, str]:
         """
-        Стримит аудио с TTS сервера и воспроизводит.
-        Возвращает (success, bytes_played, error_msg).
+        Streams audio from the TTS server and plays it.
+        Returns (success, bytes_played, error_msg).
 
-        emotion — имя голосового пресета сервера (OmniVoice/audio.cpp,
+        emotion — name of the server's voice preset (OmniVoice/audio.cpp,
         server.json → voice_presets): "neutral"/"happy"/"sad"/"surprise".
-        Клонирование голоса доминирует над текстовыми instruct-инструкциями
-        (наследие CosyVoice3), поэтому только предустановленные пресеты.
-        Пусто/неизвестное имя = сервер откатывает на "neutral".
+        Voice cloning dominates over textual instruct instructions
+        (a CosyVoice3 legacy), hence only pre-defined presets.
+        Empty/unknown name = the server falls back to "neutral".
         """
         body: dict = {'text': text}
         if emotion:
             body['emotion'] = emotion
 
-        # TTFA (Time To First Audio) — от отправки POST до первого полученного
-        # аудио-байта: коннект + время сервера до начала выдачи потока.
-        # Именно эта задержка определяет ощущаемую "отзывчивость" TTS —
-        # см. обсуждение миграции CosyVoice3 → OmniVoice (MIGRATION_NOTES.md).
+        # TTFA (Time To First Audio) — from sending the POST to the first
+        # received audio byte: connect + server time until it starts emitting
+        # the stream. This latency determines the perceived "responsiveness"
+        # of the TTS — see the discussion of the CosyVoice3 → OmniVoice
+        # migration (MIGRATION_NOTES.md).
         t_req_start = time.time()
         ttfa_logged = False
 
@@ -492,7 +501,7 @@ class TTSNode(LifecycleNode):
                     self._playback_active.set()
                     try:
                         for chunk in resp.iter_content(chunk_size=self.chunk_size):
-                            # Preemption / cancellation check между чанками
+                            # Preemption / cancellation check between chunks
                             if my_abort.is_set() or goal_handle.is_cancel_requested:
                                 stream.abort()
                                 resp.close()
@@ -502,7 +511,7 @@ class TTSNode(LifecycleNode):
                             if chunk:
                                 if not ttfa_logged:
                                     self.get_logger().info(
-                                        f'TTFA: {time.time() - t_req_start:.2f}с '
+                                        f'TTFA: {time.time() - t_req_start:.2f}s '
                                         f'[{url}]')
                                     ttfa_logged = True
                                 self._write_chunk(stream, chunk)
@@ -517,7 +526,7 @@ class TTSNode(LifecycleNode):
                 self._publish_jaw(self._jaw_closed)
 
                 if bytes_played == 0:
-                    return False, 0, 'Пустой поток от TTS сервера'
+                    return False, 0, 'Empty stream from the TTS server'
 
                 return True, bytes_played, ''
 
@@ -525,14 +534,14 @@ class TTSNode(LifecycleNode):
             self.get_logger().warn(f'TTS ConnectionError [{url}]: {e}')
             return False, 0, 'connection_error'
         except requests.exceptions.Timeout:
-            return False, 0, f'Таймаут ({self.timeout_sec}с)'
+            return False, 0, f'Timeout ({self.timeout_sec}s)'
         except requests.exceptions.HTTPError as e:
-            return False, 0, f'HTTP ошибка: {e}'
+            return False, 0, f'HTTP error: {e}'
 
-    # ── Вспомогательные методы ─────────────────────────────────────────────
+    # ── Helper methods ─────────────────────────────────────────────────────
 
     def _chunk_to_jaw(self, chunk: bytes) -> int:
-        """Вычисляет RMS чанка PCM int16 и маппит в позицию челюсти."""
+        """Computes the RMS of a PCM int16 chunk and maps it to a jaw position."""
         audio = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
         rms = np.sqrt(np.mean(audio ** 2))
         if rms < self._jaw_rms_threshold:
@@ -542,11 +551,11 @@ class TTSNode(LifecycleNode):
         return int(self._jaw_closed + t * (self._jaw_open - self._jaw_closed))
 
     def _publish_jaw(self, position: int):
-        """Публикует позицию челюсти через /face_command (JointState).
-        position — градусы [jaw_closed..jaw_open], конвертируется в радианы
-        по формуле (deg - 90) * π/180 (center_deg=90, как везде в face protocol).
-        velocity  — скорость в rad/s; arduino_left_node конвертирует в step
-                    и отправляет CMD_SET_SPEEDS только при изменении.
+        """Publishes the jaw position via /face_command (JointState).
+        position — degrees [jaw_closed..jaw_open], converted to radians
+        with (deg - 90) * π/180 (center_deg=90, as everywhere in the face protocol).
+        velocity  — speed in rad/s; arduino_left_node converts it to a step
+                    and sends CMD_SET_SPEEDS only when it changes.
         """
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -561,9 +570,9 @@ class TTSNode(LifecycleNode):
         self._speaking_pub.publish(msg)
 
     def _publish_face_emotion(self, name: str):
-        """Held-мимика на время речи, см. _execute_speak. Отдельно от
-        анимированного /face_expression — face_expressions_node применяет
-        позу статично, без встроенного авто-возврата."""
+        """Held facial expression for the duration of speech, see _execute_speak.
+        Separate from the animated /face_expression — face_expressions_node
+        applies the pose statically, without a built-in auto-return."""
         msg = String()
         msg.data = name
         self._face_expr_pub.publish(msg)
@@ -577,17 +586,17 @@ class TTSNode(LifecycleNode):
         for i, d in enumerate(sd.query_devices()):
             if '(hw:' not in d['name'] and d['max_output_channels'] > 0 \
                     and name_lower in d['name'].lower():
-                self.get_logger().info(f'Аудио вывод: [{i}] {d["name"]}')
+                self.get_logger().info(f'Audio output: [{i}] {d["name"]}')
                 return i
         # hw: device found but PipeWire manages it → fall back to system default
         for i, d in enumerate(sd.query_devices()):
             if '(hw:' in d['name'] and d['max_output_channels'] > 0 \
                     and name_lower in d['name'].lower():
                 self.get_logger().warn(
-                    f'Устройство "{d["name"]}" доступно только через raw ALSA — '
-                    f'использую системное (PipeWire)')
+                    f'Device "{d["name"]}" is only available via raw ALSA — '
+                    f'using the system default (PipeWire)')
                 return None
-        self.get_logger().warn(f'Устройство вывода "{name}" не найдено, использую системное')
+        self.get_logger().warn(f'Output device "{name}" not found, using the system default')
         return None
 
     @staticmethod
@@ -608,8 +617,8 @@ class TTSNode(LifecycleNode):
 def main():
     rclpy.init()
     node = TTSNode()
-    # MultiThreadedExecutor нужен для ReentrantCallbackGroup:
-    # execute callback нового goal должен стартовать пока старый ещё работает
+    # MultiThreadedExecutor is required for ReentrantCallbackGroup:
+    # the execute callback of a new goal must start while the old one is still running
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:

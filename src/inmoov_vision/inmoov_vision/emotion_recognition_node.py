@@ -2,19 +2,19 @@
 """
 emotion_recognition_node.py
 ===========================
-Определяет эмоцию на лице с помощью hsemotion-onnx (EfficientNet-B0 / AffectNet).
+Detects facial emotion using hsemotion-onnx (EfficientNet-B0 / AffectNet).
 
-Резервирование: по умолчанию работает с левым глазом. Если левый недоступен
-(нет треков > STALE_SEC), автоматически переключается на правый. Обратный
-переход происходит сразу как только левый глаз снова присылает треки.
+Redundancy: works with the left eye by default. If the left eye is
+unavailable (no tracks for > STALE_SEC), automatically switches to the
+right eye. Switches back as soon as the left eye sends tracks again.
 
-Подписки:
+Subscriptions:
   /camera/eye_left/compressed   (sensor_msgs/CompressedImage)
   /camera/eye_right/compressed  (sensor_msgs/CompressedImage)
   /face/tracks/left             (String JSON)
   /face/tracks/right            (String JSON)
 
-Публикует:
+Publishes:
   /face/emotion  (String JSON)
   {
     "track_id": 3,
@@ -23,6 +23,10 @@ emotion_recognition_node.py
     "source": "left",
     "all": {"angry":0.01, "happy":0.89, ...}
   }
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -38,7 +42,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, String
 
-_STALE_SEC = 2.0  # порог недоступности (с)
+_STALE_SEC = 2.0  # unavailability threshold (s)
 
 _LABEL_MAP = {
     'Anger':    'angry',
@@ -67,7 +71,7 @@ class EmotionRecognitionNode(LifecycleNode):
         self._active_side  = 'left'
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores repeated declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -78,12 +82,12 @@ class EmotionRecognitionNode(LifecycleNode):
         self._analysis_hz = self.get_parameter('analysis_hz').value
         self._min_face    = self.get_parameter('min_face_size').value
 
-        self.get_logger().info('Загрузка hsemotion-onnx emotion model...')
+        self.get_logger().info('Loading hsemotion-onnx emotion model...')
         from hsemotion_onnx.facial_emotions import HSEmotionRecognizer
         self._recognizer = HSEmotionRecognizer(model_name='enet_b0_8_best_vgaf')
         dummy = np.zeros((64, 64, 3), dtype=np.uint8)
         self._recognizer.predict_emotions(dummy, logits=False)
-        self.get_logger().info('Emotion model готова (onnxruntime, AVX512)')
+        self.get_logger().info('Emotion model ready (onnxruntime, AVX512)')
 
         latched_qos = QoSProfile(
             depth=1,
@@ -173,7 +177,7 @@ class EmotionRecognitionNode(LifecycleNode):
         except Exception:
             pass
 
-    # ── Триггер анализа ───────────────────────────────────────────────────
+    # ── Analysis trigger ──────────────────────────────────────────────────
 
     def _trigger(self):
         if self._sleeping or self._busy:
@@ -190,12 +194,12 @@ class EmotionRecognitionNode(LifecycleNode):
             left_frame  = self._left_frame
             right_frame = self._right_frame
 
-        # Выбираем активный источник: левый приоритетен.
-        # Fallback на правый только если левая камера мертва (не шлёт сообщения),
-        # а не просто когда лиц нет на кадре.
+        # Choose the active source: left has priority.
+        # Fall back to the right only if the left camera is dead (not sending
+        # messages at all), not simply when there are no faces in the frame.
         if left_fresh:
             if not left_tracks or left_frame is None:
-                return  # левая жива, но лиц нет — не переключаться на правую
+                return  # left is alive but no faces — don't switch to the right
             frame, tracks, side = left_frame, left_tracks, 'left'
         elif right_fresh and right_tracks and right_frame is not None:
             frame, tracks, side = right_frame, right_tracks, 'right'
@@ -204,14 +208,14 @@ class EmotionRecognitionNode(LifecycleNode):
 
         if side != self._active_side:
             self.get_logger().info(
-                f'EmotionRecognition: переключение {self._active_side} → {side}')
+                f'EmotionRecognition: switching {self._active_side} → {side}')
             self._active_side = side
 
         self._busy = True
         threading.Thread(
             target=self._analyze, args=(frame, tracks, side), daemon=True).start()
 
-    # ── Анализ эмоций ─────────────────────────────────────────────────────
+    # ── Emotion analysis ──────────────────────────────────────────────────
 
     def _analyze(self, frame: np.ndarray, tracks: list, source: str):
         try:

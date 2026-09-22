@@ -1,0 +1,128 @@
+# InMoov ROS2
+
+A ROS2 Jazzy stack driving a physical [InMoov](https://inmoov.fr/) humanoid
+robot: dual-eye computer vision, a full voice pipeline (wake word, VAD, STT,
+TTS), an LLM-driven cognition layer with tool calling and a three-layer
+memory system, and a custom binary serial protocol to two Arduino Mega boards
+for motion control. Everything is orchestrated by a tier-based lifecycle
+manager built on ROS2 managed lifecycle nodes.
+
+This is a hobby project built and tuned against one specific physical robot
+— expect hardcoded defaults (LAN IPs, device paths, model directories) tied
+to that machine throughout the code and READMEs. They are called out where
+found; treat them as "override for your own setup," not as configuration
+that works out of the box.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Sense
+        VOICE[inmoov_voice\nwake word / VAD / STT / TTS]
+        VISION[inmoov_vision\ndual-eye face + OAK-D]
+    end
+    subgraph Think
+        COG[inmoov_cognition\nIdentityManager + LLM node + Behavior Tree]
+        MEM[inmoov_memory\nworking / episodic / semantic memory]
+    end
+    subgraph Act
+        CTRL[inmoov_control\nbinary serial protocol]
+        ARD[2x Arduino Mega]
+    end
+    BRING[inmoov_bringup\nlifecycle_manager: tiers T0-T6, watchdog]
+
+    VOICE -- transcript --> COG
+    VISION -- /social_context --> COG
+    COG <-- /memory_query --> MEM
+    COG -- tool calls / speech --> VOICE
+    COG -- /robot_events --> CTRL
+    CTRL <-- USB serial --> ARD
+    BRING -. supervises .- VOICE
+    BRING -. supervises .- VISION
+    BRING -. supervises .- COG
+    BRING -. supervises .- MEM
+    BRING -. supervises .- CTRL
+```
+
+Data flows from perception (`inmoov_vision`, `inmoov_voice`) into a social/
+dialogue context that `inmoov_cognition`'s Behavior Tree consumes as the
+single source of truth (the Blackboard); the LLM node produces both spoken
+text and tool calls (physical actions, memory ops, smart-home control); tool
+calls become `/robot_events` that the Behavior Tree turns into motion
+commands for `inmoov_control`. `inmoov_bringup` starts and supervises every
+node in dependency-ordered tiers and exposes overall health on
+`/lifecycle/status`.
+
+## Packages
+
+| Package | Purpose |
+|---|---|
+| [`inmoov_bringup`](src/inmoov_bringup/README.md) | Tier-based lifecycle orchestrator (T0-T6), watchdog, cascade activate/deactivate |
+| [`inmoov_cognition`](src/inmoov_cognition/README.md) | Behavior Tree, social context (IdentityManager), LLM dialogue + tool calling, openHAB/Telegram bridges |
+| [`inmoov_control`](src/inmoov_control/README.md) | Binary batch serial protocol to the left/right Arduino Mega boards, aggregated `/joint_states` |
+| [`inmoov_memory`](src/inmoov_memory/README.md) | Three-layer memory: working (RAM), episodic (SQLite), semantic (ChromaDB) |
+| [`inmoov_msgs`](src/inmoov_msgs/README.md) | Shared message/service/action definitions (`SoundDirection`, `MemoryQuery`, `Speak`) |
+| [`inmoov_vision`](src/inmoov_vision/README.md) | Dual-eye face detection/tracking/recognition, emotion, OAK-D body perception, head tracking |
+| [`inmoov_voice`](src/inmoov_voice/README.md) | Wake word, VAD, STT, sound localization (TDOA), voice emotion, streaming TTS |
+| [`inmoov_description`](src/inmoov_description/README.md) | URDF/meshes for RViz2 reference — visual/kinematic comparison only, not used for control |
+
+Each package's own README has the full node-by-node breakdown: every ROS2
+parameter with its default and meaning, every topic/service/action with its
+message type, external service dependencies, and known issues found while
+documenting the code (races, unwired parameters, stale defaults — read
+those sections before relying on a given node).
+
+## Hardware
+
+- **Onboard compute**: a local mini-PC (Ryzen 9, integrated GPU) running the
+  full ROS2 graph.
+- **LLM/TTS compute**: a separate machine with two GPUs, one serving the LLM
+  (OpenAI-compatible API) and one serving TTS, both reached over the LAN —
+  see `inmoov_cognition`/`inmoov_voice` READMEs for the exact endpoints
+  (override their host/port parameters for your own setup).
+- **Motion**: two Arduino Mega 2560 boards (left/right body halves), see
+  [`Arduino/`](Arduino/) and `inmoov_control`.
+- **Vision**: one USB camera per eye plus an OAK-D Lite depth camera in the
+  torso.
+- **Audio**: a USB conferencing speaker/mic as the primary audio device.
+
+## Build
+
+Standard `colcon` workspace:
+
+```bash
+cd ~/ros2_ws
+colcon build
+source install/setup.bash
+```
+
+Bring up the whole robot (see `inmoov_bringup/README.md` for tier details
+and launch arguments):
+
+```bash
+ros2 launch inmoov_bringup inmoov.launch.py
+```
+
+Individual packages also ship their own stand-alone launch files
+(`ros2 launch inmoov_<pkg> <pkg>.launch.py`) for developing against a subset
+of the system — see each package's README for what they start and their
+limitations versus the full `inmoov_bringup` orchestration.
+
+## Arduino firmware
+
+[`Arduino/InMoovLeft/`](Arduino/InMoovLeft/) and
+[`Arduino/InMoovRight/`](Arduino/InMoovRight/) hold the sketches for the two
+Mega boards — binary frame protocol (see the `.ino` header comments and
+`inmoov_control/README.md`'s Protocol section for the frame format and
+servo/channel mapping). Flash with the Arduino IDE or `arduino-cli`.
+
+## License
+
+[GNU General Public License v3.0](LICENSE) throughout, including
+`inmoov_description`'s URDF/launch files (adapted from
+[Sentience-Robotics/inmoov_urdf](https://github.com/Sentience-Robotics/inmoov_urdf),
+also GPL-3.0 — see that package's README for details).
+
+## Author
+
+Artur Fedjukevits, with assistance from Claude Code (Anthropic).

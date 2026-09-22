@@ -2,33 +2,38 @@
 """
 human_detection_node.py
 =======================
-Присутствие человека: YOLO (тип объекта) + ультразвук (точная дистанция).
+Human presence: YOLO (object type) + ultrasonic (precise distance).
 
-YOLO подтверждает что объект — человек.
-Ультразвук валидирует расстояние (точнее стерео-глубины).
-Итоговая дистанция = ultrasonic если доступен, иначе z из YOLO.
+YOLO confirms that the object is a person.
+Ultrasonic validates the distance (more accurate than stereo depth).
+Final distance = ultrasonic if available, otherwise z from YOLO.
 
-Топики:
-  /objects/detections        (String JSON)  ← oak_node
-  /ultrasonic_left_distance  (Int16, см)    ← arduino_left_node
-  /ultrasonic_right_distance (Int16, см)    ← arduino_right_node
-  /human_detected            (Bool)         → identity_manager / BT
-  /human_angle_deg           (Float32)      → BT (SoundScanBehaviour — наведение
-                              головы на ближайшего человека ДО того, как
-                              face_detection/head_tracker успеют его увидеть.
-                              atan2(x_mm, z_mm) из OAK-D, + = человек справа
-                              (конвенция DepthAI: X положительный вправо от
-                              камеры) — НЕ провалидировано физически, как и
-                              остальные знаковые конвенции в проекте, проверить
-                              руками при первом использовании)
+Topics:
+  /objects/detections        (String JSON)  <- oak_node
+  /ultrasonic_left_distance  (Int16, cm)    <- arduino_left_node
+  /ultrasonic_right_distance (Int16, cm)    <- arduino_right_node
+  /human_detected            (Bool)         -> identity_manager / BT
+  /human_angle_deg           (Float32)      -> BT (SoundScanBehaviour — aims
+                              the head at the nearest person BEFORE
+                              face_detection/head_tracker have had a chance to
+                              see them. atan2(x_mm, z_mm) from the OAK-D,
+                              + = person is to the right (DepthAI convention:
+                              X is positive to the right of the camera) — NOT
+                              validated physically, like the other sign
+                              conventions in the project; check by hand on
+                              first use)
 
-Параметры:
-  max_distance_m      — макс. дальность (default 4.0м)
-  min_confidence      — мин. уверенность YOLO (default 0.45)
-  lost_timeout_sec    — время без детекции до False (default 4.0с)
-  publish_rate_hz     — частота публикации (default 5.0 Гц)
-  use_ultrasonic      — использовать ультразвук для дистанции (default True)
-  ultrasonic_stale_s  — устаревание ультразвука (default 1.0с)
+Parameters:
+  max_distance_m      — max range (default 4.0 m)
+  min_confidence      — min YOLO confidence (default 0.45)
+  lost_timeout_sec    — time without a detection before publishing False (default 4.0 s)
+  publish_rate_hz     — publish rate (default 5.0 Hz)
+  use_ultrasonic      — use ultrasonic for distance (default True)
+  ultrasonic_stale_s  — ultrasonic staleness limit (default 1.0 s)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -58,7 +63,7 @@ class HumanDetectionNode(LifecycleNode):
         self._us_left_ts   = self._us_right_ts = 0.0
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores re-declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -92,7 +97,7 @@ class HumanDetectionNode(LifecycleNode):
         self._angle_pub = self.create_lifecycle_publisher(Float32, '/human_angle_deg', 10)
         self.get_logger().info(
             f'HumanDetection configured. '
-            f'Дальность: {self._max_z_mm/1000:.1f}м, confidence: {self._min_conf}')
+            f'Range: {self._max_z_mm/1000:.1f} m, confidence: {self._min_conf}')
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
@@ -125,27 +130,27 @@ class HumanDetectionNode(LifecycleNode):
             was_sleeping = self._sleeping
             self._sleeping = msg.data
             if msg.data and not was_sleeping:
-                # Сбрасываем состояние чтобы при пробуждении начать с чистого листа
+                # Reset state so that we start from a clean slate on wake-up
                 self._last_seen    = 0.0
                 self._yolo_z_m     = 0.0
                 self._us_left_ts   = 0.0
                 self._us_right_ts  = 0.0
         if msg.data and not was_sleeping:
-            # Одна публикация False при входе в сон
+            # Publish False once when entering sleep
             out = Bool()
             out.data = False
             self._pub.publish(out)
             self._was_detected = False
-            self.get_logger().info('Спящий режим: human_detection приостановлен')
+            self.get_logger().info('Sleep mode: human_detection paused')
         elif not msg.data and was_sleeping:
-            self.get_logger().info('Пробуждение: human_detection возобновлён')
+            self.get_logger().info('Wake-up: human_detection resumed')
 
     def _us_left_cb(self, msg: Int16):
         if msg.data > 0:
             with self._lock:
                 if self._sleeping:
                     return
-                self._us_left_m  = msg.data / 100.0  # см → м
+                self._us_left_m  = msg.data / 100.0  # cm -> m
                 self._us_left_ts = time.time()
 
     def _us_right_cb(self, msg: Int16):
@@ -182,10 +187,10 @@ class HumanDetectionNode(LifecycleNode):
                 if z_mm > 0:
                     self._angle_deg = math.degrees(math.atan2(x_mm, z_mm))
 
-    # ── Публикация ────────────────────────────────────────────────────────────
+    # ── Publishing ────────────────────────────────────────────────────────────
 
     def _best_distance_m(self) -> float:
-        """Лучшая оценка дистанции: ультразвук если свежий, иначе YOLO."""
+        """Best distance estimate: ultrasonic if fresh, otherwise YOLO."""
         if not self._use_us:
             return self._yolo_z_m
 
@@ -197,7 +202,7 @@ class HumanDetectionNode(LifecycleNode):
             candidates.append(self._us_right_m)
 
         if candidates:
-            return min(candidates)   # ближайшее из двух датчиков
+            return min(candidates)   # the nearer of the two sensors
         return self._yolo_z_m
 
     def _publish_state(self):
@@ -221,9 +226,9 @@ class HumanDetectionNode(LifecycleNode):
             if detected:
                 src = 'US' if self._use_us else 'YOLO'
                 self.get_logger().info(
-                    f'Человек обнаружен (body) на расстоянии {dist_m:.1f}м [{src}]')
+                    f'Person detected (body) at {dist_m:.1f} m [{src}]')
             else:
-                self.get_logger().info('Человек не обнаружен (body detection)')
+                self.get_logger().info('Person not detected (body detection)')
             self._was_detected = detected
 
 

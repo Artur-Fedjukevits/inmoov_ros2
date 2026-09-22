@@ -1,19 +1,23 @@
 """
-reminder_db.py — Хранилище напоминаний (SQLite)
+reminder_db.py — Reminder storage (SQLite)
 
-Схема:
+Schema:
     reminders(id, person_id, person_name, trigger_date, trigger_time, message, source, delivered, created_at)
 
 trigger_date:
-    NULL  → показываем при каждой встрече пока не подтвердят
-    YYYY-MM-DD → показываем начиная с этой даты
+    NULL  → shown at every meeting until the user confirms
+    YYYY-MM-DD → shown starting from this date
 
 trigger_time:
-    NULL  → используется default_time при проверке (обычно 07:00)
-    HH:MM → показываем начиная с этого времени в день trigger_date
+    NULL  → default_time is used when checking (normally 07:00)
+    HH:MM → shown starting from this time on the trigger_date day
 
-Жизненный цикл:
-    добавлен (delivered=0) → показан при встрече (delivered=1) → подтверждён пользователем → удалён
+Lifecycle:
+    added (delivered=0) → shown at a meeting (delivered=1) → confirmed by the user → deleted
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import sqlite3
@@ -50,18 +54,18 @@ class ReminderDB:
                 self._db.execute('ALTER TABLE reminders ADD COLUMN trigger_time TEXT')
             self._db.commit()
 
-    # ── Запись ────────────────────────────────────────────────────────────
+    # ── Writing ────────────────────────────────────────────────────────────
 
     def add_reminder(self, person_id: int, person_name: str, message: str,
                      trigger_date: str | None = None,
                      trigger_time: str | None = None,
                      source: str = 'manual') -> int:
-        """Создать напоминание. trigger_date=None → при следующей встрече.
+        """Create a reminder. trigger_date=None → at the next meeting.
 
-        trigger_time: 'HH:MM' или None (используется default_time при get_due).
+        trigger_time: 'HH:MM' or None (default_time is used in get_due).
 
-        Возвращает id существующего напоминания если точный дубликат уже есть
-        (совпадают person_id, trigger_date, trigger_time и нормализованный текст, delivered=0).
+        Returns the id of the existing reminder if an exact duplicate already exists
+        (same person_id, trigger_date, trigger_time and normalized text, delivered=0).
         """
         msg_norm = message.strip().lower()
         now = datetime.now().isoformat()
@@ -92,7 +96,7 @@ class ReminderDB:
         return cur.lastrowid
 
     def mark_delivered(self, reminder_id: int) -> bool:
-        """Отметить как показанное (ждём подтверждения пользователя)."""
+        """Mark as shown (awaiting user confirmation)."""
         with self._lock:
             self._db.execute(
                 'UPDATE reminders SET delivered=1 WHERE id=?', (reminder_id,))
@@ -100,15 +104,15 @@ class ReminderDB:
         return True
 
     def delete_reminder(self, reminder_id: int) -> bool:
-        """Удалить конкретное напоминание (по id)."""
+        """Delete a specific reminder (by id)."""
         with self._lock:
             self._db.execute('DELETE FROM reminders WHERE id=?', (reminder_id,))
             self._db.commit()
         return True
 
     def confirm_all_delivered(self, person_id: int) -> int:
-        """Удалить показанные (delivered=1) напоминания для этого человека.
-        Возвращает кол-во удалённых."""
+        """Delete the shown (delivered=1) reminders for this person.
+        Returns the number deleted."""
         with self._lock:
             cur = self._db.execute(
                 'DELETE FROM reminders WHERE person_id=? AND delivered=1',
@@ -116,16 +120,16 @@ class ReminderDB:
             self._db.commit()
         return cur.rowcount
 
-    # ── Запросы ───────────────────────────────────────────────────────────
+    # ── Queries ───────────────────────────────────────────────────────────
 
     def get_due(self, person_id: int, today: str,
                 now_time: str | None = None,
                 default_time: str = '07:00') -> list[dict]:
-        """Напоминания для показа: trigger_date IS NULL или (trigger_date < today)
-        или (trigger_date = today И effective_time <= now_time).
+        """Reminders to show: trigger_date IS NULL or (trigger_date < today)
+        or (trigger_date = today AND effective_time <= now_time).
 
-        now_time: текущее время 'HH:MM'. Если None — используется '23:59' (доставить всё за сегодня).
-        default_time: время по умолчанию когда trigger_time IS NULL (обычно '07:00').
+        now_time: current time 'HH:MM'. If None, '23:59' is used (deliver everything due today).
+        default_time: default time when trigger_time IS NULL (normally '07:00').
         """
         if now_time is None:
             now_time = '23:59'
@@ -147,7 +151,7 @@ class ReminderDB:
         return [self._row_to_dict(r) for r in rows]
 
     def list_reminders(self, person_id: int | None = None) -> list[dict]:
-        """Все напоминания — для конкретного человека или для всех."""
+        """All reminders — for a specific person or for everyone."""
         with self._lock:
             if person_id is not None:
                 rows = self._db.execute(
@@ -168,7 +172,7 @@ class ReminderDB:
                 ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    # ── Утилиты ───────────────────────────────────────────────────────────
+    # ── Utilities ───────────────────────────────────────────────────────────
 
     def _row_to_dict(self, row) -> dict:
         return {

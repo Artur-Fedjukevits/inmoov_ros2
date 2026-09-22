@@ -21,21 +21,25 @@ Hardware (matching setup_xicro_subsystem1.yaml):
   /robot_sleep (latched Bool) is forwarded to the Arduino as CMD_SLEEP —
   while asleep, ultrasonic/PIR/Hall telemetry stops.
 
-UART packet order (body + face, total 15 servos):
-  Byte 0:  omoplate_R
-  Byte 1:  shoulder_R
-  Byte 2:  rotate_R
-  Byte 3:  bicep_R
-  Byte 4:  wrist_R
-  Byte 5:  thumb_R
-  Byte 6:  index_R
-  Byte 7:  middle_R
-  Byte 8:  ring_R
-  Byte 9:  pinky_R
+UART packet order (body + face, total 14 servos) — ORDER MUST MATCH InMoovRight.ino:
+  Byte 0:  thumb_R
+  Byte 1:  index_R
+  Byte 2:  middle_R
+  Byte 3:  ring_R
+  Byte 4:  pinky_R
+  Byte 5:  wrist_R
+  Byte 6:  bicep_R
+  Byte 7:  rotate_R
+  Byte 8:  shoulder_R
+  Byte 9:  omoplate_R
   Byte 10: rollneck
   Byte 11: eye_lr_R     (face)
   Byte 12: eye_ud_R     (face)
   Byte 13: upperLip     (face)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import sys

@@ -2,18 +2,22 @@
 """
 rebuild_gallery.py
 ==================
-Пересчитывает embeddings в БД из фотогалереи.
-Запускать после ручной обработки фотографий:
-  - удалил плохие/размытые снимки → запусти rebuild
-  - переместил фото из одного человека в другой → запусти rebuild
-  - добавил фото вручную → запусти rebuild
+Recomputes the embeddings in the DB from the photo gallery.
+Run it after manually processing photos:
+  - deleted bad/blurry shots → run rebuild
+  - moved a photo from one person to another → run rebuild
+  - added photos manually → run rebuild
 
-Использование:
+Usage:
   python3 rebuild_gallery.py [--db /path/to/inmoov_memory.db] [--gallery /path/to/inmoov_faces]
 
-После rebuild нужно уведомить запущенный memory_node:
+After the rebuild the running memory_node must be notified:
   ros2 service call /memory/query inmoov_msgs/srv/MemoryQuery \
     "request_json: '{op: reload_gallery}'"
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import argparse
@@ -28,16 +32,16 @@ try:
     import cv2
     from insightface.app import FaceAnalysis
 except ImportError as e:
-    print(f'Ошибка импорта: {e}')
-    print('Установи: pip install insightface opencv-python')
+    print(f'Import error: {e}')
+    print('Install: pip install insightface opencv-python')
     sys.exit(1)
 
 
 def load_insightface():
-    print('Загружаю InsightFace buffalo_l...')
+    print('Loading InsightFace buffalo_l...')
     app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
     app.prepare(ctx_id=0, det_size=(640, 640))
-    print('InsightFace готов.')
+    print('InsightFace ready.')
     return app
 
 
@@ -47,9 +51,9 @@ def get_embedding(app, image_path: str) -> np.ndarray | None:
         return None
     faces = app.get(img)
     if not faces:
-        # Попробуем с уменьшенным порогом det_thresh
+        # Could try again with a lower det_thresh
         return None
-    # Берём лицо с наибольшей площадью bbox
+    # Take the face with the largest bbox area
     best = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
     emb = best.normed_embedding.astype(np.float32)
     emb /= np.linalg.norm(emb) + 1e-8
@@ -59,16 +63,16 @@ def get_embedding(app, image_path: str) -> np.ndarray | None:
 def rebuild(db_path: str, gallery_dir: str):
     gallery_root = Path(gallery_dir) / 'persons'
     if not gallery_root.exists():
-        print(f'Директория не найдена: {gallery_root}')
+        print(f'Directory not found: {gallery_root}')
         sys.exit(1)
 
     db = sqlite3.connect(db_path)
     app = load_insightface()
 
-    # Очищаем текущую галерею
+    # Clear the current gallery
     db.execute('DELETE FROM person_gallery')
     db.commit()
-    print('Галерея очищена. Начинаю пересчёт...\n')
+    print('Gallery cleared. Starting recomputation...\n')
 
     total_added = 0
     total_skipped = 0
@@ -77,24 +81,24 @@ def rebuild(db_path: str, gallery_dir: str):
         if not person_dir.is_dir():
             continue
 
-        # Имя директории: {id}_{name}
+        # Directory name: {id}_{name}
         dir_name = person_dir.name
         parts = dir_name.split('_', 1)
         if len(parts) < 2 or not parts[0].isdigit():
-            print(f'  Пропускаю (неверный формат имени): {dir_name}')
+            print(f'  Skipping (invalid name format): {dir_name}')
             continue
 
         person_id   = int(parts[0])
         person_name = parts[1].replace('_', ' ')
 
-        # Проверяем существование в БД
+        # Check that the person exists in the DB
         row = db.execute('SELECT name FROM persons WHERE id=?', (person_id,)).fetchone()
         if not row:
-            print(f'  Человек id={person_id} не найден в БД — пропускаю {dir_name}')
+            print(f'  Person id={person_id} not found in DB — skipping {dir_name}')
             continue
 
         photos = sorted(list(person_dir.glob('*.jpg')) + list(person_dir.glob('*.png')))
-        print(f'  {dir_name}: {len(photos)} фото', end='', flush=True)
+        print(f'  {dir_name}: {len(photos)} photos', end='', flush=True)
 
         added = 0
         skipped = 0
@@ -107,7 +111,7 @@ def rebuild(db_path: str, gallery_dir: str):
                 print('.', end='', flush=True)
                 continue
 
-            # Определяем источник по имени файла
+            # Determine the source from the file name
             source = 'enroll' if 'enroll' in photo_path.name else (
                      'manual' if 'manual' in photo_path.name else 'auto')
 
@@ -123,11 +127,11 @@ def rebuild(db_path: str, gallery_dir: str):
         db.commit()
         total_added   += added
         total_skipped += skipped
-        print(f'  → {added} добавлено, {skipped} пропущено')
+        print(f'  → {added} added, {skipped} skipped')
 
     db.close()
-    print(f'\nГотово: {total_added} embedding добавлено, {total_skipped} фото пропущено (нет лица).')
-    print('\nУведомите memory_node о перезагрузке:')
+    print(f'\nDone: {total_added} embeddings added, {total_skipped} photos skipped (no face).')
+    print('\nNotify memory_node to reload:')
 
 
 
@@ -139,8 +143,8 @@ def main():
                         help='Path to gallery root directory')
     args = parser.parse_args()
 
-    print(f'БД:      {args.db}')
-    print(f'Галерея: {args.gallery}')
+    print(f'DB:      {args.db}')
+    print(f'Gallery: {args.gallery}')
     print()
     rebuild(args.db, args.gallery)
 

@@ -30,6 +30,10 @@ Arduino → ROS events:
                               addrN:     I2C address of each device (7-bit)
                               pca_mode1: PCA9685 MODE1 register (0xFF = not found)
   CMD_ACK          = 0xFF   DATA: 1 byte, echoed CMD (acknowledgement)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import struct

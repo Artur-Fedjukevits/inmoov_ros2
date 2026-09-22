@@ -2,10 +2,10 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>inmoov_msgs</name>
-  <version>0.0.0</version>
-  <description>Custom ROS2 message and service definitions for InMoov robot</description>
-  <maintainer email="fedjukevitsh@gmail.com">artur</maintainer>
-  <license>Apache-2.0</license>
+  <version>0.1.0</version>
+  <description>Custom ROS2 message, service, and action definitions for the InMoov robot</description>
+  <maintainer email="fedjukevitsh@gmail.com">Artur Fedjukevits</maintainer>
+  <license>GPL-3.0-only</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>rosidl_default_generators</depend>

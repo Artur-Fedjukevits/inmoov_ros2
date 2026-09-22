@@ -15,7 +15,7 @@ setup(
     maintainer='artur',
     maintainer_email='fedjukevitsh@gmail.com',
     description='Social memory node for InMoov robot (SQLite + ROS2 service)',
-    license='Apache-2.0',
+    license='GPL-3.0-only',
     entry_points={
         'console_scripts': [
             'memory_node = inmoov_memory.memory_node:main',

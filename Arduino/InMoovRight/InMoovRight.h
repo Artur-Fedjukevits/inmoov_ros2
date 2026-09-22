@@ -1,3 +1,6 @@
+// InMoovRight.h — servo/state definitions for the right Arduino Mega 2560.
+// Author: Artur Fedjukevits | Assisted by: Claude Code (Anthropic)
+// License: GNU General Public License v3.0 (see repository root LICENSE)
 #pragma once
 #include <Arduino.h>
 #include <Servo.h>

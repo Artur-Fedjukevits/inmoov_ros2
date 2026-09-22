@@ -9,8 +9,8 @@
     for ML-based motion control. Provides /joint_states and /face_joint_states
     aggregated topics for policy inference.
   </description>
-  <maintainer email="todo@todo.com">Artur</maintainer>
-  <license>Apache-2.0</license>
+  <maintainer email="fedjukevitsh@gmail.com">Artur Fedjukevits</maintainer>
+  <license>GPL-3.0-only</license>
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>

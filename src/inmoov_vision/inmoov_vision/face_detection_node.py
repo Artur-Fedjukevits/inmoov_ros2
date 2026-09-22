@@ -2,30 +2,31 @@
 """
 face_detection_node.py
 ======================
-Запускает insightface на кадрах с указанного глаза.
-Параметр camera_side ('left' | 'right') определяет:
-  - какую камеру читать:   /camera/eye_{side}/compressed
-  - куда публиковать:      /face/detections/{side}
+Runs insightface on frames from the given eye.
+The camera_side parameter ('left' | 'right') determines:
+  - which camera to read from:   /camera/eye_{side}/compressed
+  - where to publish to:         /face/detections/{side}
 
-insightface запускается в фоновом потоке.
-Частота анализа регулируется параметром detection_hz (default 1.5 Hz).
+insightface runs in a background thread.
+Analysis rate is controlled by the detection_hz parameter (default 1.5 Hz).
 
-Fallback-по-требованию (параметр fallback_for):
-  Если задан непустым (топик другого глаза, напр. '/face/detections/left'),
-  нода не гоняет insightface постоянно — она слушает этот топик как heartbeat
-  primary-камеры и запускает собственную детекцию только когда primary не
-  публиковал дольше primary_timeout_sec (default 1.5с). Экономит CPU: правый
-  глаз (fallback) не молотит insightface параллельно с левым (primary) 24/7,
-  а включается только когда левый реально пропал (камера отвалилась/процесс
-  упал) — то есть настоящий fallback, а не постоянное дублирование.
+On-demand fallback (fallback_for parameter):
+  If set to a non-empty value (the other eye's topic, e.g.
+  '/face/detections/left'), the node does not run insightface continuously —
+  it listens to that topic as the primary camera's heartbeat and only starts
+  its own detection once the primary hasn't published for longer than
+  primary_timeout_sec (default 1.5s). Saves CPU: the right eye (fallback)
+  doesn't grind insightface in parallel with the left (primary) 24/7 — it
+  only kicks in once the left has actually disappeared (camera disconnected /
+  process crashed) — i.e. a real fallback, not permanent duplication.
 
-Подписки:
+Subscriptions:
   /camera/eye_{camera_side}/compressed  (sensor_msgs/CompressedImage)
 
-Публикует:
+Publishes:
   /face/detections/{camera_side}  (std_msgs/String — JSON)
 
-Формат JSON:
+JSON format:
   {
     "stamp": 1234567890.0,
     "faces": [
@@ -33,10 +34,14 @@ Fallback-по-требованию (параметр fallback_for):
         "bbox":      [x1, y1, x2, y2],
         "det_score": 0.98,
         "embedding": [0.01, -0.03, ...],   // 512-d normed (buffalo_l only)
-        "kps":       [[x,y], ...]          // 5 точек
+        "kps":       [[x,y], ...]          // 5 points
       }
     ]
   }
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -71,14 +76,14 @@ class FaceDetectionNode(LifecycleNode):
         self._primary_timeout    = 1.5
         self._last_primary_t     = 0.0
         self._fallback_active    = False
-        # Диагностика "подвисшей" камеры (см. _trigger_detection) — кадр
-        # приходит по расписанию, но его stamp не меняется.
+        # Diagnostics for a "stuck" camera (see _trigger_detection) — a frame
+        # arrives on schedule, but its stamp doesn't change.
         self._last_processed_stamp   = -1.0
         self._stale_frame_streak     = 0
         self._STALE_FRAME_WARN_STREAK = 3
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores repeated declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -103,21 +108,21 @@ class FaceDetectionNode(LifecycleNode):
         self._fallback_for    = self.get_parameter('fallback_for').value
         self._primary_timeout = self.get_parameter('primary_timeout_sec').value
 
-        # По умолчанию ORT разворачивает пул потоков под все логические ядра
-        # для КАЖДОЙ из ~5 моделей buffalo_l (intra_op_num_threads=0 = auto).
-        # При двух процессах (left+right) на 16 логических ядрах это даёт
-        # конкуренцию за потоки и ~350-370% CPU на процесс. Ограничиваем пул
-        # явно — insightface.FaceAnalysis(**kwargs) прокидывает sess_options
-        # до onnxruntime.InferenceSession без изменений.
+        # By default ORT spins up a thread pool across all logical cores for
+        # EACH of the ~5 buffalo_l models (intra_op_num_threads=0 = auto).
+        # With two processes (left+right) on 16 logical cores this causes
+        # thread contention and ~350-370% CPU per process. We limit the pool
+        # explicitly — insightface.FaceAnalysis(**kwargs) forwards
+        # sess_options to onnxruntime.InferenceSession unchanged.
         sess_options = ort.SessionOptions()
         sess_options.intra_op_num_threads = intra_op
         sess_options.inter_op_num_threads = inter_op
 
-        self.get_logger().info(f'Загрузка insightface ({model_name}, side={self._side})...')
+        self.get_logger().info(f'Loading insightface ({model_name}, side={self._side})...')
         self._app = FaceAnalysis(
             name=model_name, providers=['CPUExecutionProvider'], sess_options=sess_options)
         self._app.prepare(ctx_id=0, det_size=(det_size, det_size), det_thresh=det_thresh)
-        self.get_logger().info('insightface загружен')
+        self.get_logger().info('insightface loaded')
 
         from std_msgs.msg import Bool as _Bool
         cam_topic = f'/camera/eye_{self._side}/compressed'
@@ -133,7 +138,7 @@ class FaceDetectionNode(LifecycleNode):
             self.create_subscription(
                 String, self._fallback_for, self._primary_heartbeat_cb, 5)
         self._pub = self.create_lifecycle_publisher(String, det_topic, 10)
-        fb_note = f', fallback_for={self._fallback_for} (timeout={self._primary_timeout}с)' \
+        fb_note = f', fallback_for={self._fallback_for} (timeout={self._primary_timeout}s)' \
             if self._fallback_for else ''
         self.get_logger().info(
             f'FaceDetection configured (side={self._side}, hz={self._det_hz}, '
@@ -142,10 +147,11 @@ class FaceDetectionNode(LifecycleNode):
 
     def on_activate(self, state):
         self._pub.on_activate(state)
-        # Грейс-период: считаем primary живым с момента активации, а не с
-        # эпохи (иначе _last_primary_t=0.0 → time.time()-0 огромно >
-        # primary_timeout → ложный "primary молчит" на самом первом тике,
-        # ещё до того как primary вообще успел прислать первый heartbeat).
+        # Grace period: consider primary alive from the moment of activation,
+        # not from the epoch (otherwise _last_primary_t=0.0 → time.time()-0
+        # is huge > primary_timeout → a false "primary silent" on the very
+        # first tick, before primary has even had a chance to send its first
+        # heartbeat).
         self._last_primary_t = time.time()
         self._timers.append(self.create_timer(1.0 / self._det_hz, self._trigger_detection))
         self._timers.append(self.create_timer(5.0, self._watchdog))
@@ -168,7 +174,7 @@ class FaceDetectionNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def _frame_callback(self, msg: CompressedImage):
-        """Сохраняем последний кадр без обработки — только буфер."""
+        """Store the latest frame without processing it — just a buffer."""
         buf = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
@@ -183,21 +189,21 @@ class FaceDetectionNode(LifecycleNode):
         self._enabled = msg.data
         self._no_face_since = 0.0
         if msg.data:
-            # Грейс-период на КАЖДОЕ включение (не только on_activate — сам
-            # lifecycle activate происходит раз при старте стека, а enable
-            # дальше дёргается toggle'ом через PIRScan/пробуждение). Без
-            # сброса здесь _last_primary_t остаётся протухшим с прошлого
-            # раза → primary_alive сразу ложно False на первом тике.
+            # Grace period on EVERY enable (not just on_activate — the lifecycle
+            # activate itself happens once when the stack starts, whereas enable
+            # is toggled further on by PIRScan/wakeup). Without resetting here
+            # _last_primary_t stays stale from last time → primary_alive is
+            # immediately falsely False on the first tick.
             self._last_primary_t = time.time()
             self._fallback_active = False
             self._last_processed_stamp = -1.0
             self._stale_frame_streak   = 0
-        role = f', fallback-резерв за {self._fallback_for}' if self._fallback_for else ', primary'
+        role = f', fallback-reserve for {self._fallback_for}' if self._fallback_for else ', primary'
         self.get_logger().info(
-            f'FaceDetection: {"включена" if msg.data else "выключена"}{role}')
+            f'FaceDetection: {"enabled" if msg.data else "disabled"}{role}')
 
     def _primary_heartbeat_cb(self, msg) -> None:
-        """Приход ЛЮБОГО сообщения от primary-камеры = она жива, не важно нашла ли лицо."""
+        """Receiving ANY message from the primary camera = it's alive, whether or not it found a face."""
         self._last_primary_t = time.time()
 
     def _trigger_detection(self):
@@ -210,38 +216,38 @@ class FaceDetectionNode(LifecycleNode):
             if primary_alive:
                 if self._fallback_active:
                     self.get_logger().info(
-                        f'Primary ({self._fallback_for}) восстановилась — fallback ({self._side}) в резерв')
+                        f'Primary ({self._fallback_for}) recovered — fallback ({self._side}) back to standby')
                 self._fallback_active = False
                 return
             if not self._fallback_active:
                 self._fallback_active = True
                 self.get_logger().warn(
-                    f'Primary ({self._fallback_for}) молчит >{self._primary_timeout}с — '
-                    f'активирую fallback-детекцию на {self._side}')
+                    f'Primary ({self._fallback_for}) silent >{self._primary_timeout}s — '
+                    f'activating fallback detection on {self._side}')
         with self._frame_lock:
             if self._latest_frame is None:
                 return
             frame = self._latest_frame.copy()
             stamp = self._latest_stamp
 
-        # Живой баг 2026-08-31/09-01: подозрение, что USB-камера в глазу может
-        # физически "подвиснуть" (сенсор перестал обновляться), но кадры с
-        # последним удачным снимком продолжают приходить по /camera/eye_*
-        # — _frame_callback добросовестно обновляет _last_frame_t на КАЖДОЕ
-        # сообщение, поэтому обычный "камера молчит" watchdog это не ловит.
-        # Раньше это приводило к тому, что head_tracker получал "свежие" (по
-        # времени сообщения) детекции с НЕИЗМЕНЫМ bbox/offset — голову
-        # уводило в сторону без остановки, потому что реальной новой
-        # картинки не было. Сравниваем stamp КАДРА (не сообщения) с прошлым
-        # запуском детекции — если он не продвинулся, это тот же кадр.
+        # Live bug 2026-08-31/09-01: suspicion that the USB camera in the eye
+        # can physically "freeze" (the sensor stops updating), but frames with
+        # the last successful image keep arriving on /camera/eye_* —
+        # _frame_callback dutifully updates _last_frame_t on EVERY message, so
+        # the usual "camera is silent" watchdog doesn't catch this. Previously
+        # this caused head_tracker to receive "fresh" (by message time)
+        # detections with an UNCHANGED bbox/offset — the head would drift to
+        # one side without stopping, because there was no actually new image.
+        # We compare the FRAME's stamp (not the message's) with the previous
+        # detection run — if it hasn't advanced, it's the same frame.
         if stamp == self._last_processed_stamp:
             self._stale_frame_streak += 1
             if self._stale_frame_streak == self._STALE_FRAME_WARN_STREAK:
                 self.get_logger().warn(
-                    f'FaceDetection ({self._side}): кадр НЕ обновляется '
-                    f'{self._stale_frame_streak} детекций подряд (stamp='
-                    f'{stamp:.3f}) — камера могла "подвиснуть" (сообщения '
-                    f'приходят, но картинка та же)')
+                    f'FaceDetection ({self._side}): frame NOT updating for '
+                    f'{self._stale_frame_streak} detections in a row (stamp='
+                    f'{stamp:.3f}) — camera may have "frozen" (messages '
+                    f'arriving, but the picture is the same)')
         else:
             self._stale_frame_streak = 0
         self._last_processed_stamp = stamp
@@ -272,7 +278,7 @@ class FaceDetectionNode(LifecycleNode):
             if result['faces']:
                 self._no_face_since = 0.0
                 self.get_logger().debug(
-                    f'Обнаружено лиц: {len(result["faces"])}')
+                    f'Faces detected: {len(result["faces"])}')
             else:
                 if self._no_face_since == 0.0:
                     self._no_face_since = time.time()
@@ -282,7 +288,7 @@ class FaceDetectionNode(LifecycleNode):
             self._pub.publish(msg)
 
         except Exception as e:
-            self.get_logger().error(f'Ошибка детекции: {e}')
+            self.get_logger().error(f'Detection error: {e}')
         finally:
             self._busy = False
 
@@ -291,22 +297,22 @@ class FaceDetectionNode(LifecycleNode):
         if not self._enabled:
             return
         now = time.time()
-        # Кадры не приходят?
+        # No frames arriving?
         if self._last_frame_t > 0.0 and (now - self._last_frame_t) > 3.0:
             self.get_logger().warn(
-                f'Камера молчит {now - self._last_frame_t:.1f}с — нет кадров с /camera/eye_{self._side}/compressed')
+                f'Camera silent for {now - self._last_frame_t:.1f}s — no frames from /camera/eye_{self._side}/compressed')
         elif self._last_frame_t == 0.0:
-            self.get_logger().warn('Кадры с камеры ещё не получены')
-        # Детекция не запускается? (fallback-нода в резерве не детектит — это норма, не варним)
+            self.get_logger().warn('No frames received from the camera yet')
+        # Detection not running? (a standby fallback node not detecting is normal — no warning)
         in_standby = bool(self._fallback_for) and not self._fallback_active
         if not in_standby and self._last_detect_t > 0.0 and (now - self._last_detect_t) > 3.0:
             self.get_logger().warn(
-                f'Детекция не запускается {now - self._last_detect_t:.1f}с (busy={self._busy})')
-        # Лицо давно не найдено
+                f'Detection not running for {now - self._last_detect_t:.1f}s (busy={self._busy})')
+        # Face not found for a long time
         if self._no_face_since > 0.0 and (now - self._no_face_since) > 10.0:
             self.get_logger().warn(
-                f'Лицо не обнаружено уже {now - self._no_face_since:.0f}с')
-            self._no_face_since = now  # сбрасываем чтобы не спамить каждые 5с
+                f'No face detected for {now - self._no_face_since:.0f}s')
+            self._no_face_since = now  # reset to avoid spamming every 5s
 
 
 

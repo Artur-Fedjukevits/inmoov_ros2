@@ -2,19 +2,23 @@
 """
 face_capture_node.py
 ====================
-Единственная нода, которая открывает USB-камеры в глазах.
-Публикует compressed JPEG кадры — без сырых Image топиков.
+The only node that opens the USB cameras in the eyes.
+Publishes compressed JPEG frames — no raw Image topics.
 
-Топики:
+Topics:
   /camera/eye_left/compressed   (sensor_msgs/CompressedImage)
   /camera/eye_right/compressed  (sensor_msgs/CompressedImage)
 
-Параметры:
-  cam_left, cam_right  — пути to V4L2 устройствам (by-path)
-  fps, width, height   — параметры захвата
-  jpeg_quality         — качество JPEG 1-100 (default 85)
-  flip_h_left/right    — горизонтальный флип
-  reopen_after_fails   — сбросов кадра до попытки переоткрытия (default 10)
+Parameters:
+  cam_left, cam_right  — paths to the V4L2 devices (by-path)
+  fps, width, height   — capture parameters
+  jpeg_quality         — JPEG quality 1-100 (default 85)
+  flip_h_left/right    — horizontal flip
+  reopen_after_fails   — frame failures before a reopen attempt (default 10)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import time
@@ -29,7 +33,7 @@ _LEFT_PATH  = '/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0'
 _RIGHT_PATH = '/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0'
 
 _REOPEN_AFTER = 10   # consecutive failures before reopen attempt
-_REOPEN_WAIT  = 2.0  # секунд между попытками переоткрытия
+_REOPEN_WAIT  = 2.0  # seconds between reopen attempts
 
 
 class FaceCaptureNode(LifecycleNode):
@@ -43,7 +47,7 @@ class FaceCaptureNode(LifecycleNode):
         self._timer       = None
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores repeated declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -98,7 +102,7 @@ class FaceCaptureNode(LifecycleNode):
 
         self._timer = self.create_timer(1.0 / self._fps, self._capture)
         self.get_logger().info(
-            f'FaceCapture активна: left={self._devs["left"]}, '
+            f'FaceCapture active: left={self._devs["left"]}, '
             f'right={self._devs["right"]}, '
             f'{self._width}x{self._height}@{self._fps}fps')
         return TransitionCallbackReturn.SUCCESS
@@ -136,7 +140,7 @@ class FaceCaptureNode(LifecycleNode):
                 pass
         return TransitionCallbackReturn.SUCCESS
 
-    # ── Открытие камеры ───────────────────────────────────────────────────────
+    # ── Camera open ──────────────────────────────────────────────────────────
 
     def _open(self, side: str):
         dev = self._devs[side]
@@ -146,9 +150,9 @@ class FaceCaptureNode(LifecycleNode):
         cap.set(cv2.CAP_PROP_FPS,          self._fps)
         cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
         if not cap.isOpened():
-            self.get_logger().error(f'Не удалось открыть камеру {side} ({dev})')
+            self.get_logger().error(f'Failed to open camera {side} ({dev})')
         else:
-            self.get_logger().info(f'Камера {side} открыта: {dev}')
+            self.get_logger().info(f'Camera {side} opened: {dev}')
         return cap
 
     def _reopen(self, side: str):
@@ -157,14 +161,14 @@ class FaceCaptureNode(LifecycleNode):
             return
         self._last_reopen[side] = now
 
-        self.get_logger().warn(f'Переоткрытие камеры {side}...')
+        self.get_logger().warn(f'Reopening camera {side}...')
         old = self._caps.get(side)
         if old is not None:
             old.release()
         self._caps[side] = self._open(side)
         self._fails[side] = 0
 
-    # ── Захват кадра ──────────────────────────────────────────────────────────
+    # ── Frame capture ────────────────────────────────────────────────────────
 
     def _capture(self):
         now = self.get_clock().now().to_msg()
@@ -187,13 +191,13 @@ class FaceCaptureNode(LifecycleNode):
             self._fails[side] += 1
             if self._fails[side] >= self._reopen_after:
                 self.get_logger().warn(
-                    f'Камера {side}: {self._fails[side]} сбоев → переоткрытие',
+                    f'Camera {side}: {self._fails[side]} failures → reopening',
                     throttle_duration_sec=5.0)
                 self._reopen(side)
             self._publish_fallback(side, stamp)
             return
 
-        # Успешный кадр
+        # Successful frame
         self._fails[side] = 0
         if self._flips[side]:
             frame = cv2.flip(frame, 1)
@@ -201,13 +205,13 @@ class FaceCaptureNode(LifecycleNode):
         self._publish_frame(frame, self._pubs[side], stamp)
 
     def _publish_fallback(self, side: str, stamp):
-        """Если своя камера недоступна — публикуем зеркало противоположной."""
+        """If our own camera is unavailable — publish a mirror of the other one."""
         other = 'right' if side == 'left' else 'left'
         frame = self._last_frame.get(other)
         if frame is None:
             return
         self.get_logger().debug(
-            f'Камера {side}: fallback на {other}', throttle_duration_sec=10.0)
+            f'Camera {side}: falling back to {other}', throttle_duration_sec=10.0)
         self._publish_frame(frame, self._pubs[side], stamp)
 
     def _publish_frame(self, frame, pub, stamp):
@@ -221,7 +225,7 @@ class FaceCaptureNode(LifecycleNode):
         msg.data         = buf.tobytes()
         pub.publish(msg)
 
-    # destroy_node заменён на on_shutdown / on_deactivate (lifecycle)
+    # destroy_node replaced by on_shutdown / on_deactivate (lifecycle)
 
 
 def main():

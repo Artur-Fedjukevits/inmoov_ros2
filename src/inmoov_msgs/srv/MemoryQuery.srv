@@ -1,3 +1,8 @@
+# Generic JSON-in/JSON-out request to inmoov_memory's memory_node.
+# request_json/response_json carry a free-form JSON payload; the exact
+# schema (an "op" field plus op-specific arguments) is defined by memory_node — see
+# inmoov_memory/README.md for the request/response formats it supports.
+
 string request_json
 ---
 string response_json

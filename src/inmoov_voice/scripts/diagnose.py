@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-diagnose.py — Диагностика всех компонентов InMoov Voice Pipeline.
+diagnose.py — Diagnostics for all components of the InMoov Voice Pipeline.
 
-Запуск:
+Usage:
     python3 src/inmoov_voice/scripts/diagnose.py
-    python3 src/inmoov_voice/scripts/diagnose.py --quick   # без inference-тестов
+    python3 src/inmoov_voice/scripts/diagnose.py --quick   # without inference tests
 
-Проверяет:
-  - Сетевые сервисы (vLLM, TTS, OpenHAB)
-  - Модели (загружены ли в vLLM, LLM inference)
-  - Файловую систему (wake word модель)
-  - Аудио устройства
-  - Python пакеты
-  - ROS2 окружение
+Checks:
+  - Network services (vLLM, TTS, OpenHAB)
+  - Models (whether they are loaded in vLLM, LLM inference)
+  - Filesystem (wake word model)
+  - Audio devices
+  - Python packages
+  - ROS2 environment
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import argparse
@@ -24,22 +28,22 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
-# ── ANSI цвета ────────────────────────────────────────────────────────────────
+# ── ANSI colors ────────────────────────────────────────────────────────────────
 
 USE_COLOR = sys.stdout.isatty()
 
 def _c(text: str, code: str) -> str:
     return f'\033[{code}m{text}\033[0m' if USE_COLOR else text
 
-OK    = lambda t: _c(t, '32')   # зелёный
-WARN  = lambda t: _c(t, '33')   # жёлтый
-FAIL  = lambda t: _c(t, '31')   # красный
-INFO  = lambda t: _c(t, '36')   # голубой
-BOLD  = lambda t: _c(t, '1')    # жирный
-DIM   = lambda t: _c(t, '2')    # тёмный
+OK    = lambda t: _c(t, '32')   # green
+WARN  = lambda t: _c(t, '33')   # yellow
+FAIL  = lambda t: _c(t, '31')   # red
+INFO  = lambda t: _c(t, '36')   # cyan
+BOLD  = lambda t: _c(t, '1')    # bold
+DIM   = lambda t: _c(t, '2')    # dim
 
 
-# ── Результат проверки ─────────────────────────────────────────────────────────
+# ── Check result ─────────────────────────────────────────────────────────
 
 @dataclass
 class Check:
@@ -55,10 +59,10 @@ class Check:
         return {'ok': OK('OK  '), 'warn': WARN('WARN'), 'fail': FAIL('FAIL'), 'skip': DIM('SKIP')}[self.status]
 
 
-# ── Конфиг ────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 PRIMARY_HOST    = '192.168.10.118'
-LLM_PRIMARY     = f'http://{PRIMARY_HOST}:18020'   # vLLM, OpenAI-совместимый API
+LLM_PRIMARY     = f'http://{PRIMARY_HOST}:18020'   # vLLM, OpenAI-compatible API
 LLM_LOCAL       = 'http://localhost:18020'
 LLM_BEARER      = os.environ.get('VLLM_BEARER_TOKEN', '')
 TTS_PRIMARY     = f'http://{PRIMARY_HOST}:8000'
@@ -69,7 +73,7 @@ WAKEWORD_MODEL  = '/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'
 TIMEOUT         = 4.0
 
 
-# ── Вспомогательные функции ────────────────────────────────────────────────────
+# ── Helper functions ────────────────────────────────────────────────────
 
 def _get(url: str, timeout: float = TIMEOUT, **kwargs):
     import requests
@@ -107,17 +111,17 @@ def _tts_health(url: str) -> Optional[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# СЕКЦИИ ПРОВЕРОК
+# CHECK SECTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_llm(quick: bool) -> list[Check]:
     checks = []
 
-    for label, base_url in [('Основной (vLLM, RTX 3090)', LLM_PRIMARY),
-                              ('Локальный (NUC)', LLM_LOCAL)]:
+    for label, base_url in [('Primary (vLLM, RTX 3090)', LLM_PRIMARY),
+                              ('Local (NUC)', LLM_LOCAL)]:
         name = f'LLM {label}'
         if not _probe(f'{base_url}/health'):
-            checks.append(Check(name, 'fail', f'Недоступен ({base_url})'))
+            checks.append(Check(name, 'fail', f'Unreachable ({base_url})'))
             continue
 
         models = _llm_models(base_url)
@@ -125,14 +129,14 @@ def check_llm(quick: bool) -> list[Check]:
         found = [m for m in models if model_base in m]
 
         if found:
-            checks.append(Check(name, 'ok', f'{base_url}', f'Модель: {found[0]}'))
+            checks.append(Check(name, 'ok', f'{base_url}', f'Model: {found[0]}'))
         else:
             checks.append(Check(
-                name, 'warn', f'{base_url} — сервер ОК, но модель не найдена',
-                f'Ожидалась: {LLM_MODEL}\nДоступные: {models[:5]}'
+                name, 'warn', f'{base_url} — server OK, but model not found',
+                f'Expected: {LLM_MODEL}\nAvailable: {models[:5]}'
             ))
 
-    # Inference тест (только основного, не quick)
+    # Inference test (primary only, not in quick mode)
     if not quick and _probe(f'{LLM_PRIMARY}/health'):
         models = _llm_models(LLM_PRIMARY)
         model_base = LLM_MODEL.split(':')[0]
@@ -158,7 +162,7 @@ def check_llm(quick: bool) -> list[Check]:
                 choices = r.json().get('choices') or []
                 text = (choices[0].get('message', {}).get('content', '') if choices else '').strip()
                 checks.append(Check(
-                    name, 'ok', f'Ответ за {dt:.1f}с', f'Текст: "{text}"'
+                    name, 'ok', f'Answered in {dt:.1f}s', f'Text: "{text}"'
                 ))
             except Exception as e:
                 checks.append(Check(name, 'fail', str(e)))
@@ -169,22 +173,22 @@ def check_llm(quick: bool) -> list[Check]:
 def check_tts(quick: bool) -> list[Check]:
     checks = []
 
-    for label, base_url in [('Основной (RTX 3090)', TTS_PRIMARY),
-                              ('Локальный (ROCm)', TTS_LOCAL)]:
+    for label, base_url in [('Primary (RTX 3090)', TTS_PRIMARY),
+                              ('Local (ROCm)', TTS_LOCAL)]:
         name = f'TTS {label}'
         health = _tts_health(base_url)
         if health is None:
             checks.append(Check(name, 'warn' if base_url == TTS_LOCAL else 'fail',
-                                f'Недоступен ({base_url})'))
+                                f'Unreachable ({base_url})'))
             continue
 
         gpu  = health.get('gpu', 'N/A')
         vram = f"{health.get('vram_used_mb', '?')}/{health.get('vram_total_mb', '?')} MB"
         checks.append(Check(name, 'ok', base_url, f'GPU: {gpu}, VRAM: {vram}'))
 
-    # Синтез тест (только основного, не quick)
+    # Synthesis test (primary only, not in quick mode)
     if not quick and _probe(TTS_PRIMARY):
-        name = 'TTS синтез'
+        name = 'TTS synthesis'
         try:
             import requests as req
             t0 = time.time()
@@ -196,7 +200,7 @@ def check_tts(quick: bool) -> list[Check]:
             )
             data = b''.join(r.iter_content(4096))
             dt = time.time() - t0
-            # Определяем sample rate
+            # Determine the sample rate
             ct = r.headers.get('Content-Type', '')
             sr = 'N/A'
             for part in ct.split(';'):
@@ -204,7 +208,7 @@ def check_tts(quick: bool) -> list[Check]:
                     sr = part.strip()[5:]
             checks.append(Check(
                 name, 'ok' if data else 'fail',
-                f'{len(data)} байт за {dt:.1f}с',
+                f'{len(data)} bytes in {dt:.1f}s',
                 f'Sample rate: {sr} Hz'
             ))
         except Exception as e:
@@ -218,15 +222,15 @@ def check_openhab() -> list[Check]:
     name = f'OpenHAB ({PRIMARY_HOST}:8080)'
 
     if not _probe(OPENHAB_URL):
-        return [Check(name, 'warn', 'Недоступен — умный дом не будет работать')]
+        return [Check(name, 'warn', 'Unreachable — the smart home will not work')]
 
     try:
         all_items = _get(f'{OPENHAB_URL}/rest/items').json()
         llm_items = _get(f'{OPENHAB_URL}/rest/items?tags=ChatGPT').json()
         checks.append(Check(
             name, 'ok' if llm_items else 'warn',
-            f'{len(llm_items)} устройств с тегом ChatGPT (из {len(all_items)} всего)',
-            f'Без тега ChatGPT LLM не видит устройства' if not llm_items else ''
+            f'{len(llm_items)} devices tagged ChatGPT (out of {len(all_items)} total)',
+            f'Without the ChatGPT tag the LLM cannot see the devices' if not llm_items else ''
         ))
     except Exception as e:
         checks.append(Check(name, 'fail', str(e)))
@@ -237,16 +241,16 @@ def check_openhab() -> list[Check]:
 def check_filesystem() -> list[Check]:
     checks = []
 
-    # Wake word модель
-    name = 'Wake word модель'
+    # Wake word model
+    name = 'Wake word model'
     if os.path.exists(WAKEWORD_MODEL):
         size_kb = os.path.getsize(WAKEWORD_MODEL) // 1024
         checks.append(Check(name, 'ok', WAKEWORD_MODEL, f'{size_kb} KB'))
     else:
         checks.append(Check(
             name, 'fail',
-            f'Не найдена: {WAKEWORD_MODEL}',
-            'Необходима для обнаружения "Эй Лёня"'
+            f'Not found: {WAKEWORD_MODEL}',
+            'Required to detect "Эй Лёня"'
         ))
 
     # ~/.cache/torch (Silero VAD)
@@ -257,7 +261,7 @@ def check_filesystem() -> list[Check]:
     else:
         checks.append(Check(
             name, 'warn',
-            'Не закэширован — будет скачан при первом запуске (~8MB)',
+            'Not cached — will be downloaded on first run (~8MB)',
             silero_cache
         ))
 
@@ -265,22 +269,22 @@ def check_filesystem() -> list[Check]:
     whisper_cache = os.path.expanduser('~/.cache/huggingface')
     name = 'Whisper model cache'
     if os.path.isdir(whisper_cache):
-        # ищем medium модель
+        # look for the medium model
         found = any(
             'medium' in root
             for root, _, _ in os.walk(whisper_cache)
             if 'faster-whisper' in root
         )
         if found:
-            checks.append(Check(name, 'ok', 'faster-whisper medium найдена'))
+            checks.append(Check(name, 'ok', 'faster-whisper medium found'))
         else:
             checks.append(Check(
                 name, 'warn',
-                'faster-whisper medium не найдена — будет скачана при первом запуске (~1.5GB)',
+                'faster-whisper medium not found — will be downloaded on first run (~1.5GB)',
                 whisper_cache
             ))
     else:
-        checks.append(Check(name, 'warn', 'Hugging Face cache не найден'))
+        checks.append(Check(name, 'warn', 'Hugging Face cache not found'))
 
     return checks
 
@@ -304,17 +308,17 @@ def check_audio() -> list[Check]:
 
         if input_devices:
             checks.append(Check(
-                'Аудио входы', 'ok',
-                f'{len(input_devices)} устройств найдено',
+                'Audio inputs', 'ok',
+                f'{len(input_devices)} devices found',
                 '\n    '.join(input_devices)
             ))
         else:
-            checks.append(Check('Аудио входы', 'fail', 'Нет входных аудио устройств'))
+            checks.append(Check('Audio inputs', 'fail', 'No audio input devices'))
 
     except ImportError:
-        checks.append(Check('PyAudio', 'fail', 'Не установлен: pip install pyaudio'))
+        checks.append(Check('PyAudio', 'fail', 'Not installed: pip install pyaudio'))
     except Exception as e:
-        checks.append(Check('Аудио', 'fail', str(e)))
+        checks.append(Check('Audio', 'fail', str(e)))
 
     try:
         import sounddevice as sd
@@ -323,12 +327,12 @@ def check_audio() -> list[Check]:
         if output_devs:
             default_out = sd.query_devices(kind='output')
             checks.append(Check(
-                'Аудио выход', 'ok',
-                f"По умолчанию: {default_out['name']}",
+                'Audio output', 'ok',
+                f"Default: {default_out['name']}",
                 f'{int(default_out["default_samplerate"])} Hz'
             ))
         else:
-            checks.append(Check('Аудио выход', 'fail', 'Нет выходных устройств'))
+            checks.append(Check('Audio output', 'fail', 'No output devices'))
     except Exception as e:
         checks.append(Check('sounddevice', 'fail', str(e)))
 
@@ -338,14 +342,14 @@ def check_audio() -> list[Check]:
 def check_python_packages() -> list[Check]:
     checks = []
     packages = [
-        ('rclpy',         'ROS2 Python клиент'),
+        ('rclpy',         'ROS2 Python client'),
         ('faster_whisper','Whisper STT'),
         ('torch',         'PyTorch (Silero VAD)'),
-        ('openwakeword',  'Wake word детектор'),
-        ('pyaudio',       'Захват микрофона'),
-        ('sounddevice',   'Воспроизведение аудио'),
-        ('requests',      'HTTP клиент'),
-        ('numpy',         'Обработка аудио'),
+        ('openwakeword',  'Wake word detector'),
+        ('pyaudio',       'Microphone capture'),
+        ('sounddevice',   'Audio playback'),
+        ('requests',      'HTTP client'),
+        ('numpy',         'Audio processing'),
         ('py_trees',      'Behavior Tree'),
     ]
     for pkg, desc in packages:
@@ -354,7 +358,7 @@ def check_python_packages() -> list[Check]:
             version = getattr(mod, '__version__', '?')
             checks.append(Check(f'{pkg}', 'ok', desc, f'v{version}'))
         except ImportError:
-            checks.append(Check(f'{pkg}', 'fail', f'{desc} — не установлен'))
+            checks.append(Check(f'{pkg}', 'fail', f'{desc} — not installed'))
 
     # inmoov_msgs action
     try:
@@ -363,7 +367,7 @@ def check_python_packages() -> list[Check]:
     except ImportError:
         checks.append(Check(
             'inmoov_msgs', 'fail',
-            'Не собран: colcon build --packages-select inmoov_msgs'
+            'Not built: colcon build --packages-select inmoov_msgs'
         ))
 
     return checks
@@ -379,13 +383,13 @@ def check_ros2_env() -> list[Check]:
         checks.append(Check(
             'ROS_DISTRO', 'ok' if ok else 'warn',
             distro,
-            '' if ok else 'Ожидается jazzy'
+            '' if ok else 'jazzy expected'
         ))
     else:
         checks.append(Check(
             'ROS_DISTRO', 'fail',
-            'Не установлен',
-            'Запусти: source /opt/ros/jazzy/setup.bash'
+            'Not set',
+            'Run: source /opt/ros/jazzy/setup.bash'
         ))
 
     # Workspace
@@ -396,11 +400,11 @@ def check_ros2_env() -> list[Check]:
     else:
         checks.append(Check(
             'Workspace sourced', 'warn',
-            f'Workspace не найден в AMENT_PREFIX_PATH',
-            f'Запусти: source {ws_path}/install/setup.bash'
+            f'Workspace not found in AMENT_PREFIX_PATH',
+            f'Run: source {ws_path}/install/setup.bash'
         ))
 
-    # ROS2 topics (если daemon запущен)
+    # ROS2 nodes (if the daemon is running)
     try:
         import subprocess
         result = subprocess.run(
@@ -410,20 +414,20 @@ def check_ros2_env() -> list[Check]:
         nodes = [n for n in result.stdout.strip().split('\n') if n]
         if nodes:
             checks.append(Check(
-                'Запущенные ноды', 'ok' if nodes else 'skip',
-                f'{len(nodes)} нод активно',
+                'Running nodes', 'ok' if nodes else 'skip',
+                f'{len(nodes)} nodes active',
                 ', '.join(nodes[:8]) + ('...' if len(nodes) > 8 else '')
             ))
         else:
-            checks.append(Check('Запущенные ноды', 'skip', 'Нет активных нод'))
+            checks.append(Check('Running nodes', 'skip', 'No active nodes'))
     except Exception:
-        checks.append(Check('ros2 CLI', 'warn', 'Недоступен'))
+        checks.append(Check('ros2 CLI', 'warn', 'Unavailable'))
 
     return checks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ВЫВОД
+# OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def print_section(title: str, checks: list[Check]):
@@ -449,16 +453,16 @@ def print_summary(all_checks: list[Check]):
     print(f'\n{"─"*60}')
     status = 'ok' if fail == 0 and warn == 0 else ('warn' if fail == 0 else 'fail')
     icon   = {'ok': OK('✓'), 'warn': WARN('⚠'), 'fail': FAIL('✗')}[status]
-    print(f'{icon}  {ok} OK  |  {warn} WARN  |  {fail} FAIL  |  {skip} SKIP  (всего {total})')
+    print(f'{icon}  {ok} OK  |  {warn} WARN  |  {fail} FAIL  |  {skip} SKIP  (total {total})')
 
     if fail > 0:
-        print(f'\n{FAIL("Критические проблемы:")}')
+        print(f'\n{FAIL("Critical problems:")}')
         for c in all_checks:
             if c.status == 'fail':
                 print(f'  {FAIL("✗")} {c.name}: {c.message}')
 
     if warn > 0:
-        print(f'\n{WARN("Предупреждения:")}')
+        print(f'\n{WARN("Warnings:")}')
         for c in all_checks:
             if c.status == 'warn':
                 print(f'  {WARN("⚠")} {c.name}: {c.message}')
@@ -471,29 +475,29 @@ def print_summary(all_checks: list[Check]):
 def main():
     parser = argparse.ArgumentParser(description='InMoov Voice Pipeline Diagnostic')
     parser.add_argument('--quick', action='store_true',
-                        help='Пропустить тесты inference (быстрый режим)')
+                        help='Skip inference tests (quick mode)')
     parser.add_argument('--no-audio', action='store_true',
-                        help='Не проверять аудио устройства')
+                        help='Do not check audio devices')
     args = parser.parse_args()
 
     print(BOLD('\n╔══════════════════════════════════════════════════════╗'))
-    print(BOLD('║     InMoov Voice Pipeline — Диагностика              ║'))
+    print(BOLD('║     InMoov Voice Pipeline — Diagnostics            ║'))
     print(BOLD('╚══════════════════════════════════════════════════════╝'))
     if args.quick:
-        print(DIM('  [быстрый режим — inference тесты пропущены]'))
+        print(DIM('  [quick mode — inference tests skipped]'))
 
     all_checks: list[Check] = []
 
     sections = [
-        ('🔌  ROS2 окружение',   check_ros2_env()),
-        ('📦  Python пакеты',    check_python_packages()),
-        ('📁  Файловая система', check_filesystem()),
+        ('🔌  ROS2 environment',   check_ros2_env()),
+        ('📦  Python packages',    check_python_packages()),
+        ('📁  Filesystem', check_filesystem()),
         ('🧠  vLLM',             check_llm(args.quick)),
         ('🔊  TTS Server',       check_tts(args.quick)),
         ('🏠  OpenHAB',          check_openhab()),
     ]
     if not args.no_audio:
-        sections.append(('🎤  Аудио устройства', check_audio()))
+        sections.append(('🎤  Audio devices', check_audio()))
 
     for title, checks in sections:
         print_section(title, checks)
@@ -502,7 +506,7 @@ def main():
     print_summary(all_checks)
     print()
 
-    # Возвращаем код ошибки если есть fail
+    # Return a non-zero exit code if any check failed
     fail_count = sum(1 for c in all_checks if c.status == 'fail')
     sys.exit(1 if fail_count > 0 else 0)
 

@@ -2,34 +2,37 @@
 """
 identity_manager_node.py
 ========================
-«Поставщик Социального Контекста» — объединяет данные от face_recognition
-и emotion_recognition и публикует богатый контекст для Behavior Tree.
+"Social Context Provider" — combines data from face_recognition
+and emotion_recognition and publishes rich context for the Behavior Tree.
 
-НЕ отправляет прямые команды. Только данные.
+Does NOT send direct commands. Data only.
 
-Конечный автомат:
-  IDLE        — нет лица в кадре
-  RECOGNIZING — лицо есть, ждём идентификации
-  INTERACTING — знаем кто перед нами, следим за эмоцией
-  INTRODUCING — неизвестный человек, собираем имя через голос
+State machine:
+  IDLE        — no face in frame
+  RECOGNIZING — face present, waiting for identification
+  INTERACTING — we know who is in front of us, tracking emotion
+  INTRODUCING — unknown person, collecting name via voice
 
-Публикует:
+Publishes:
   /social_context  (String JSON → behavior_manager Blackboard)
-      Поля: person_present, person_id, name, is_known, emotion,
+      Fields: person_present, person_id, name, is_known, emotion,
             should_greet, greet_text, introducing,
             introduce_pending, introduce_text, state
   /person_context  (String JSON → llm_node)
-  /person_present  (Bool) — быстрый interrupt сигнал
+  /person_present  (Bool) — fast interrupt signal
   /introducing     (Bool → llm_node gate)
-  /face_expression (String → face_expressions_node, мимика-зеркало)
+  /face_expression (String → face_expressions_node, facial mirroring)
   /vision/enable   (Bool, latched)
 
-Подписки:
+Subscribes:
   /face/identity  (String JSON)
   /face/emotion   (String JSON)
   /face/tracks    (String JSON)
-  /voice_command  (String) — перехват в режиме INTRODUCING
+  /voice_command  (String) — intercepted while in INTRODUCING state
 
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import collections
@@ -55,113 +58,113 @@ class State:
 
 
 class IdentityManagerNode(LifecycleNode):
-    _SV_SESSION_MAX = 3      # максимум голосовых записей за сессию INTERACTING
-    _SV_SESSION_GAP = 120.0  # минимальный интервал между записями (сек)
+    _SV_SESSION_MAX = 3      # max number of voice recordings per INTERACTING session
+    _SV_SESSION_GAP = 120.0  # minimum interval between recordings (sec)
 
     def __init__(self):
         super().__init__('identity_manager_node')
 
 
-        # ── Состояние ─────────────────────────────────────────────────────
+        # ── State ─────────────────────────────────────────────────────
         self._state           = State.IDLE
         self._primary_track   = None
-        self._primary_embedding: list | None = None   # последний embedding трека
-        self._enroll_embeddings: list[list] = []      # накопленные embeddings для энролмента
-        self._enroll_max = 10                          # сколько собираем перед сохранением
+        self._primary_embedding: list | None = None   # last track embedding
+        self._enroll_embeddings: list[list] = []      # accumulated embeddings for enrollment
+        self._enroll_max = 10                          # how many to collect before saving
         self._current_person  = {}
         self._last_face_time  = 0.0
-        self._last_human_time = 0.0   # последний сигнал от human_detection_node
+        self._last_human_time = 0.0   # last signal from human_detection_node
         self._last_greet      = {}     # person_id → timestamp
         self._session_greeted = set()
-        self._last_emotion    = None   # последняя распознанная эмоция человека (для social_context)
-        # Fusion: оба источника должны согласиться, прежде чем менять мимику
+        self._last_emotion    = None   # last recognized human emotion (for social_context)
+        # Fusion: both sources must agree before changing facial expression
         self._face_emo_pend:  dict | None = None  # {'emotion', 'ts', 'confidence'}
         self._voice_emo_pend: dict | None = None  # {'emotion', 'ts', 'confidence'}
-        self._FUSION_WINDOW = 15.0  # секунд, в течение которых оба сигнала должны совпасть
+        self._FUSION_WINDOW = 15.0  # seconds within which both signals must match
         self._lock            = threading.Lock()
 
         self._introduce_last     = 0.0
         self._introduce_attempts = 0
-        self._enrolled_track_id: int | None = None  # трек, залоченный ДО энролмента — игнорируем
-        self._sleeping           = False   # спящий режим — PIR игнорируется
-        self._face_hunt_since    = 0.0    # когда начали ждать лицо при живом теле
-        self._last_dialogue_ts   = 0.0    # последний ответ LLM (диалог активен)
-        self._voice_id_grace_ts  = 0.0    # голосовая идентификация из IDLE (watchdog grace)
-        # Greet cooldown по имени (независимо от person_id — tracker может менять id)
+        self._enrolled_track_id: int | None = None  # track locked BEFORE enrollment — ignore
+        self._sleeping           = False   # sleep mode — PIR ignored
+        self._face_hunt_since    = 0.0    # when we started waiting for a face while a body is present
+        self._last_dialogue_ts   = 0.0    # last LLM response (dialogue active)
+        self._voice_id_grace_ts  = 0.0    # voice identification from IDLE (watchdog grace)
+        # Greet cooldown by name (independent of person_id — tracker may change id)
         self._greeted_names: dict[str, float] = {}   # name → timestamp
-        # После OakD вето: блокируем _tracks_cb до следующего сигнала тела.
-        # Это разрывает бесконечный цикл "Привет/До свидания" при false positive face_detection.
+        # After an OakD veto: block _tracks_cb until the next body signal.
+        # This breaks the infinite "Hello/Goodbye" loop on face_detection false positives.
         self._waiting_for_body: bool = False
 
-        # Left-primary / right-fallback для трекинга: если левая камера молчит
-        # дольше track_eye_fallback_sec — переключаемся на правую.
-        self._left_track_last_msg: float = 0.0   # время последнего msg от левой
-        self._tracks_eye: str = 'left'            # текущий активный глаз
+        # Left-primary / right-fallback tracking: if the left camera is silent
+        # longer than track_eye_fallback_sec — switch to the right one.
+        self._left_track_last_msg: float = 0.0   # time of the last message from the left camera
+        self._tracks_eye: str = 'left'            # currently active eye
 
-        # Взгляд: смотрит ли собеседник роботу в глаза.
-        # Вычисляется из kps InsightFace — асимметрия нос/глаза (yaw-proxy).
-        # Хранится скользящее окно последних 15 значений (~1.5с @ 10Hz детекции).
+        # Gaze: whether the interlocutor is looking the robot in the eyes.
+        # Computed from InsightFace kps — nose/eye asymmetry (yaw-proxy).
+        # A sliding window of the last 15 values is kept (~1.5s @ 10Hz detection).
         self._frontal_scores: collections.deque = collections.deque(maxlen=15)
-        self._looking_at_robot: bool = True  # default True пока нет данных
+        self._looking_at_robot: bool = True  # default True until data is available
 
-        # Голосовой отпечаток текущей сессии (от voice_detector через /voice_embedding)
+        # Voice fingerprint of the current session (from voice_detector via /voice_embedding)
         self._session_voice_emb: list | None = None
-        # Все голосовые embeddings сессии (для сохранения в галерею при знакомстве)
+        # All voice embeddings of the session (for saving to the gallery during introduction)
         self._session_voice_gallery: list = []  # [{embedding, timestamp}]
-        # Счётчик: сколько голосовых записей уже сохранено в БД в этой сессии INTERACTING.
-        # Разрешаем до 3 записей за сессию с интервалом не менее 2 минут.
+        # Counter: how many voice recordings have already been saved to the DB in this INTERACTING session.
+        # Up to 3 recordings per session are allowed, with at least a 2-minute interval.
         self._session_voice_save_count: int = 0
         self._session_voice_last_save_ts: float = 0.0
 
-        # Верификация заявленной личности (в режиме INTRODUCING)
-        # Ступени: face_sim < FACE_VETO → другой человек; >= FACE_ACCEPT → принимаем;
-        # между — нужен голос.
-        self._FACE_VETO         = 0.28   # явно другое лицо — голос не поможет
-        self._FACE_ACCEPT       = 0.45   # лицо говорит ДА — принимаем без голоса
-        self._VOICE_ACCEPT      = 0.52   # голос подтверждает в uncertain-зоне лица
-        # Три флага состояния pending-ответа:
-        #   _pending_name_confirm     — имя, ждём да/нет подтверждения
-        #   _pending_name_confirm_pid — person_id если имя уже в БД (для accept_claim),
-        #                               None если новый человек (для enroll)
-        #   _skip_db_check            — следующее имя не проверяем по БД
-        #                               (ситуация "другой Артур, придумайте прозвище")
+        # Verification of a claimed identity (in INTRODUCING mode)
+        # Tiers: face_sim < FACE_VETO → different person; >= FACE_ACCEPT → accept;
+        # in between — voice is needed.
+        self._FACE_VETO         = 0.28   # clearly a different face — voice won't help
+        self._FACE_ACCEPT       = 0.45   # face says YES — accept without voice
+        self._VOICE_ACCEPT      = 0.52   # voice confirms in the face's uncertain zone
+        # Three pending-answer state flags:
+        #   _pending_name_confirm     — name, waiting for yes/no confirmation
+        #   _pending_name_confirm_pid — person_id if the name is already in the DB (for accept_claim),
+        #                               None if a new person (for enroll)
+        #   _skip_db_check            — don't check the next name against the DB
+        #                               (the "another Artur, come up with a nickname" case)
         self._pending_name_confirm:     str | None = None
         self._pending_name_confirm_pid: int | None = None
         self._skip_db_check:            bool       = False
 
-        # Пост-прощальный кулдаун: после явного goodbye игнорируем человека N минут
-        # (или до wake word). Ключ — имя человека, значение — timestamp прощания.
+        # Post-goodbye cooldown: after an explicit goodbye we ignore the person for N minutes
+        # (or until wake word). Key — person's name, value — goodbye timestamp.
         self._post_goodbye_names: dict[str, float] = {}
-        # Блокировка обработки треков лица на N секунд после goodbye — предотвращает
-        # петлю IDLE→RECOGNIZING→post_goodbye→IDLE при работающей face_detection.
+        # Blocks face track processing for N seconds after goodbye — prevents
+        # an IDLE→RECOGNIZING→post_goodbye→IDLE loop while face_detection keeps running.
         self._post_goodbye_track_block_until: float = 0.0
 
-        # Когда последний раз видели текущего человека (по person_id из face_recognition).
-        # Переключение на другого собеседника возможно только спустя _dialogue_switch_timeout.
+        # When the current person (by person_id from face_recognition) was last seen.
+        # Switching to a different interlocutor is only possible after _dialogue_switch_timeout.
         self._current_person_last_seen: float = 0.0
 
-        # ── Социальный контекст (публикуется в /social_context) ───────────
-        # Одноразовые флаги: устанавливаются перед публикацией, сбрасываются после.
-        self._should_greet       = False   # BT должен поздороваться
-        self._greet_text         = ''      # текст приветствия
-        self._introduce_pending  = False   # BT должен произнести фразу знакомства
-        self._introduce_text     = ''      # текст для произнесения
+        # ── Social context (published to /social_context) ───────────
+        # One-shot flags: set before publishing, reset afterwards.
+        self._should_greet       = False   # BT should greet
+        self._greet_text         = ''      # greeting text
+        self._introduce_pending  = False   # BT should speak the introduction phrase
+        self._introduce_text     = ''      # text to speak
 
         self._watchdog_timer = None
         self._ctx_timer      = None
 
-    # ── Wakeword / Спящий режим ───────────────────────────────────────────
+    # ── Wakeword / Sleep mode ───────────────────────────────────────────
 
     def _robot_sleep_cb(self, msg: Bool):
-        """Получаем команду сна от behavior_manager. Vision управляется BT."""
+        """Receives the sleep command from behavior_manager. Vision is controlled by the BT."""
         if msg.data and not self._sleeping:
-            # /sleep из Telegram — мгновенный переход, минуя обычный watchdog/
-            # goodbye-путь. Если в этот момент шло знакомство (State.INTRODUCING),
-            # /introducing иначе останется True навсегда — llm_node/telegram_ask
-            # будут вечно отвечать "занят", даже во сне (баг найден 2026-08-30).
+            # /sleep from Telegram — an instant transition, bypassing the normal watchdog/
+            # goodbye path. If an introduction was in progress at that moment (State.INTRODUCING),
+            # /introducing would otherwise stay True forever — llm_node/telegram_ask
+            # would keep answering "busy" forever, even while asleep (bug found 2026-08-30).
             was_introducing = (self._state == State.INTRODUCING)
             self._sleeping = True
-            self.get_logger().info('Спящий режим активирован')
+            self.get_logger().info('Sleep mode activated')
             with self._lock:
                 self._state                    = State.IDLE
                 self._primary_track            = None
@@ -180,20 +183,20 @@ class IdentityManagerNode(LifecycleNode):
             self._pub_person_present(False)
         elif not msg.data and self._sleeping:
             self._sleeping = False
-            self.get_logger().info('Пробуждение: восстанавливаю нормальный режим')
+            self.get_logger().info('Waking up: restoring normal mode')
 
     def _wakeword_cb(self, msg: Bool):
         if not msg.data:
             return
-        # Wake word: снимаем пост-прощальные блокировки — человек сам инициирует диалог
+        # Wake word: clear post-goodbye blocks — the person is initiating the dialogue themselves
         with self._lock:
             if self._post_goodbye_names:
                 names = ', '.join(self._post_goodbye_names.keys())
                 self._post_goodbye_names.clear()
-                self.get_logger().info(f'Wake word: пост-прощальный кулдаун снят ({names})')
+                self.get_logger().info(f'Wake word: post-goodbye cooldown cleared ({names})')
             self._post_goodbye_track_block_until = 0.0
         if self._sleeping:
-            self.get_logger().info('Wakeword: выхожу из спящего режима')
+            self.get_logger().info('Wakeword: exiting sleep mode')
             self._sleeping = False
             wake_msg = Bool()
             wake_msg.data = False
@@ -201,31 +204,31 @@ class IdentityManagerNode(LifecycleNode):
             face_msg = String()
             face_msg.data = 'neutral'
             self._face_expr_pub.publish(face_msg)
-        # Включение face_detection — задача BT (через PIRScanBranch / пробуждение)
+        # Enabling face_detection is the BT's job (via PIRScanBranch / wake-up)
 
     def _llm_response_seen_cb(self, _msg):
-        """LLM ответил → диалог активен, сбрасываем таймер поиска лица."""
+        """LLM responded → dialogue is active, reset the face-search timer."""
         with self._lock:
             self._last_dialogue_ts = time.time()
             self._face_hunt_since  = 0.0
 
-    # ── Колбэки ───────────────────────────────────────────────────────────
+    # ── Callbacks ───────────────────────────────────────────────────────────
 
     def _tracks_left_cb(self, msg: String):
         self._left_track_last_msg = time.time()
         if self._tracks_eye != 'left':
             self._tracks_eye = 'left'
-            self.get_logger().info('Tracks: левая камера восстановлена — возврат с правой')
+            self.get_logger().info('Tracks: left camera restored — switching back from right')
         self._tracks_cb(msg)
 
     def _tracks_right_cb(self, msg: String):
         elapsed = time.time() - self._left_track_last_msg
         if self._left_track_last_msg > 0.0 and elapsed < self._track_eye_fallback_sec:
-            return  # левая активна — правую игнорируем
+            return  # left is active — ignoring right
         if self._tracks_eye != 'right':
             self._tracks_eye = 'right'
             self.get_logger().warn(
-                f'Tracks: левая камера недоступна ({elapsed:.1f}с) — переключаюсь на правую')
+                f'Tracks: left camera unavailable ({elapsed:.1f}s) — switching to right')
         self._tracks_cb(msg)
 
     def _tracks_cb(self, msg: String):
@@ -234,7 +237,7 @@ class IdentityManagerNode(LifecycleNode):
         if self._waiting_for_body:
             return
         if time.time() < self._post_goodbye_track_block_until:
-            return  # пост-прощальная блокировка треков активна
+            return  # post-goodbye track block is active
         try:
             data   = json.loads(msg.data)
             tracks = data.get('tracks', [])
@@ -244,50 +247,50 @@ class IdentityManagerNode(LifecycleNode):
         with self._lock:
             if tracks:
                 self._last_face_time  = time.time()
-                self._face_hunt_since = 0.0   # лицо снова видно — сбрасываем охоту
+                self._face_hunt_since = 0.0   # face visible again — reset the hunt
                 track_ids = {t['track_id'] for t in tracks}
 
                 if self._primary_track not in track_ids:
-                    # Пробовали здесь выбирать по схожести embedding вместо
-                    # площади bbox (живой баг 2026-08-31: перехват чужого/
-                    # ложного трека) — откачено 2026-08-31: не устранило сам
-                    # уход головы (см. project_face_search_retry.md), лишняя
-                    # сложность. Оставлено как было — по площади bbox.
+                    # We tried selecting by embedding similarity here instead
+                    # of bbox area (live bug 2026-08-31: hijacking someone else's/
+                    # a false track) — reverted 2026-08-31: it did not fix the
+                    # head-drift itself (see project_face_search_retry.md), just
+                    # added complexity. Left as it was — by bbox area.
                     best = max(tracks, key=lambda t: (
                         (t['bbox'][2] - t['bbox'][0]) * (t['bbox'][3] - t['bbox'][1])))
                     new_track = best['track_id']
 
                     if self._state == State.IDLE:
-                        # Новое лицо из IDLE — начинаем распознавание
+                        # New face from IDLE — start recognizing
                         self._primary_track = new_track
                         self._state = State.RECOGNIZING
-                        self.get_logger().info('Лицо обнаружено — распознаём...')
+                        self.get_logger().info('Face detected — recognizing...')
                         self._pub_person_present(True)
                     else:
                         # INTRODUCING / INTERACTING / RECOGNIZING:
-                        # Просто обновляем track_id. Если человек сменился — _identity_cb это определит
-                        # по person_id (или locked=True + unknown). Это предотвращает лишние переходы
-                        # состояний при обычной смене track_id из-за движения головы.
+                        # Just update track_id. If the person changed — _identity_cb will detect it
+                        # via person_id (or locked=True + unknown). This prevents unnecessary state
+                        # transitions on an ordinary track_id change caused by head movement.
                         self.get_logger().debug(
-                            f'Трек переназначен: {self._primary_track}→{new_track} '
+                            f'Track reassigned: {self._primary_track}→{new_track} '
                             f'(state={self._state})')
                         self._primary_track = new_track
 
-                # Сохраняем embedding и вычисляем frontal score главного трека
+                # Save the embedding and compute the frontal score of the primary track
                 for t in tracks:
                     if t['track_id'] == self._primary_track:
                         emb       = t.get('embedding', [])
                         det_score = t.get('det_score', 1.0)
                         if emb:
                             self._primary_embedding = emb
-                            # В режиме знакомства накапливаем только качественные embeddings
+                            # In introduction mode, accumulate only quality embeddings
                             if self._state == State.INTRODUCING:
                                 if (len(self._enroll_embeddings) < self._enroll_max
                                         and det_score >= self._min_enroll_det):
                                     self._enroll_embeddings.append(emb)
-                        # Yaw-proxy из 5 InsightFace keypoints:
+                        # Yaw-proxy from 5 InsightFace keypoints:
                         # kps[0]=left_eye, kps[1]=right_eye, kps[2]=nose_tip
-                        # Если нос смещён от центра между глазами < 30% inter-eye dist → фронталь
+                        # If the nose is offset from the mid-eye point by < 30% of inter-eye dist → frontal
                         kps = t.get('kps', [])
                         if len(kps) >= 3:
                             eye_mid_x   = (kps[0][0] + kps[1][0]) / 2.0
@@ -331,19 +334,19 @@ class IdentityManagerNode(LifecycleNode):
             if is_known and confidence == 'high':
                 self._on_known(person_id, name)
             elif not is_known and confidence == 'uncertain' and locked:
-                # Вероятно известный человек — тихий INTERACTING без приветствия
+                # Likely a known person — silent INTERACTING without a greeting
                 self._on_uncertain(candidate_id, candidate_name)
             elif not is_known and confidence == 'unknown' and locked:
                 self._on_unknown()
             else:
                 self.get_logger().debug(
-                    f'Трек {data.get("track_id")} — ещё не опознан, ждём lock...')
+                    f'Track {data.get("track_id")} — not yet recognized, waiting for lock...')
 
         elif state == State.INTRODUCING:
-            # Только если пришло распознавание известного человека — отменяем знакомство
+            # Cancel the introduction only if recognition of a known person came in
             if is_known:
                 self.get_logger().info(
-                    f'INTRODUCING: лицо распознано как {name} (id={person_id}) — отменяю знакомство')
+                    f'INTRODUCING: face recognized as {name} (id={person_id}) — cancelling introduction')
                 now = time.time()
                 with self._lock:
                     self._state               = State.INTERACTING
@@ -369,22 +372,22 @@ class IdentityManagerNode(LifecycleNode):
                 current_name = self._current_person.get('name', '?')
 
             if is_known and confidence == 'high' and person_id == current_id:
-                # Тот же человек — обновляем метку последнего появления
+                # Same person — update the last-seen timestamp
                 with self._lock:
                     self._current_person_last_seen = now
             elif is_known and confidence == 'high' and person_id != current_id:
-                # Другой человек — переключаем только после длительного отсутствия текущего
+                # Different person — switch only after the current one has been absent for a long time
                 with self._lock:
                     absent_sec = (now - self._current_person_last_seen
                                   if self._current_person_last_seen > 0 else float('inf'))
                 if absent_sec < self._dialogue_switch_timeout:
                     self.get_logger().debug(
-                        f'Игнорирую {name} (id={person_id}) — '
-                        f'диалог с {current_name}, последний раз видели {absent_sec:.0f}с назад')
+                        f'Ignoring {name} (id={person_id}) — '
+                        f'dialogue with {current_name}, last seen {absent_sec:.0f}s ago')
                     return
                 self.get_logger().info(
-                    f'INTERACTING: смена человека → {name} (id={person_id}) '
-                    f'({current_name} не виден {absent_sec:.0f}с)')
+                    f'INTERACTING: person switch → {name} (id={person_id}) '
+                    f'({current_name} not seen for {absent_sec:.0f}s)')
                 with self._lock:
                     self._state             = State.RECOGNIZING
                     self._current_person    = {}
@@ -392,10 +395,10 @@ class IdentityManagerNode(LifecycleNode):
                     self._last_emotion      = None
                 self._on_known(person_id, name)
             elif not is_known and confidence == 'uncertain' and locked:
-                # Лицо похоже на кандидата но ниже порога — не меняем состояние
+                # Face resembles a candidate but is below the threshold — don't change state
                 pass
             elif not is_known and confidence == 'unknown' and locked:
-                # Неизвестный — переключаем только после длительного отсутствия текущего
+                # Unknown — switch only after the current one has been absent for a long time
                 with self._lock:
                     absent_sec = (now - self._current_person_last_seen
                                   if self._current_person_last_seen > 0 else float('inf'))
@@ -405,12 +408,12 @@ class IdentityManagerNode(LifecycleNode):
                     return
                 if absent_sec < self._dialogue_switch_timeout:
                     self.get_logger().debug(
-                        f'Игнорирую неизвестного — '
-                        f'диалог с {current_name}, последний раз видели {absent_sec:.0f}с назад')
+                        f'Ignoring unknown — '
+                        f'dialogue with {current_name}, last seen {absent_sec:.0f}s ago')
                     return
                 self.get_logger().info(
-                    f'INTERACTING: неизвестный после {absent_sec:.0f}с отсутствия '
-                    f'{current_name} — знакомство')
+                    f'INTERACTING: unknown after {absent_sec:.0f}s absence of '
+                    f'{current_name} — starting introduction')
                 with self._lock:
                     self._state             = State.RECOGNIZING
                     self._current_person    = {}
@@ -438,11 +441,11 @@ class IdentityManagerNode(LifecycleNode):
         if confidence < self._emotion_thresh:
             return
 
-        # Обновляем social_context (для LLM) по лицу без fusion
+        # Update social_context (for the LLM) from the face without fusion
         if emotion != self._last_emotion:
             self._last_emotion = emotion
 
-        # Fusion: сохраняем pending и проверяем согласие с голосом
+        # Fusion: store pending and check agreement with voice
         self._face_emo_pend = {'emotion': emotion, 'ts': time.time(), 'confidence': confidence}
         self._check_emotion_fusion()
 
@@ -464,12 +467,12 @@ class IdentityManagerNode(LifecycleNode):
         if confidence < 0.55:
             return
 
-        self.get_logger().info(f'Голос-эмоция получена: {emotion} (conf={confidence:.2f})')
+        self.get_logger().info(f'Voice emotion received: {emotion} (conf={confidence:.2f})')
         self._voice_emo_pend = {'emotion': emotion, 'ts': time.time(), 'confidence': confidence}
         self._check_emotion_fusion()
 
     def _check_emotion_fusion(self):
-        """Реагируем на эмоцию только если лицо и голос согласны в пределах FUSION_WINDOW."""
+        """React to emotion only if face and voice agree within FUSION_WINDOW."""
         face  = self._face_emo_pend
         voice = self._voice_emo_pend
         if face is None or voice is None:
@@ -486,25 +489,25 @@ class IdentityManagerNode(LifecycleNode):
 
         emotion = face['emotion']
         self.get_logger().info(
-            f'Fusion: лицо={face["emotion"]}({face["confidence"]:.2f}) '
-            f'+ голос={voice["emotion"]}({voice["confidence"]:.2f}) → реагируем'
+            f'Fusion: face={face["emotion"]}({face["confidence"]:.2f}) '
+            f'+ voice={voice["emotion"]}({voice["confidence"]:.2f}) → reacting'
         )
-        # Сбрасываем, чтобы не реагировать повторно на ту же пару
+        # Reset so we don't react again to the same pair
         self._face_emo_pend  = None
         self._voice_emo_pend = None
         self._react_to_emotion(emotion)
 
-    # ── Голосовой отпечаток ───────────────────────────────────────────────
+    # ── Voice fingerprint ───────────────────────────────────────────────
 
     def _voice_embedding_cb(self, msg: String):
-        """Получаем голосовой embedding от voice_detector.
+        """Receives a voice embedding from voice_detector.
 
-        Пять ролей:
-        1. IDLE → пробуем идентифицировать по голосу, переход в INTERACTING если узнали
-        2. INTERACTING с известным человеком → add_voice_to_gallery (1 раз за сессию)
-        3. INTRODUCING → накапливаем в _session_voice_gallery, проверяем по БД
-        4. RECOGNIZING → пробуем идентифицировать по голосу (параллельно с face recognition)
-        5. Всегда → обновляем _session_voice_emb (последний) и _session_voice_gallery
+        Five roles:
+        1. IDLE → try to identify by voice, transition to INTERACTING if recognized
+        2. INTERACTING with a known person → add_voice_to_gallery (once per session)
+        3. INTRODUCING → accumulate in _session_voice_gallery, check against the DB
+        4. RECOGNIZING → try to identify by voice (in parallel with face recognition)
+        5. Always → update _session_voice_emb (latest) and _session_voice_gallery
         """
         try:
             data = json.loads(msg.data)
@@ -523,15 +526,15 @@ class IdentityManagerNode(LifecycleNode):
             person_id = self._current_person.get('person_id')
 
         if state == State.IDLE:
-            # Нет лица — пробуем узнать по голосу
+            # No face — try to identify by voice
             threading.Thread(
                 target=self._try_voice_id_from_idle,
                 args=(emb,), daemon=True).start()
             return
 
         if state == State.INTERACTING and person_id is not None:
-            # Сохраняем до _SV_SESSION_MAX записей за сессию с интервалом _SV_SESSION_GAP.
-            # memory_node применит правило 7 дней: если галерея полная и свежая — пропустит.
+            # Save up to _SV_SESSION_MAX recordings per session with interval _SV_SESSION_GAP.
+            # memory_node will apply the 7-day rule: if the gallery is full and fresh — it skips.
             now = time.time()
             gap_ok   = (now - self._session_voice_last_save_ts) >= self._SV_SESSION_GAP
             count_ok = self._session_voice_save_count < self._SV_SESSION_MAX
@@ -539,18 +542,18 @@ class IdentityManagerNode(LifecycleNode):
                 self._session_voice_save_count  += 1
                 self._session_voice_last_save_ts = now
                 self.get_logger().info(
-                    f'Голосовой embedding принят (pid={person_id}), '
-                    f'запись {self._session_voice_save_count}/{self._SV_SESSION_MAX} — сохраняю в БД')
+                    f'Voice embedding accepted (pid={person_id}), '
+                    f'recording {self._session_voice_save_count}/{self._SV_SESSION_MAX} — saving to DB')
                 threading.Thread(
                     target=self._add_voice_to_gallery,
                     args=(person_id, emb, ts), daemon=True).start()
             elif not count_ok:
                 self.get_logger().debug(
-                    f'Голосовая галерея: лимит {self._SV_SESSION_MAX}/сессию достигнут, пропускаю')
+                    f'Voice gallery: limit {self._SV_SESSION_MAX}/session reached, skipping')
             else:
                 remaining = self._SV_SESSION_GAP - (now - self._session_voice_last_save_ts)
                 self.get_logger().debug(
-                    f'Голосовая галерея: слишком рано (ещё {remaining:.0f}с до следующей записи)')
+                    f'Voice gallery: too early (another {remaining:.0f}s until next recording)')
 
         elif state == State.RECOGNIZING:
             threading.Thread(
@@ -563,10 +566,10 @@ class IdentityManagerNode(LifecycleNode):
                 args=(emb,), daemon=True).start()
 
     def _try_voice_id_from_idle(self, emb: list):
-        """Голосовая идентификация из IDLE (лицо не видно, сработал wake word).
+        """Voice identification from IDLE (no face visible, wake word triggered).
 
-        Если голос узнан с высокой уверенностью — переходим в INTERACTING как при
-        обычном распознавании лица. 2Hz цикл опубликует person_present=True на след. тике.
+        If the voice is recognized with high confidence — transition to INTERACTING as with
+        normal face recognition. The 2Hz loop will publish person_present=True on the next tick.
         """
         result = self._call_memory({'op': 'lookup_by_voice', 'embedding': emb,
                                     'high_threshold': self._voice_high_threshold,
@@ -576,9 +579,9 @@ class IdentityManagerNode(LifecycleNode):
             name = result.get('name', '?')     if result else '?'
             conf = result.get('confidence', 'none') if result else 'no_result'
             self.get_logger().info(
-                f'Голосовая идентификация из IDLE: не узнан '
-                f'(лучший={name}, sim={sim:.3f}, confidence={conf}, '
-                f'нужно sim >= {self._voice_high_threshold} для перехода в INTERACTING)')
+                f'Voice identification from IDLE: not recognized '
+                f'(best={name}, sim={sim:.3f}, confidence={conf}, '
+                f'need sim >= {self._voice_high_threshold} to transition to INTERACTING)')
             return
 
         person_id = result['person_id']
@@ -586,19 +589,19 @@ class IdentityManagerNode(LifecycleNode):
 
         with self._lock:
             if self._state != State.IDLE:
-                return  # состояние изменилось (лицо распозналось пока мы запрашивали)
-            # Watchdog grace period: нет лица и тела — это норма при голосовой
-            # идентификации. Отдельное поле, не _last_dialogue_ts (тот проверяется
-            # в _on_known → dialogue_recently, что заблокировало бы приветствие).
+                return  # state changed (face was recognized while we were querying)
+            # Watchdog grace period: no face and no body is normal during voice
+            # identification. A separate field, not _last_dialogue_ts (that one is checked
+            # in _on_known → dialogue_recently, which would block the greeting).
             self._voice_id_grace_ts = time.time()
 
         self.get_logger().info(
-            f'Голосовая идентификация из IDLE: {name} (id={person_id}, '
-            f'sim={result.get("similarity", 0):.3f}) — перехожу в INTERACTING')
+            f'Voice identification from IDLE: {name} (id={person_id}, '
+            f'sim={result.get("similarity", 0):.3f}) — transitioning to INTERACTING')
         self._on_known(person_id, name)
 
     def _try_voice_identification(self, emb: list):
-        """Пробуем узнать человека по голосу пока face recognition ещё работает."""
+        """Try to recognize the person by voice while face recognition is still running."""
         result = self._call_memory({'op': 'lookup_by_voice', 'embedding': emb,
                                     'high_threshold': self._voice_high_threshold,
                                     'uncertain_threshold': self._voice_uncertain_threshold})
@@ -607,29 +610,29 @@ class IdentityManagerNode(LifecycleNode):
             name = result.get('name', '?')     if result else '?'
             conf = result.get('confidence', 'none') if result else 'no_result'
             self.get_logger().info(
-                f'Голосовая идентификация (RECOGNIZING): не узнан '
-                f'(лучший={name}, sim={sim:.3f}, confidence={conf})')
+                f'Voice identification (RECOGNIZING): not recognized '
+                f'(best={name}, sim={sim:.3f}, confidence={conf})')
             return
 
         person_id = result['person_id']
         name      = result.get('name', '?')
 
         with self._lock:
-            # Гонка: проверяем что мы всё ещё в RECOGNIZING (face recognition не завершилось)
+            # Race: check that we're still in RECOGNIZING (face recognition hasn't finished)
             if self._state != State.RECOGNIZING:
                 return
 
         self.get_logger().info(
-            f'Голосовая идентификация: {name} (id={person_id}, '
-            f'sim={result.get("similarity", 0):.3f}) — опережаю face recognition')
+            f'Voice identification: {name} (id={person_id}, '
+            f'sim={result.get("similarity", 0):.3f}) — ahead of face recognition')
         self._on_known(person_id, name)
 
     def _try_voice_id_in_introducing(self, emb: list):
-        """В режиме знакомства: проверяем голосовой отпечаток против галереи.
+        """In introduction mode: check the voice fingerprint against the gallery.
 
-        high       → сразу INTERACTING (голос узнан уверенно)
-        uncertain  → спрашиваем "Вы случайно не {name}?" → pending confirm
-        unknown    → игнорируем
+        high       → straight to INTERACTING (voice confidently recognized)
+        uncertain  → ask "Вы случайно не {name}?" ("Aren't you {name} by any chance?") → pending confirm
+        unknown    → ignore
         """
         result = self._call_memory({'op': 'lookup_by_voice', 'embedding': emb,
                                     'high_threshold': self._voice_high_threshold,
@@ -660,7 +663,7 @@ class IdentityManagerNode(LifecycleNode):
                 self._current_person_last_seen = now
 
             self.get_logger().info(
-                f'INTRODUCING: голос узнан — {name} (id={person_id}, sim={sim:.3f})')
+                f'INTRODUCING: voice recognized — {name} (id={person_id}, sim={sim:.3f})')
             self._set_introducing(False)
             self._should_greet = True
             self._greet_text   = f'Прости, {name}! Я тебя не узнал по лицу, но узнал по голосу.'
@@ -680,19 +683,19 @@ class IdentityManagerNode(LifecycleNode):
                 if self._state != State.INTRODUCING:
                     return
                 if self._pending_name_confirm is not None:
-                    return  # уже ждём ответа — не перебиваем
+                    return  # already waiting for an answer — don't interrupt
                 self._pending_name_confirm     = cand_name
                 self._pending_name_confirm_pid = person_id
             self.get_logger().info(
-                f'INTRODUCING: голос похож на {cand_name} (sim={sim:.3f}) — спрашиваю')
+                f'INTRODUCING: voice resembles {cand_name} (sim={sim:.3f}) — asking')
             self._introduce_pending = True
             self._introduce_text    = f'Вы случайно не {cand_name}?'
         else:
             self.get_logger().debug(
-                f'Голосовая идентификация (INTRODUCING): не узнан (sim={sim:.3f})')
+                f'Voice identification (INTRODUCING): not recognized (sim={sim:.3f})')
 
     def _add_voice_to_gallery(self, person_id: int, emb: list, ts: float = None):
-        """Добавляет embedding в голосовую галерею (memory_node применит правило 7 дней)."""
+        """Adds the embedding to the voice gallery (memory_node applies the 7-day rule)."""
         import time as _t
         result = self._call_memory({
             'op':        'add_voice_to_gallery',
@@ -701,18 +704,18 @@ class IdentityManagerNode(LifecycleNode):
             'timestamp': ts if ts is not None else _t.time(),
         })
         if result is None:
-            self.get_logger().warn(f'Голосовая галерея: _call_memory вернул None (таймаут/ошибка) для pid={person_id}')
+            self.get_logger().warn(f'Voice gallery: _call_memory returned None (timeout/error) for pid={person_id}')
         elif result.get('added'):
             self.get_logger().info(
-                f'Голосовая галерея сохранена в БД: pid={person_id}, '
+                f'Voice gallery saved to DB: pid={person_id}, '
                 f'count={result.get("count")}/10')
         else:
             self.get_logger().info(
-                f'Голосовая галерея НЕ сохранена: pid={person_id}, '
-                f'причина={result.get("reason", "?")} (age={result.get("oldest_age_days", "?")}д)')
+                f'Voice gallery NOT saved: pid={person_id}, '
+                f'reason={result.get("reason", "?")} (age={result.get("oldest_age_days", "?")}d)')
 
     def _publish_voice_anchor(self, person_id: int, name: str):
-        """Загружаем голосовую галерею из БД и отправляем в voice_detector."""
+        """Loads the voice gallery from the DB and sends it to voice_detector."""
         result = self._call_memory({'op': 'get_voice_gallery', 'person_id': person_id})
         if result and result.get('has_voice'):
             msg = String()
@@ -723,20 +726,20 @@ class IdentityManagerNode(LifecycleNode):
             }, ensure_ascii=False)
             self._voice_anchor_pub.publish(msg)
             n = len(result['gallery'])
-            self.get_logger().info(f'Голосовая галерея отправлена в SV: {name} ({n} записей)')
+            self.get_logger().info(f'Voice gallery sent to SV: {name} ({n} entries)')
         else:
-            self.get_logger().info(f'Нет голосового отпечатка для {name} — SV будет учиться с нуля')
+            self.get_logger().info(f'No voice fingerprint for {name} — SV will learn from scratch')
 
-    # ── Голосовой ответ в режиме знакомства ──────────────────────────────
+    # ── Voice response in introduction mode ───────────────────────────────
 
     def _voice_cmd_cb(self, msg: String):
-        """Перехватываем voice_command только в режиме INTRODUCING."""
+        """Intercept voice_command only in INTRODUCING mode."""
         with self._lock:
             if self._state != State.INTRODUCING:
                 return
         text = msg.data.strip()
 
-        # Если ждём подтверждения да/нет — обрабатываем отдельно
+        # If we are waiting for a yes/no confirmation — handle it separately
         with self._lock:
             pending_confirm = self._pending_name_confirm
         if pending_confirm is not None:
@@ -745,28 +748,28 @@ class IdentityManagerNode(LifecycleNode):
             return
 
         if not text:
-            # STT не распознал речь — переспрашиваем как при неудачной попытке
+            # STT did not recognize speech — re-ask like on a failed attempt
             with self._lock:
                 self._introduce_attempts += 1
                 attempts = self._introduce_attempts
             if attempts >= self._max_attempts:
-                self.get_logger().warn('STT: нет ответа — перехожу в INTERACTING')
+                self.get_logger().warn('STT: no response — moving to INTERACTING')
                 self._set_introducing(False)
                 with self._lock:
                     self._state = State.INTERACTING
                     self._introduce_attempts = 0
             else:
                 self.get_logger().info(
-                    f'STT: тишина (попытка {attempts}/{self._max_attempts}) — переспрашиваю')
+                    f'STT: silence (attempt {attempts}/{self._max_attempts}) — re-asking')
                 self._introduce_pending = True
                 self._introduce_text    = random.choice(self._RETRY_PHRASES)
             return
-        self.get_logger().info(f'INTRODUCING: получен голосовой ответ: "{text}"')
+        self.get_logger().info(f'INTRODUCING: voice response received: "{text}"')
         threading.Thread(
             target=self._handle_introduce_response, args=(text,), daemon=True).start()
 
     def _handle_introduce_response(self, text: str):
-        # Пока LLM думал, watchdog мог перевести в IDLE
+        # While the LLM was thinking, the watchdog might have switched to IDLE
         with self._lock:
             if self._state != State.INTRODUCING:
                 return
@@ -780,25 +783,25 @@ class IdentityManagerNode(LifecycleNode):
                 self._introduce_attempts += 1
                 attempts = self._introduce_attempts
             if attempts >= self._max_attempts:
-                self.get_logger().warn('Не удалось получить имя — перехожу в INTERACTING')
+                self.get_logger().warn('Could not get a name — moving to INTERACTING')
                 self._set_introducing(False)
                 with self._lock:
                     self._state = State.INTERACTING
                     self._introduce_attempts = 0
             else:
                 self.get_logger().info(
-                    f'Имя не найдено (попытка {attempts}/{self._max_attempts}) — переспрашиваю')
+                    f'Name not found (attempt {attempts}/{self._max_attempts}) — re-asking')
                 self._introduce_pending = True
                 self._introduce_text    = random.choice(self._RETRY_PHRASES)
             return
 
-        self.get_logger().info(f'Имя распознано: "{name}"')
+        self.get_logger().info(f'Name recognized: "{name}"')
 
-        # Режим "другой человек с тем же именем" — пропускаем проверку по БД
+        # "Different person with the same name" mode — skip the DB check
         if skip_db:
             with self._lock:
                 self._skip_db_check = False
-            # Спрашиваем подтверждение перед энролментом нового человека
+            # Ask for confirmation before enrolling a new person
             with self._lock:
                 self._pending_name_confirm     = name
                 self._pending_name_confirm_pid = None
@@ -806,33 +809,33 @@ class IdentityManagerNode(LifecycleNode):
             self._introduce_text    = f'Вас зовут {name}? Я правильно понял?'
             return
 
-        # Проверяем: есть ли такое имя в БД?
+        # Check: does this name exist in the DB?
         existing = self._call_memory({'op': 'lookup_by_name', 'name': name})
         with self._lock:
             if self._state != State.INTRODUCING:
                 return
 
         if existing and existing.get('person_id') is not None:
-            # Имя есть в БД → запускаем верификацию
+            # The name is in the DB → run verification
             person_id = existing['person_id']
             db_name   = existing['name']
             self.get_logger().info(
-                f'Имя "{name}" найдено в БД как "{db_name}" (id={person_id}) — верифицирую')
+                f'Name "{name}" found in DB as "{db_name}" (id={person_id}) — verifying')
             threading.Thread(
                 target=self._verify_claimed_identity,
                 args=(person_id, db_name), daemon=True).start()
         else:
-            # Новое имя → запрашиваем подтверждение перед энролментом
+            # New name → ask for confirmation before enrolling
             with self._lock:
                 self._pending_name_confirm     = name
                 self._pending_name_confirm_pid = None
             self._introduce_pending = True
             self._introduce_text    = f'Вас зовут {name}? Я правильно понял?'
 
-    # Быстрый regex-путь: находим первое слово с заглавной буквы (рус/лат)
+    # Fast regex path: find the first capitalized word (Cyrillic/Latin)
     _NAME_RE = re.compile(r'\b([А-ЯЁ][а-яё]{1,20}|[A-Z][a-z]{1,20})\b')
 
-    # Стоп-слова — не являются именами, даже если начинаются с заглавной
+    # Stopwords — not names even though they start with a capital letter
     _NAME_STOPWORDS = {
         'Меня', 'Зовут', 'Мне', 'Моё', 'Моя', 'Мой', 'Это',
         'Да', 'Нет', 'Привет', 'Здравствуй', 'Пожалуйста',
@@ -842,39 +845,39 @@ class IdentityManagerNode(LifecycleNode):
         'Когда', 'Потом', 'Сейчас', 'Здесь', 'Туда', 'Сюда',
     }
 
-    # Триггерные слова для шаблона — IGNORECASE только для них, не для захватываемого имени
-    # (?i:...) — inline флаг применяется только внутри группы
+    # Trigger words for the pattern — IGNORECASE only for them, not for the captured name
+    # (?i:...) — the inline flag applies only inside the group
     _TRIGGER_RE = re.compile(r'(?i:зовут|зови|называй|меня)\s+([А-ЯЁ][а-яё]{1,20})')
 
     def _extract_name(self, text: str) -> str | None:
-        """Извлекает имя из фразы.
+        """Extracts a name from a phrase.
 
-        Сначала пробует быстрый regex без обращения к сети.
-        Если фраза сложная (несколько слов, нет очевидного имени) — спрашивает LLM.
+        First tries a fast regex without hitting the network.
+        If the phrase is complex (several words, no obvious name) — asks the LLM.
         """
         cleaned = text.strip().strip('.,!?"\'').strip()
 
-        # Быстрый путь по шаблону — приоритет, проверяем ПЕРВЫМ
+        # Fast path via the pattern — priority, checked FIRST
         # "меня зовут Артур" / "зовут Артур" / "меня Артур"
-        # IGNORECASE только для триггерных слов, имя должно начинаться с заглавной
+        # IGNORECASE only for the trigger words, the name itself must start with a capital
         m = self._TRIGGER_RE.search(cleaned)
         if m:
             name = m.group(1)
             if name not in self._NAME_STOPWORDS:
-                self.get_logger().info(f'Имя из regex (шаблон): "{name}"')
+                self.get_logger().info(f'Name from regex (pattern): "{name}"')
                 return name
 
-        # Быстрый путь: вся фраза — одно-два слова (напр. "Артур" или "Я Артур")
+        # Fast path: the whole phrase is one or two words (e.g. "Артур" or "Я Артур")
         words = cleaned.split()
         if len(words) <= 2:
             names = [n for n in self._NAME_RE.findall(cleaned)
                      if n not in self._NAME_STOPWORDS]
             if names:
-                self.get_logger().info(f'Имя из regex (короткая фраза): "{names[0]}"')
+                self.get_logger().info(f'Name from regex (short phrase): "{names[0]}"')
                 return names[0]
 
-        # Резерв — LLM для сложных случаев (используем ту же модель что уже загружена).
-        # Короткий нестриминговый запрос — не нужна SSE-задержка ради 10 токенов.
+        # Fallback — LLM for complex cases (uses the same model that is already loaded).
+        # A short non-streaming request — no need for the SSE delay for 10 tokens.
         payload = {
             'model': self._name_model,
             'messages': [
@@ -907,17 +910,17 @@ class IdentityManagerNode(LifecycleNode):
             except requests.exceptions.ConnectionError:
                 continue
             except Exception as e:
-                self.get_logger().error(f'Ошибка извлечения имени: {e}')
+                self.get_logger().error(f'Name extraction error: {e}')
                 return None
         return None
 
-    # ── Верификация заявленной личности ──────────────────────────────────
+    # ── Verifying a claimed identity ────────────────────────────────────
 
     _YES_RE = re.compile(r'(?i:^да$|^верно$|^правильно$|^именно$|^точно$|^угу$|^ага$|\bда\b|\bверно\b|\bточно\b)')
     _NO_RE  = re.compile(r'(?i:^нет$|^неверно$|^неправильно$|\bнет\b|\bне\s+(?:так|верно|правильно)\b)')
 
     def _handle_name_confirmation(self, text: str):
-        """Обрабатывает да/нет ответ на вопрос подтверждения имени."""
+        """Handles a yes/no answer to the name-confirmation question."""
         with self._lock:
             if self._state != State.INTRODUCING:
                 self._pending_name_confirm     = None
@@ -933,7 +936,7 @@ class IdentityManagerNode(LifecycleNode):
         is_no  = bool(self._NO_RE.search(text.strip()))
 
         self.get_logger().info(
-            f'Подтверждение имени "{name}": text="{text}", yes={is_yes}, no={is_no}')
+            f'Name confirmation "{name}": text="{text}", yes={is_yes}, no={is_no}')
 
         if is_yes:
             with self._lock:
@@ -950,7 +953,7 @@ class IdentityManagerNode(LifecycleNode):
                 self._introduce_attempts      += 1
                 attempts = self._introduce_attempts
             if attempts >= self._max_attempts:
-                self.get_logger().warn('Подтверждение отклонено, лимит попыток — INTERACTING')
+                self.get_logger().warn('Confirmation rejected, attempt limit reached — INTERACTING')
                 self._set_introducing(False)
                 with self._lock:
                     self._state              = State.INTERACTING
@@ -959,16 +962,16 @@ class IdentityManagerNode(LifecycleNode):
                 self._introduce_pending = True
                 self._introduce_text    = 'Прошу прощения! Как вас зовут?'
         else:
-            # Неясный ответ — переспрашиваем
+            # Unclear answer — re-ask
             self._introduce_pending = True
             self._introduce_text    = f'Вас зовут {name}? Скажите "да" или "нет".'
 
     def _verify_claimed_identity(self, person_id: int, name: str):
-        """Тиер-верификация: лицо первично, голос — тайбрейкер.
+        """Tiered verification: face is primary, voice is the tiebreaker.
 
-        face_sim < FACE_VETO               → другой человек (голос не учитываем)
-        face_sim in [FACE_VETO, FACE_ACCEPT) → uncertain: нужен голос или вопрос
-        face_sim >= FACE_ACCEPT            → принимаем (голос не нужен)
+        face_sim < FACE_VETO               → a different person (voice is not considered)
+        face_sim in [FACE_VETO, FACE_ACCEPT) → uncertain: needs voice or a direct question
+        face_sim >= FACE_ACCEPT            → accept (voice not needed)
         """
         with self._lock:
             if self._state != State.INTRODUCING:
@@ -1000,18 +1003,18 @@ class IdentityManagerNode(LifecycleNode):
                 return
 
         if face_sim >= self._FACE_ACCEPT:
-            # Лицо убедительно — принимаем
+            # The face is convincing — accept
             self._accept_identity_claim(person_id, name)
 
         elif face_sim >= self._FACE_VETO:
-            # Неуверенная зона — нужен голос
+            # Uncertain zone — voice is needed
             if has_voice_gallery and voice_sim >= self._VOICE_ACCEPT:
                 self._accept_identity_claim(person_id, name)
             elif has_voice_gallery and voice_sim < self._VOICE_ACCEPT:
-                # Голос опровергает — другой человек с тем же именем
+                # Voice disproves it — a different person with the same name
                 self._start_same_name_flow(name)
             else:
-                # Нет голоса в БД — спрашиваем напрямую
+                # No voice in the DB — ask directly
                 with self._lock:
                     self._pending_name_confirm     = name
                     self._pending_name_confirm_pid = person_id
@@ -1021,11 +1024,11 @@ class IdentityManagerNode(LifecycleNode):
                     f'Вы точно {name}?'
                 )
         else:
-            # Лицо явно другое — голос не важен
+            # The face is clearly different — voice does not matter
             self._start_same_name_flow(name)
 
     def _accept_identity_claim(self, person_id: int, name: str):
-        """Переход в INTERACTING с извинением — личность подтверждена."""
+        """Transition to INTERACTING with an apology — identity confirmed."""
         with self._lock:
             if self._state != State.INTRODUCING:
                 return
@@ -1041,7 +1044,7 @@ class IdentityManagerNode(LifecycleNode):
             self._last_emotion             = 'neutral'
             self._current_person_last_seen = now
 
-        self.get_logger().info(f'Верификация успешна: {name} (id={person_id})')
+        self.get_logger().info(f'Verification succeeded: {name} (id={person_id})')
         self._set_introducing(False)
         self._should_greet = True
         self._greet_text   = f'Прости, {name}! Я тебя не узнал. Больше постараюсь запомнить!'
@@ -1053,16 +1056,16 @@ class IdentityManagerNode(LifecycleNode):
             target=self._publish_voice_anchor, args=(person_id, name), daemon=True).start()
 
     def _start_same_name_flow(self, existing_name: str):
-        """Запускаем поток знакомства с новым человеком, у которого то же имя."""
+        """Starts the introduction flow for a new person who has the same name."""
         with self._lock:
             if self._state != State.INTRODUCING:
                 return
             self._pending_name_confirm     = None
             self._pending_name_confirm_pid = None
-            self._skip_db_check            = True   # следующий ответ — прямо в энролмент
+            self._skip_db_check            = True   # the next answer goes straight to enrollment
 
         self.get_logger().info(
-            f'Другой человек с именем "{existing_name}" — запускаю новое знакомство')
+            f'A different person named "{existing_name}" — starting a new introduction')
         self._introduce_pending = True
         self._introduce_text    = (
             f'Интересно! У меня уже есть знакомый по имени {existing_name}, '
@@ -1072,21 +1075,21 @@ class IdentityManagerNode(LifecycleNode):
     # ─────────────────────────────────────────────────────────────────────
 
     def _enroll_new_person(self, name: str):
-        """Сохраняем нового человека в память и запускаем приветствие."""
+        """Saves the new person to memory and starts the greeting."""
         import numpy as np
         with self._lock:
             collected  = list(self._enroll_embeddings)
             fallback   = self._primary_embedding
 
         if not collected and not fallback:
-            self.get_logger().warn('Нет embedding для энролмента — перехожу в INTERACTING')
+            self.get_logger().warn('No embedding for enrollment — moving to INTERACTING')
             self._set_introducing(False)
             with self._lock:
                 self._state = State.INTERACTING
             return
 
         if collected:
-            # Усредняем все собранные embeddings и нормируем результат
+            # Average all collected embeddings and normalize the result
             mat = np.array(collected, dtype=np.float32)
             avg = mat.mean(axis=0)
             norm = np.linalg.norm(avg)
@@ -1094,11 +1097,11 @@ class IdentityManagerNode(LifecycleNode):
                 avg /= norm
             embedding = avg.tolist()
             self.get_logger().info(
-                f'Энролмент: усреднено {len(collected)} embeddings для "{name}"')
+                f'Enrollment: averaged {len(collected)} embeddings for "{name}"')
         else:
             embedding = fallback
             self.get_logger().warn(
-                f'Энролмент: только 1 embedding (сбор не завершён) для "{name}"')
+                f'Enrollment: only 1 embedding (collection incomplete) for "{name}"')
 
         result = self._call_memory({
             'op':        'save_person',
@@ -1108,7 +1111,7 @@ class IdentityManagerNode(LifecycleNode):
 
         if result and 'person_id' in result:
             person_id = result['person_id']
-            self.get_logger().info(f'Зарегистрирован: {name} (id={person_id})')
+            self.get_logger().info(f'Registered: {name} (id={person_id})')
 
             with self._lock:
                 self._state                    = State.INTERACTING
@@ -1123,7 +1126,7 @@ class IdentityManagerNode(LifecycleNode):
 
             self._set_introducing(False)
 
-            # Сохраняем голосовую галерею нового человека
+            # Save the new person's voice gallery
             if voice_gallery:
                 def _save_gallery(pid, entries):
                     for entry in entries:
@@ -1134,47 +1137,47 @@ class IdentityManagerNode(LifecycleNode):
                             'timestamp': entry['timestamp'],
                         })
                     self.get_logger().info(
-                        f'Голосовая галерея сохранена для {name} ({len(entries)} записей)')
+                        f'Voice gallery saved for {name} ({len(entries)} entries)')
                 threading.Thread(
                     target=_save_gallery, args=(person_id, voice_gallery), daemon=True).start()
 
-            # Публикуем контекст для LLM
+            # Publish the context for the LLM
             threading.Thread(
                 target=self._fetch_and_publish_context,
                 args=(person_id,), daemon=True).start()
 
-            # BT приветствует нового знакомого через social_context
+            # The BT greets the newly met person via social_context
             self._should_greet = True
             self._greet_text   = (
                 f'Очень приятно познакомиться, {name}! '
                 f'Расскажи немного о себе.'
             )
         else:
-            self.get_logger().error('Не удалось сохранить человека в память')
+            self.get_logger().error('Failed to save the person to memory')
             self._set_introducing(False)
             with self._lock:
                 self._state = State.INTERACTING
 
     def _set_introducing(self, active: bool):
-        """Публикует /introducing — гейт для llm_node."""
+        """Publishes /introducing — a gate for llm_node."""
         msg = Bool()
         msg.data = active
         self._introducing_pub.publish(msg)
 
-    # ── Логика состояний ──────────────────────────────────────────────────
+    # ── State logic ─────────────────────────────────────────────────────
 
     def _on_known(self, person_id: int, name: str):
-        """Переход в INTERACTING для известного человека.
+        """Transition to INTERACTING for a known person.
 
-        Вызывается из RECOGNIZING (face recognition) или IDLE (голосовая идентификация).
+        Called from RECOGNIZING (face recognition) or IDLE (voice identification).
         """
         now = time.time()
         with self._lock:
-            # Кулдаун по имени — не зависит от person_id (tracker может менять id)
+            # Cooldown by name — independent of person_id (the tracker may change the id)
             already_greeted = (now - self._greeted_names.get(name, 0)) < self._greet_cooldown
             goodbye_ts = self._post_goodbye_names.get(name, 0)
 
-        # Пост-прощальный кулдаун: человек сам попрощался — до wake word не приветствуем
+        # Post-farewell cooldown: the person said goodbye themselves — don't greet until the wake word
         if (now - goodbye_ts) < self._post_goodbye_ignore_sec:
             remaining_min = (self._post_goodbye_ignore_sec - (now - goodbye_ts)) / 60
 
@@ -1182,13 +1185,13 @@ class IdentityManagerNode(LifecycleNode):
                 self._state         = State.IDLE
                 self._primary_track = None
                 self._current_person = {}
-                # Продляем блокировку треков чтобы не зациклиться
+                # Extend the track block so it doesn't loop
                 self._post_goodbye_track_block_until = now + self._post_goodbye_track_block_sec
             self._pub_person_present(False)
             return
 
-        # Если диалог недавно вёлся только по голосу (без распознавания лица),
-        # face recognition нашёл человека — не приветствуем снова.
+        # If the dialogue has recently been carried only by voice (without face recognition),
+        # and face recognition has now found the person — don't greet again.
         with self._lock:
             dialogue_recently = (self._last_dialogue_ts > 0.0 and
                                  (now - self._last_dialogue_ts) < self._greet_cooldown)
@@ -1196,16 +1199,16 @@ class IdentityManagerNode(LifecycleNode):
         if not already_greeted and not dialogue_recently:
             self._greet_known(person_id, name, now)
         else:
-            # Тихий переход — уже приветствовали или был активный голосовой диалог
+            # Silent transition — already greeted, or there was an active voice dialogue
             with self._lock:
                 self._state                    = State.INTERACTING
                 self._current_person           = {'person_id': person_id, 'name': name}
-                self._greeted_names[name]      = now   # обновляем cooldown
+                self._greeted_names[name]      = now   # refresh the cooldown
                 self._last_emotion             = 'neutral'
                 self._current_person_last_seen = now
-            reason = 'cooldown активен' if already_greeted else 'диалог по голосу был активен'
+            reason = 'cooldown active' if already_greeted else 'a voice dialogue was active'
             self.get_logger().info(
-                f'{name} распознан (id={person_id}), {reason} — сразу INTERACTING без приветствия')
+                f'{name} recognized (id={person_id}), {reason} — straight to INTERACTING without a greeting')
             threading.Thread(
                 target=self._publish_voice_anchor,
                 args=(person_id, name), daemon=True).start()
@@ -1214,9 +1217,9 @@ class IdentityManagerNode(LifecycleNode):
                 args=(person_id,), daemon=True).start()
 
     def _on_uncertain(self, person_id: int | None, name: str):
-        """Лицо похоже на известного человека, но sim ниже уверенного порога.
-        Переходим в INTERACTING без приветствия и без знакомства.
-        Галерея накопит больше фото и следующий раз распознает увереннее.
+        """The face resembles a known person, but sim is below the confident threshold.
+        Transition to INTERACTING without a greeting and without an introduction.
+        The gallery will accumulate more photos and recognize more confidently next time.
         """
         now = time.time()
         with self._lock:
@@ -1225,8 +1228,8 @@ class IdentityManagerNode(LifecycleNode):
             self._last_emotion             = 'neutral'
             self._current_person_last_seen = now
         self.get_logger().info(
-            f'Неуверенное распознавание: вероятно {name} (id={person_id}) — '
-            f'тихий INTERACTING, знакомство не начинаем')
+            f'Unconfident recognition: probably {name} (id={person_id}) — '
+            f'silent INTERACTING, not starting an introduction')
         if person_id is not None:
             threading.Thread(
                 target=self._fetch_and_publish_context,
@@ -1240,7 +1243,7 @@ class IdentityManagerNode(LifecycleNode):
             self._last_emotion             = 'neutral'
             self._current_person_last_seen = now
 
-        self.get_logger().info(f'Приветствую: {name} (id={person_id})')
+        self.get_logger().info(f'Greeting: {name} (id={person_id})')
 
         threading.Thread(
             target=self._update_seen_and_embedding,
@@ -1250,7 +1253,7 @@ class IdentityManagerNode(LifecycleNode):
             target=self._publish_voice_anchor,
             args=(person_id, name), daemon=True).start()
 
-        # Напоминания запрашиваются асинхронно — should_greet выставляется после
+        # Reminders are requested asynchronously — should_greet is set afterward
         threading.Thread(
             target=self._fetch_reminders_and_greet,
             args=(person_id, name), daemon=True).start()
@@ -1259,7 +1262,7 @@ class IdentityManagerNode(LifecycleNode):
             target=self._fetch_and_publish_context,
             args=(person_id,), daemon=True).start()
 
-    # Фразы для начала знакомства — случайный выбор для естественности
+    # Phrases to start an introduction — chosen at random for naturalness
     _INTRO_PHRASES = [
         'Привет! Я тебя раньше не видел. Как тебя зовут?',
         'Здравствуй! Мы ещё не знакомы. Как тебя зовут?',
@@ -1271,7 +1274,7 @@ class IdentityManagerNode(LifecycleNode):
         'О, привет! Ты новый человек для меня. Как вас зовут?',
     ]
 
-    # Фразы для переспроса — случайный выбор
+    # Phrases to re-ask — chosen at random
     _RETRY_PHRASES = [
         'Простите, я не расслышал. Как вас зовут?',
         'Извините, не разобрал. Повторите ваше имя, пожалуйста.',
@@ -1283,29 +1286,29 @@ class IdentityManagerNode(LifecycleNode):
         now = time.time()
         with self._lock:
             if self._state == State.INTRODUCING:
-                return   # уже спрашиваем
+                return   # already asking
             if (now - self._introduce_last) < self._introduce_cooldown:
                 self._state = State.INTERACTING
                 return
-            # OakD гейт: если OAK-D активен и не видит тела >10с — лицо false positive,
-            # не начинаем знакомство (watchdog переведёт в IDLE сам)
+            # OakD gate: if OAK-D is active and hasn't seen a body for >10s — the face is a
+            # false positive, don't start an introduction (the watchdog will move to IDLE on its own)
             if self._last_human_time > 0.0 and (now - self._last_human_time) > 10.0:
                 self.get_logger().warn(
-                    f'Неизвестное лицо, но OakD не видит тела '
-                    f'{now - self._last_human_time:.0f}с — '
-                    f'пропускаю знакомство (вероятно false positive face_detection)')
+                    f'Unknown face, but OakD has not seen a body for '
+                    f'{now - self._last_human_time:.0f}s — '
+                    f'skipping the introduction (probably a face_detection false positive)')
                 return
             self._state = State.INTRODUCING
             self._introduce_last     = now
             self._introduce_attempts = 0
-            self._enroll_embeddings  = []   # начинаем накапливать с нуля
+            self._enroll_embeddings  = []   # start accumulating from scratch
             self._enrolled_track_id  = None
             emotion = self._last_emotion or 'surprised'
 
         phrase = random.choice(self._INTRO_PHRASES)
-        self.get_logger().info('Неизвестный человек — инициирую знакомство')
+        self.get_logger().info('Unknown person — starting an introduction')
         self._set_introducing(True)
-        # Не публикуем прямую команду — BT прочитает introduce_pending из social_context
+        # Don't publish a direct command — the BT will read introduce_pending from social_context
         self._introduce_pending = True
         self._introduce_text    = phrase
 
@@ -1320,14 +1323,14 @@ class IdentityManagerNode(LifecycleNode):
             'neutral':   'neutral',
         }
         robot_emotion = mirror_map.get(emotion, 'neutral')
-        # Мимика-зеркало: рефлекс, публикуется напрямую без BT (низкоуровневый рефлекс)
+        # Facial mirroring: a reflex, published directly without the BT (low-level reflex)
         msg = String()
         msg.data = robot_emotion
         self._face_expr_pub.publish(msg)
-        self.get_logger().info(f'Эмоция человека: {emotion} → мимика: {robot_emotion}')
+        self.get_logger().info(f'Person emotion: {emotion} → facial expression: {robot_emotion}')
 
     def _human_detected_cb(self, msg: Bool):
-        """Вторичный сигнал присутствия от OAK-D body detection."""
+        """Secondary presence signal from OAK-D body detection."""
         if self._sleeping:
             return
         if msg.data:
@@ -1335,21 +1338,21 @@ class IdentityManagerNode(LifecycleNode):
                 self._last_human_time = time.time()
             if self._waiting_for_body:
                 self._waiting_for_body = False
-                self.get_logger().info('OakD: тело обнаружено → снимаю блокировку face_detection')
+                self.get_logger().info('OakD: body detected → lifting the face_detection block')
 
     def _go_idle_cb(self, msg: Bool):
-        """Принудительный переход в IDLE от BT (say_goodbye tool call LLM)."""
+        """Forced transition to IDLE from the BT (say_goodbye LLM tool call)."""
         if not msg.data or self._sleeping:
             return
         with self._lock:
             if self._state == State.IDLE:
                 return
-            # Сохраняем имя и режим до очистки состояния
+            # Save the name and mode before clearing the state
             goodbye_name    = self._current_person.get('name', '')
             prev_state      = self._state
             now             = time.time()
 
-            self.get_logger().info('go_idle: принудительный переход в IDLE')
+            self.get_logger().info('go_idle: forced transition to IDLE')
             self._state                    = State.IDLE
             self._primary_track            = None
             self._primary_embedding        = None
@@ -1376,20 +1379,20 @@ class IdentityManagerNode(LifecycleNode):
             self._looking_at_robot         = True
             was_introducing                = (prev_state == State.INTRODUCING)
 
-            # Пост-прощальный кулдаун: человек сам попрощался — игнорируем его
-            # N минут (или до wake word), даже если face_detection его видит.
+            # Post-farewell cooldown: the person said goodbye themselves — ignore them
+            # for N minutes (or until the wake word), even if face_detection sees them.
             if goodbye_name:
                 self._post_goodbye_names[goodbye_name] = now
                 self.get_logger().info(
-                    f'Пост-прощальный кулдаун: {goodbye_name} — '
-                    f'{self._post_goodbye_ignore_sec / 60:.0f} мин (или до wake word)')
-            # Блокировка треков на N секунд — предотвращает петлю re-greeting
+                    f'Post-farewell cooldown: {goodbye_name} — '
+                    f'{self._post_goodbye_ignore_sec / 60:.0f} min (or until the wake word)')
+            # Block tracks for N seconds — prevents a re-greeting loop
             self._post_goodbye_track_block_until = now + self._post_goodbye_track_block_sec
 
         self._pub_context({})
         self._pub_person_present(False)
-        # Публикуем /introducing False только если реально были в режиме знакомства —
-        # иначе voice_detector и llm_node шумят "INTRODUCING завершён" при обычном прощании.
+        # Only publish /introducing False if we were actually in introduction mode —
+        # otherwise voice_detector and llm_node get noisy "INTRODUCING finished" on an ordinary farewell.
         if was_introducing:
             self._set_introducing(False)
 
@@ -1404,30 +1407,30 @@ class IdentityManagerNode(LifecycleNode):
             go_idle     = False
             idle_reason = ''
 
-            # OakD вето: если OAK-D активен (получали хоть один сигнал) и не видит тела
-            # дольше no_human_timeout — считаем face_detection false positive и уходим в IDLE.
-            # Это критично: левая камера может детектировать постер/отражение бесконечно,
-            # тогда как реального человека давно нет.
+            # OakD veto: if OAK-D is active (we've received at least one signal) and hasn't
+            # seen a body for longer than no_human_timeout — treat face_detection as a false
+            # positive and go to IDLE. This is critical: the left camera can detect a
+            # poster/reflection indefinitely, while the real person has been gone for a while.
             if self._last_human_time > 0.0:
                 body_absent_sec = now - self._last_human_time
                 if body_absent_sec > self._no_human_timeout:
                     go_idle     = True
                     idle_reason = (
-                        f'OakD вето: тело не видно {body_absent_sec:.0f}с '
-                        f'(face_detection вероятно false positive)')
+                        f'OakD veto: body not seen for {body_absent_sec:.0f}s '
+                        f'(face_detection likely a false positive)')
                     self._waiting_for_body = True
 
             if not go_idle:
-                # INTRODUCING нужно больше времени: TTS + VAD-задержка + речь + STT
+                # INTRODUCING needs more time: TTS + VAD delay + speech + STT
                 face_timeout = (self._no_face_timeout * 4
                                 if self._state == State.INTRODUCING
                                 else self._no_face_timeout)
 
                 face_lost = (now - self._last_face_time) > face_timeout
                 if not face_lost:
-                    return  # лицо видно — всё хорошо
+                    return  # the face is visible — all good
 
-                # Диалог активен: LLM недавно ответил → даём 60с для ответа пользователя
+                # Dialogue active: the LLM answered recently → give 60s for the user's reply
                 dialogue_active = (self._last_dialogue_ts > 0.0 and
                                    (now - self._last_dialogue_ts) < 60.0)
                 if dialogue_active:
@@ -1436,15 +1439,15 @@ class IdentityManagerNode(LifecycleNode):
                     self._face_hunt_since = 0.0
                     return
 
-                # Голосовая идентификация из IDLE: нет лица/тела — норма, человек
-                # рядом но за кадром. Даём 60с до первого LLM-ответа (после которого
-                # _last_dialogue_ts обновится и подхватит эстафету).
+                # Voice identification from IDLE: no face/body — normal, the person is
+                # nearby but out of frame. Give 60s until the first LLM reply (after which
+                # _last_dialogue_ts updates and takes over).
                 if (self._voice_id_grace_ts > 0.0 and
                         (now - self._voice_id_grace_ts) < 60.0):
                     self._face_hunt_since = 0.0
                     return
 
-                # Лицо потеряно — проверяем body detection как запасной сигнал
+                # Face lost — check body detection as a fallback signal
                 human_detected = (now - self._last_human_time) < self._no_human_timeout
                 if human_detected:
                     face_lost_sec = now - self._last_face_time
@@ -1453,13 +1456,13 @@ class IdentityManagerNode(LifecycleNode):
                     hunt_sec = now - self._face_hunt_since
                     if hunt_sec >= self._max_face_hunt:
                         idle_reason = (
-                            f'Лицо не найдено {hunt_sec:.0f}с при живом теле — '
-                            f'сброс в IDLE, BT перезапустит поиск')
+                            f'Face not found for {hunt_sec:.0f}s while the body is present — '
+                            f'resetting to IDLE, the BT will restart the search')
                         go_idle = True
                     else:
                         return
                 else:
-                    idle_reason = 'Человек ушёл (нет лица и тела)'
+                    idle_reason = 'Person left (no face and no body)'
                     go_idle = True
 
             if go_idle:
@@ -1492,7 +1495,7 @@ class IdentityManagerNode(LifecycleNode):
 
 
     def _update_seen_and_embedding(self, person_id: int):
-        """update_seen + EMA обновление embedding при каждой встрече."""
+        """update_seen + an EMA update of the embedding on every encounter."""
         import numpy as np
         self._call_memory({'op': 'update_seen', 'person_id': person_id})
 
@@ -1504,7 +1507,7 @@ class IdentityManagerNode(LifecycleNode):
         if not embeddings:
             return
 
-        # Усредняем доступные embeddings и обновляем через EMA
+        # Average the available embeddings and update via EMA
         mat = np.array(embeddings, dtype=np.float32)
         avg = mat.mean(axis=0)
         norm = np.linalg.norm(avg)
@@ -1514,18 +1517,18 @@ class IdentityManagerNode(LifecycleNode):
             'op':        'update_embedding',
             'person_id': person_id,
             'embedding': avg.tolist(),
-            'alpha':     0.2,   # мягкое обновление: 20% новый, 80% старый
+            'alpha':     0.2,   # soft update: 20% new, 80% old
         })
 
-    # ── Вспомогательные ───────────────────────────────────────────────────
+    # ── Helpers ────────────────────────────────────────────────────────
 
     def _publish_social_context(self):
         
-        """Публикует социальный контекст @ 2 Гц → BehaviorManager Blackboard.
+        """Publishes the social context @ 2 Hz → the BehaviorManager Blackboard.
 
-        Полностью останавливается в спящем режиме.
-        should_greet и introduce_pending — одноразовые сигналы: True публикуется
-        один раз, затем автоматически сбрасывается.
+        Fully stops in sleep mode.
+        should_greet and introduce_pending are one-shot signals: True is published
+        once, then automatically reset.
 
         """
         if self._sleeping:
@@ -1548,16 +1551,16 @@ class IdentityManagerNode(LifecycleNode):
             'emotion':           emotion,
             'state':             state,
             'introducing':       intro,
-            # True если собеседник смотрит в глаза роботу (yaw-proxy < 30% от inter-eye dist,
-            # >50% кадров за последнюю ~1.5с). None если трек без kps / нет данных.
+            # True if the interlocutor is looking the robot in the eye (yaw-proxy < 30% of
+            # inter-eye dist, >50% of frames over the last ~1.5s). None if the track has no kps / no data.
             'looking_at_robot':  looking if has_face else None,
-            # Одноразовые флаги (сбрасываются после первой публикации)
+            # One-shot flags (reset after the first publish)
             'should_greet':      self._should_greet,
             'greet_text':        self._greet_text if self._should_greet else '',
             'introduce_pending': self._introduce_pending,
             'introduce_text':    self._introduce_text if self._introduce_pending else '',
         }
-        # Сброс одноразовых флагов
+        # Reset the one-shot flags
         self._should_greet      = False
         self._introduce_pending = False
 
@@ -1565,10 +1568,10 @@ class IdentityManagerNode(LifecycleNode):
         msg.data = json.dumps(ctx, ensure_ascii=False)
         self._social_ctx_pub.publish(msg)
 
-        # Обновляем /person_present Bool @ 2Hz — voice_detector использует timestamp
-        # этого топика для определения присутствия человека во время диалога.
-        # Без этого grace period (120с) истекает и pipeline уходит в wake word режим
-        # даже когда человек активно взаимодействует (state=INTERACTING).
+        # Update /person_present Bool @ 2Hz — voice_detector uses this topic's
+        # timestamp to determine whether a person is present during a dialogue.
+        # Without this the grace period (120s) expires and the pipeline drops into wake-word
+        # mode even while the person is actively interacting (state=INTERACTING).
         if person_present:
             self._pub_person_present(True)
 
@@ -1583,13 +1586,13 @@ class IdentityManagerNode(LifecycleNode):
         self._person_present_pub.publish(msg)
 
     def _fetch_reminders_and_greet(self, person_id: int, name: str):
-        """Запрашивает ручные напоминания и выставляет should_greet с текстом.
+        """Requests manual reminders and sets should_greet with the text.
 
-        Env-напоминания (source='env:...') в БД больше не хранятся —
-        они уходят напрямую в Telegram через openhab_bridge_node.
-        Здесь обрабатываем только manual-напоминания (delivered=0):
-          - показываем в приветствии
-          - помечаем delivered=1 и сразу удаляем (confirm_reminders)
+        Env reminders (source='env:...') are no longer stored in the DB —
+        they go straight to Telegram via openhab_bridge_node.
+        Here we handle only manual reminders (delivered=0):
+          - show them in the greeting
+          - mark delivered=1 and delete right away (confirm_reminders)
         """
         import datetime as _dt
 
@@ -1618,7 +1621,7 @@ class IdentityManagerNode(LifecycleNode):
                 self._should_greet = True
                 self._greet_text   = greet_text
 
-        # Помечаем delivered=1 и удаляем: сказано лично → можно удалять
+        # Mark delivered=1 and delete: said in person → safe to delete
         for rid in manual_ids:
             try:
                 self._call_memory({'op': 'mark_reminder_delivered', 'reminder_id': rid})
@@ -1630,7 +1633,7 @@ class IdentityManagerNode(LifecycleNode):
             except Exception:
                 pass
             self.get_logger().info(
-                f'Напоминания для {name}: показано и удалено {len(manual_ids)} ручных')
+                f'Reminders for {name}: shown and deleted {len(manual_ids)} manual ones')
 
     def _fetch_and_publish_context(self, person_id: int):
         result = self._call_memory({'op': 'get_context', 'person_id': person_id})
@@ -1645,7 +1648,7 @@ class IdentityManagerNode(LifecycleNode):
             )
         else:
             self.get_logger().warn(
-                f'Не удалось получить контекст для person_id={person_id}')
+                f'Failed to get context for person_id={person_id}')
 
     def _call_memory(self, req: dict) -> dict | None:
         if not self._mem.wait_for_service(timeout_sec=2.0):
@@ -1666,7 +1669,7 @@ class IdentityManagerNode(LifecycleNode):
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores a repeated declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -1741,7 +1744,7 @@ class IdentityManagerNode(LifecycleNode):
         self._robot_sleep_pub    = self.create_lifecycle_publisher(Bool,   '/robot_sleep',     latched_qos)
 
         self._mem = self.create_client(MemoryQuery, '/memory/query')
-        self.get_logger().info('IdentityManager настроен')
+        self.get_logger().info('IdentityManager configured')
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
@@ -1754,7 +1757,7 @@ class IdentityManagerNode(LifecycleNode):
         self._robot_sleep_pub.on_activate(state)
         self._watchdog_timer = self.create_timer(0.5, self._watchdog)
         self._ctx_timer      = self.create_timer(0.5, self._publish_social_context)
-        self.get_logger().info('IdentityManager готов')
+        self.get_logger().info('IdentityManager ready')
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):

@@ -4,8 +4,8 @@
   <name>inmoov_bringup</name>
   <version>0.1.0</version>
   <description>Top-level bringup for InMoov robot — lifecycle manager, system launch, systemd helpers</description>
-  <maintainer email="fedjukevitsh@gmail.com">artur</maintainer>
-  <license>Apache-2.0</license>
+  <maintainer email="fedjukevitsh@gmail.com">Artur Fedjukevits</maintainer>
+  <license>GPL-3.0-only</license>
 
   <depend>rclpy</depend>
   <depend>lifecycle_msgs</depend>

@@ -1,12 +1,16 @@
 """
-SemanticMemory — слой долговременной семантической памяти
-==========================================================
-Хранит факты двумя способами:
-  - SQLite (facts): структурированные записи для точного поиска
-  - ChromaDB:       векторный индекс для семантического поиска
+SemanticMemory — long-term semantic memory layer
+==================================================
+Stores facts in two ways:
+  - SQLite (facts): structured records for exact lookup
+  - ChromaDB:       vector index for semantic search
 
-При поиске объединяет результаты из обоих источников.
-Доступ только через tool call (не попадает в системный промпт автоматически).
+Search combines results from both sources.
+Accessible only via tool call (not injected into the system prompt automatically).
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class SemanticMemory:
-    """Долговременная семантическая память: факты, предпочтения, события."""
+    """Long-term semantic memory: facts, preferences, events."""
 
     CREATE_SQL = """
     CREATE TABLE IF NOT EXISTS facts (
@@ -58,7 +62,7 @@ class SemanticMemory:
         return conn
 
     def _init_chroma(self) -> None:
-        """Инициализация ChromaDB. Если не установлен — работаем только на SQLite."""
+        """Initializes ChromaDB. If it isn't installed — falls back to SQLite only."""
         try:
             import chromadb
             client = chromadb.PersistentClient(path=self.chroma_path)
@@ -66,16 +70,16 @@ class SemanticMemory:
                 name="robot_memory",
                 metadata={"hnsw:space": "cosine"},
             )
-            logger.info("ChromaDB инициализирован: %s", self.chroma_path)
+            logger.info("ChromaDB initialized: %s", self.chroma_path)
         except ImportError:
-            logger.warning("chromadb не установлен — семантический поиск отключён (только SQLite)")
+            logger.warning("chromadb not installed — semantic search disabled (SQLite only)")
             self._chroma = None
         except Exception as exc:
-            logger.warning("ChromaDB недоступен: %s", exc)
+            logger.warning("ChromaDB unavailable: %s", exc)
             self._chroma = None
 
     # ------------------------------------------------------------------
-    # Запись фактов
+    # Writing facts
     # ------------------------------------------------------------------
 
     def save_fact(
@@ -87,24 +91,24 @@ class SemanticMemory:
         confidence: float = 1.0,
         source: str = "conversation",
     ) -> int:
-        """Сохраняет или обновляет факт. Возвращает ID записи."""
+        """Saves or updates a fact. Returns the record ID."""
         subject   = str(subject   or "").strip()
         predicate = str(predicate or "").strip()
         value     = str(value     or "").strip()
         category  = str(category  or "preference").strip()
         if not subject or not predicate or not value:
-            logger.warning("save_fact: пустое поле — пропускаю (subj=%r pred=%r val=%r)",
+            logger.warning("save_fact: empty field — skipping (subj=%r pred=%r val=%r)",
                            subject, predicate, value)
             return -1
         now = datetime.now().isoformat(timespec="seconds")
         with self._conn() as conn:
-            # Проверяем, существует ли запись (subject, predicate)
+            # Check whether a record already exists for (subject, predicate)
             existing = conn.execute(
                 "SELECT id FROM facts WHERE subject=? AND predicate=?",
                 (subject, predicate),
             ).fetchone()
             if existing:
-                # Обновляем только value, confidence, source, updated_at — created_at не трогаем
+                # Update only value, confidence, source, updated_at — leave created_at untouched
                 conn.execute(
                     """UPDATE facts SET value=?, confidence=?, source=?, category=?, updated_at=?
                        WHERE subject=? AND predicate=?""",
@@ -120,10 +124,10 @@ class SemanticMemory:
                 )
                 fact_id = cur.lastrowid
 
-        # Синхронизируем с ChromaDB
+        # Sync with ChromaDB
         if self._chroma is not None:
             doc_text = f"{subject} — {predicate}: {value}"
-            # ID стабильный (не зависит от fact_id, который меняется при UPDATE)
+            # Stable ID (independent of fact_id, which changes on UPDATE)
             import hashlib
             chroma_id = hashlib.md5(f"{subject}::{predicate}".encode()).hexdigest()
             try:
@@ -141,11 +145,11 @@ class SemanticMemory:
             except Exception as exc:
                 logger.warning("ChromaDB upsert error: %s", exc)
 
-        logger.debug("Факт сохранён: %s — %s: %s", subject, predicate, value)
+        logger.debug("Fact saved: %s — %s: %s", subject, predicate, value)
         return fact_id
 
     # ------------------------------------------------------------------
-    # Поиск
+    # Search
     # ------------------------------------------------------------------
 
     def search(
@@ -155,10 +159,10 @@ class SemanticMemory:
         limit: int = 5,
     ) -> list[dict]:
         """
-        Семантический поиск:
-          1. ChromaDB (если доступен) — векторное сходство
-          2. SQLite fallback — LIKE по subject/predicate/value
-        Результаты дедуплицируются и ограничиваются limit.
+        Semantic search:
+          1. ChromaDB (if available) — vector similarity
+          2. SQLite fallback — LIKE over subject/predicate/value
+        Results are deduplicated and capped at limit.
         """
         results: list[dict] = []
 
@@ -184,9 +188,9 @@ class SemanticMemory:
                         "source": "vector",
                     })
             except Exception as exc:
-                logger.warning("ChromaDB поиск: %s", exc)
+                logger.warning("ChromaDB search: %s", exc)
 
-        # --- SQLite fallback / дополнение ---
+        # --- SQLite fallback / supplement ---
         if len(results) < limit:
             like = f"%{query}%"
             with self._conn() as conn:
@@ -226,7 +230,7 @@ class SemanticMemory:
         return results[:limit]
 
     def get_by_subject(self, subject: str) -> list[dict]:
-        """Все факты о конкретном субъекте."""
+        """All facts about a specific subject."""
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM facts WHERE subject = ? ORDER BY category, predicate",
@@ -239,7 +243,7 @@ class SemanticMemory:
             return conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
 
     # ------------------------------------------------------------------
-    # Удаление
+    # Deletion
     # ------------------------------------------------------------------
 
     def delete_fact(self, subject: str, predicate: str) -> bool:

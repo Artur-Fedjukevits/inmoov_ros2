@@ -2,12 +2,12 @@
 """
 face_tracker_node.py
 ====================
-IOU-трекер: назначает постоянные track_id лицам между кадрами детекции.
-Параметр camera_side ('left' | 'right') определяет:
-  - откуда читать:   /face/detections/{side}
-  - куда публиковать: /face/tracks/{side}
+IOU tracker: assigns persistent track_ids to faces across detection frames.
+The camera_side parameter ('left' | 'right') determines:
+  - where to read from: /face/detections/{side}
+  - where to publish:   /face/tracks/{side}
 
-Формат /face/tracks/{side}:
+Format of /face/tracks/{side}:
   {
     "stamp": 1234567890.0,
     "tracks": [
@@ -21,6 +21,10 @@ IOU-трекер: назначает постоянные track_id лицам м
       }
     ]
   }
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -52,7 +56,7 @@ class FaceTrackerNode(LifecycleNode):
         self._next_id = 1
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores re-declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -99,10 +103,10 @@ class FaceTrackerNode(LifecycleNode):
 
     def _enable_cb(self, msg: Bool):
         if not msg.data:
-            # При выключении vision сбрасываем все треки — при следующем включении начинаем чисто
+            # When vision is disabled, drop all tracks — start clean on the next enable
             if self._tracks:
                 self.get_logger().info(
-                    f'Vision выключен — сброс {len(self._tracks)} треков')
+                    f'Vision disabled — dropping {len(self._tracks)} tracks')
             self._tracks  = {}
             self._next_id = 1
 
@@ -110,13 +114,13 @@ class FaceTrackerNode(LifecycleNode):
         try:
             data = json.loads(msg.data)
         except Exception as e:
-            self.get_logger().error(f'JSON ошибка: {e}')
+            self.get_logger().error(f'JSON error: {e}')
             return
 
         detections = data.get('faces', [])
         stamp      = data.get('stamp', 0.0)
 
-        # ── Шаг 1: строим матрицу IOU (tracks × detections) ───────────────
+        # ── Step 1: match existing tracks to detections by IOU (tracks × detections) ──
         track_ids  = list(self._tracks.keys())
         matched_t  = set()
         matched_d  = set()
@@ -144,7 +148,7 @@ class FaceTrackerNode(LifecycleNode):
                 matched_t.add(tid)
                 matched_d.add(best_di)
 
-        # ── Шаг 2: новые детекции → новые треки ──────────────────────────
+        # ── Step 2: unmatched detections → new tracks ─────────────────────
         for di, det in enumerate(detections):
             if di in matched_d:
                 continue
@@ -160,7 +164,7 @@ class FaceTrackerNode(LifecycleNode):
             }
             self._next_id += 1
 
-        # ── Шаг 3: нематченые треки → потеряны ───────────────────────────
+        # ── Step 3: unmatched tracks → marked as lost ─────────────────────
         to_delete = []
         for tid in track_ids:
             if tid not in matched_t:
@@ -170,9 +174,9 @@ class FaceTrackerNode(LifecycleNode):
         for tid in to_delete:
             del self._tracks[tid]
 
-        # ── Публикуем только активные треки (lost==0) ─────────────────────
-        # Потерянные треки хранятся внутри для IOU re-matching, но НЕ
-        # публикуются — иначе head_tracker следует за устаревшим bbox.
+        # ── Publish only active tracks (lost==0) ──────────────────────────
+        # Lost tracks are kept internally for IOU re-matching but are NOT
+        # published — otherwise head_tracker would follow a stale bbox.
         tracks_out = []
         for tid, t in self._tracks.items():
             if t['lost'] > 0:

@@ -16,8 +16,8 @@ setup(
     zip_safe=True,
     maintainer='artur',
     maintainer_email='fedjukevitsh@gmail.com',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Vision pipeline for the InMoov robot: dual-eye face detection/tracking/recognition, emotion, OAK-D',
+    license='GPL-3.0-only',
     extras_require={
         'test': [
             'pytest',

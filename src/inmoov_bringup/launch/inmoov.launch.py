@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-inmoov.launch.py — главный launch-файл InMoov Robot (inmoov_bringup).
+inmoov.launch.py — main launch file for the InMoov Robot (inmoov_bringup).
 
-Порядок: lifecycle_manager стартует первым и поднимает все ноды
-по тирам (0→6) — без TimerAction, по реальной готовности.
+Order: lifecycle_manager starts first and brings up all nodes
+tier by tier (0→6) — no TimerAction, driven by actual readiness.
 
-Использование:
+Usage:
   ros2 launch inmoov_bringup inmoov.launch.py
   ros2 launch inmoov_bringup inmoov.launch.py tavily_api_key:=tvly-...
   ros2 launch inmoov_bringup inmoov.launch.py vision:=false
   ros2 launch inmoov_bringup inmoov.launch.py telegram:=true
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import os
@@ -21,7 +25,7 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import LifecycleNode, Node
 from launch_ros.substitutions import FindPackageShare
 
-# PulseAudio/PipeWire — нужен только аудио-нодам
+# PulseAudio/PipeWire — needed only by audio nodes
 _uid = os.getuid()
 _AUDIO_ENV = {
     'PULSE_SERVER': f'unix:/run/user/{_uid}/pulse/native',
@@ -32,12 +36,12 @@ _AUDIO_ENV = {
 
 def generate_launch_description():
 
-    # ── Аргументы ────────────────────────────────────────────────────────────
+    # ── Arguments ────────────────────────────────────────────────────────────
     args = [
-        # Серверы
-        # llm_url — OpenAI-совместимый chat.completions endpoint (сейчас vLLM), общий
-        # для llm_node и identity_manager_node (name extraction). llm_fallback_url —
-        # резервный (сейчас локальный NUC — станет OpenAI-совместимым позже).
+        # Servers
+        # llm_url — OpenAI-compatible chat.completions endpoint (currently vLLM), shared
+        # by llm_node and identity_manager_node (name extraction). llm_fallback_url —
+        # the backup (currently the local NUC — will become OpenAI-compatible later).
         DeclareLaunchArgument('llm_url',
             default_value='http://192.168.10.118:18020/v1/chat/completions'),
         DeclareLaunchArgument('llm_fallback_url',
@@ -62,12 +66,12 @@ def generate_launch_description():
             default_value='/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'),
         DeclareLaunchArgument('wakeword_threshold', default_value='0.3'),
 
-        # Аудио
+        # Audio
         DeclareLaunchArgument('audio_device_index', default_value='-1'),
         DeclareLaunchArgument('audio_device_name',  default_value='pulse'),
         DeclareLaunchArgument('output_device_name', default_value=''),
         DeclareLaunchArgument('sample_rate',        default_value='16000'),
-        DeclareLaunchArgument('pa_source_check',    default_value='Jabra'),  # '' = не проверять
+        DeclareLaunchArgument('pa_source_check',    default_value='Jabra'),  # '' = don't check
 
         # VAD / SV
         DeclareLaunchArgument('vad_threshold',          default_value='0.5'),
@@ -120,9 +124,9 @@ def generate_launch_description():
             default_value=os.environ.get('TELEGRAM_ALLOWED_CHAT_ID', '0')),
     ]
 
-    # ── Lifecycle Manager (обычный Node — управляет другими) ─────────────────
-    # lifecycle.yaml содержит сложные структуры (tiers) — нельзя передавать как
-    # --params-file (ROS2 парсер не поддерживает nested lists). Читаем Python-ом.
+    # ── Lifecycle Manager (a plain Node — manages the others) ────────────────
+    # lifecycle.yaml contains complex structures (tiers) — can't pass it as
+    # --params-file (the ROS2 parser doesn't support nested lists). Read it in Python instead.
     lifecycle_config_path = PathJoinSubstitution([
         FindPackageShare('inmoov_bringup'), 'config', 'lifecycle.yaml'
     ])
@@ -141,7 +145,7 @@ def generate_launch_description():
         }],
     )
 
-    # ── Тир 0: memory_node ───────────────────────────────────────────────────
+    # ── Tier 0: memory_node ──────────────────────────────────────────────────
     memory_node = LifecycleNode(
         package='inmoov_memory',
         executable='memory_node',
@@ -159,7 +163,7 @@ def generate_launch_description():
         }],
     )
 
-    # ── Тир 1: Hardware ──────────────────────────────────────────────────────
+    # ── Tier 1: Hardware ─────────────────────────────────────────────────────
     audio_source = LifecycleNode(
         package='inmoov_voice',
         executable='audio_source_node',
@@ -242,7 +246,7 @@ def generate_launch_description():
         respawn_delay=2.0,
     )
 
-    # ── Тир 2: HW Consumers ──────────────────────────────────────────────────
+    # ── Tier 2: HW Consumers ─────────────────────────────────────────────────
     wakeword = LifecycleNode(
         package='inmoov_voice',
         executable='wakeword_node',
@@ -351,15 +355,15 @@ def generate_launch_description():
             'det_size':     640,
             'det_thresh':   LaunchConfiguration('det_thresh'),
             'model_name':   'buffalo_l',
-            # Настоящий fallback: insightface на правом включается только
-            # когда левый (primary) реально не публикует >1.5с, а не гоняется
-            # постоянно параллельно с левым — экономия CPU.
+            # A real fallback: insightface on the right eye only turns on
+            # when the left (primary) actually stops publishing for >1.5s, rather than
+            # running constantly in parallel with the left — saves CPU.
             'fallback_for':        '/face/detections/left',
             'primary_timeout_sec': 1.5,
         }],
     )
 
-    # ── Тир 3: Processing ────────────────────────────────────────────────────
+    # ── Tier 3: Processing ───────────────────────────────────────────────────
     face_tracker_left = LifecycleNode(
         package='inmoov_vision',
         executable='face_tracker_node',
@@ -406,8 +410,8 @@ def generate_launch_description():
         }],
     )
 
-    # STT: Parakeet-TDT-0.6b-v3 (ONNX/CPU) — заменил whisper.cpp 2026-08-27,
-    # 2-4x быстрее вживую. См. project_stt_parakeet_eval.md
+    # STT: Parakeet-TDT-0.6b-v3 (ONNX/CPU) — replaced whisper.cpp on 2026-08-27,
+    # 2-4x faster in live testing. See project_stt_parakeet_eval.md
     parakeet_stt = LifecycleNode(
         package='inmoov_voice',
         executable='parakeet_stt_node',
@@ -421,7 +425,7 @@ def generate_launch_description():
         }],
     )
 
-    # ── Тир 4: Intelligence ──────────────────────────────────────────────────
+    # ── Tier 4: Intelligence ─────────────────────────────────────────────────
     face_recognition = LifecycleNode(
         package='inmoov_vision',
         executable='face_recognition_node',
@@ -486,7 +490,7 @@ def generate_launch_description():
             'dead_zone_px':       20,
             'head_dead_zone_px':  80,
             'eye_limit_deg':      8.0,
-            'return_timeout_sec': 10.0,  # было 7.0 — всё ещё мало, роняло голову в rest посреди диалога при кратковременной потере лица на краю кадра (2026-09-01)
+            'return_timeout_sec': 10.0,  # was 7.0 — still too little, dropped the head to rest mid-dialogue on a brief loss of face at the edge of the frame (2026-09-01)
             'track_hz':           10.0,
             'max_step_deg':       2.0,
             'bbox_ema_alpha':     0.4,
@@ -568,7 +572,7 @@ def generate_launch_description():
         }],
     )
 
-    # ── Тир 5: Orchestration ─────────────────────────────────────────────────
+    # ── Tier 5: Orchestration ────────────────────────────────────────────────
     identity_manager = LifecycleNode(
         package='inmoov_cognition',
         executable='identity_manager_node',
@@ -604,7 +608,7 @@ def generate_launch_description():
         }],
     )
 
-    # ── Тир 6: Optional ──────────────────────────────────────────────────────
+    # ── Tier 6: Optional ─────────────────────────────────────────────────────
     telegram_bridge = GroupAction(
         condition=IfCondition(LaunchConfiguration('telegram')),
         actions=[
@@ -627,9 +631,9 @@ def generate_launch_description():
     )
 
     return LaunchDescription(args + [
-        # lifecycle_manager стартует первым — он будет поднимать остальные
+        # lifecycle_manager starts first — it will bring up the rest
         lifecycle_manager,
-        # Все ноды стартуют в состоянии Unconfigured — manager ими управляет
+        # All nodes start in the Unconfigured state — the manager controls them
         memory_node,
         audio_source,
         arduino_right,

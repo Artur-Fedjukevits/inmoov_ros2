@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
 
+"""
+openwakeword_node.py
+=====================
+Wake word detection ("Эй Лёня") on a custom openWakeWord (ONNX) model.
+
+Subscribes:
+  raw_audio  (Float32MultiArray) — 16kHz float32 audio chunks from audio_source_node
+
+Publishes:
+  wake_detected (Bool)    — True on activation (debounced)
+  wake_score    (Float32) — raw model score for every chunk, for tuning/diagnostics
+
+Parameters:
+  model_path    (str)   — path to the custom .onnx wake word model
+  threshold     (float) — activation score threshold (default 0.2)
+  debounce_sec  (float) — minimum interval between two activations (default 1.5)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
+"""
+
 import time
 
 import rclpy
@@ -22,7 +44,7 @@ class WakeWordNode(LifecycleNode):
         self.score_pub        = None
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores re-declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -41,7 +63,7 @@ class WakeWordNode(LifecycleNode):
         self.wake_pub  = self.create_lifecycle_publisher(Bool,    'wake_detected', 10)
         self.score_pub = self.create_lifecycle_publisher(Float32, 'wake_score',    10)
 
-        self.get_logger().info(f'Загрузка модели: {model_path}')
+        self.get_logger().info(f'Loading model: {model_path}')
         self.model = Model(
             wakeword_models=[model_path],
             inference_framework='onnx',
@@ -49,7 +71,7 @@ class WakeWordNode(LifecycleNode):
         self.model_key = None
         self.create_subscription(Float32MultiArray, 'raw_audio', self._audio_callback, 20)
         self.get_logger().info(
-            f"Wake word готов (порог={self.threshold}, debounce={self.debounce_sec}с)")
+            f"Wake word ready (threshold={self.threshold}, debounce={self.debounce_sec}s)")
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
@@ -72,12 +94,12 @@ class WakeWordNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def _audio_callback(self, msg: Float32MultiArray):
-        # float32 [-1, 1] → int16 (openWakeWord ожидает int16)
+        # float32 [-1, 1] → int16 (openWakeWord expects int16)
         audio = (np.array(msg.data, dtype=np.float32) * 32768.0).astype(np.int16)
 
         prediction = self.model.predict(audio)
 
-        # Определяем ключ модели при первом вызове
+        # Determine the model key on the first call
         if self.model_key is None and prediction:
             self.model_key = list(prediction.keys())[0]
 
@@ -99,11 +121,11 @@ class WakeWordNode(LifecycleNode):
             wake_msg.data = True
             self.wake_pub.publish(wake_msg)
             self.get_logger().info(
-                f"Wake word обнаружен! Score={score:.3f} "
-                f"(активация #{self.activation_count})"
+                f"Wake word detected! Score={score:.3f} "
+                f"(activation #{self.activation_count})"
             )
 
-    # destroy_node заменён на lifecycle callbacks
+    # destroy_node replaced by lifecycle callbacks
 
 
 def main():

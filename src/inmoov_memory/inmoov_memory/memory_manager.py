@@ -1,15 +1,19 @@
 """
 Robot Memory Manager
 ====================
-Управляет тремя слоями памяти робота:
-  - WorkingMemory  : RAM, текущее состояние (время, место, режим)
-  - EpisodicMemory : SQLite, краткосрочные эпизоды (диалоги, события)
-  - SemanticMemory : ChromaDB + SQLite, долговременные факты и знания
+Manages the robot's three memory layers:
+  - WorkingMemory  : RAM, current state (time, location, mode)
+  - EpisodicMemory : SQLite, short-term episodes (dialogues, events)
+  - SemanticMemory : ChromaDB + SQLite, long-term facts and knowledge
 
-Использование:
+Usage:
     mm = MemoryManager(db_path="memory.db", chroma_path="./chroma")
     system_prompt = mm.build_system_prompt()
-    mm.after_conversation("Артур сказал что не любит громкую музыку")
+    mm.after_conversation("Artur said he does not like loud music")
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Persona — редактируй под своего робота
+# Persona — edit to match your robot
 # ---------------------------------------------------------------------------
 ROBOT_PERSONA = """Ты InMoov — гуманоидный робот-ассистент.
 Ты дружелюбен, внимателен и стараешься быть полезным.
@@ -38,7 +42,7 @@ ROBOT_PERSONA = """Ты InMoov — гуманоидный робот-ассис�
 
 
 class MemoryManager:
-    """Центральный менеджер памяти робота."""
+    """The robot's central memory manager."""
 
     def __init__(
         self,
@@ -53,7 +57,7 @@ class MemoryManager:
         self.llm_model = llm_model
         self.bearer_token = bearer_token
 
-        # Три слоя памяти (episodic и semantic могут использовать разные БД)
+        # Three memory layers (episodic and semantic may use different DBs)
         self.working = WorkingMemory()
         self.episodic = EpisodicMemory(db_path=db_path)
         self.semantic = SemanticMemory(
@@ -62,20 +66,20 @@ class MemoryManager:
         )
 
         logger.info(
-            "MemoryManager инициализирован. episodic=%s semantic=%s chroma=%s",
+            "MemoryManager initialized. episodic=%s semantic=%s chroma=%s",
             db_path, semantic_db_path or db_path, chroma_path,
         )
 
     # ------------------------------------------------------------------
-    # Построение системного промпта (вызывается перед каждым LLM-запросом)
+    # System prompt assembly (called before every LLM request)
     # ------------------------------------------------------------------
 
     def build_system_prompt(self) -> str:
         """
-        Собирает системный промпт из:
-          - персонажа робота
-          - рабочей памяти (время, место, состояние)
-          - последних 5 эпизодов сегодняшнего дня
+        Assembles the system prompt from:
+          - the robot's persona
+          - working memory (time, location, state)
+          - the last 5 episodes from today
         """
         working_text = self.working.to_text()
         recent_text = self.episodic.get_recent_text(limit=5)
@@ -92,11 +96,11 @@ class MemoryManager:
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
-    # Tool call-функции (регистрируются в LLM как tools)
+    # Tool-call functions (registered with the LLM as tools)
     # ------------------------------------------------------------------
 
     def get_tool_definitions(self) -> list[dict]:
-        """Возвращает описание инструментов для передачи в LLM (OpenAI tools format)."""
+        """Returns the tool descriptions to pass to the LLM (OpenAI tools format)."""
         return [
             {
                 "type": "function",
@@ -186,7 +190,7 @@ class MemoryManager:
         ]
 
     def execute_tool(self, tool_name: str, arguments: dict) -> str:
-        """Диспетчер вызовов инструментов от LLM."""
+        """Dispatches tool calls coming from the LLM."""
         handlers = {
             "search_memory": self._tool_search_memory,
             "save_fact": self._tool_save_fact,
@@ -199,7 +203,7 @@ class MemoryManager:
         try:
             return handler(**arguments)
         except Exception as exc:
-            logger.exception("Ошибка в tool %s", tool_name)
+            logger.exception("Error in tool %s", tool_name)
             return json.dumps({"error": str(exc)})
 
     def _tool_search_memory(self, query: str, category: str = "", limit: int = 5) -> str:
@@ -223,21 +227,21 @@ class MemoryManager:
         return json.dumps({"status": "ok", "location": room})
 
     # ------------------------------------------------------------------
-    # Постобработка диалога (вызывается после каждого завершённого разговора)
+    # Post-processing a dialogue (called after every completed conversation)
     # ------------------------------------------------------------------
 
     def after_conversation(self, dialogue_text: str, participants: list[str] | None = None) -> None:
         """
-        Сохраняет эпизод и извлекает факты из завершённого диалога.
-        Использует LLM (OpenAI chat.completions API) для генерации резюме и извлечения фактов.
+        Saves an episode and extracts facts from a completed dialogue.
+        Uses the LLM (OpenAI chat.completions API) to generate the summary and extract facts.
         """
         participants = participants or []
 
-        # 1. Генерируем краткое резюме
+        # 1. Generate a short summary
         summary = self._summarize(dialogue_text)
         importance = self._score_importance(dialogue_text, summary)
 
-        # 2. Сохраняем в эпизодическую память
+        # 2. Save to episodic memory
         self.episodic.save(
             summary=summary,
             raw_text=dialogue_text,
@@ -245,9 +249,9 @@ class MemoryManager:
             location=self.working.data["location"]["room"],
             importance=importance,
         )
-        logger.info("Эпизод сохранён (importance=%.2f): %s", importance, summary[:60])
+        logger.info("Episode saved (importance=%.2f): %s", importance, summary[:60])
 
-        # 3. Важные эпизоды → извлекаем факты в семантическую память
+        # 3. Important episodes → extract facts into semantic memory
         if importance >= 0.6:
             facts = self._extract_facts(dialogue_text)
             saved = 0
@@ -256,15 +260,15 @@ class MemoryManager:
                     self.semantic.save_fact(**fact)
                     saved += 1
                 except Exception as exc:
-                    logger.warning("save_fact пропущен (%s): %s", fact, exc)
-            logger.info("Извлечено %d фактов, сохранено %d", len(facts), saved)
+                    logger.warning("save_fact skipped (%s): %s", fact, exc)
+            logger.info("Extracted %d facts, saved %d", len(facts), saved)
 
     # ------------------------------------------------------------------
-    # Вспомогательные LLM-вызовы (OpenAI chat.completions API — vLLM)
+    # Helper LLM calls (OpenAI chat.completions API — vLLM)
     # ------------------------------------------------------------------
 
     def _call_llm(self, prompt: str, system: str = "") -> str:
-        """Синхронный нестриминговый вызов OpenAI-совместимого chat.completions."""
+        """Synchronous, non-streaming call to an OpenAI-compatible chat.completions endpoint."""
         import urllib.request
 
         messages = []
@@ -292,7 +296,7 @@ class MemoryManager:
         return content.strip()
 
     def _summarize(self, dialogue_text: str) -> str:
-        """Генерирует краткое (1–2 предложения) резюме диалога."""
+        """Generates a short (1-2 sentence) summary of the dialogue."""
         prompt = (
             f"Сделай краткое резюме (1-2 предложения) следующего диалога робота.\n"
             f"Отвечай только резюме, без лишних слов.\n\n{dialogue_text}"
@@ -300,13 +304,13 @@ class MemoryManager:
         try:
             return self._call_llm(prompt)
         except Exception:
-            # Fallback: первые 200 символов
+            # Fallback: first 200 characters
             return dialogue_text[:200].replace("\n", " ")
 
     def _score_importance(self, text: str, summary: str) -> float:
         """
-        Эвристическая оценка важности (0.0–1.0).
-        Можно заменить на LLM-вызов для точности.
+        Heuristic importance score (0.0-1.0).
+        Could be replaced with an LLM call for better accuracy.
         """
         high_keywords = [
             "не нравится", "нравится", "люблю", "не люблю", "аллергия",
@@ -315,12 +319,12 @@ class MemoryManager:
         ]
         text_lower = (text + " " + summary).lower()
         hits = sum(1 for kw in high_keywords if kw in text_lower)
-        # базовая оценка + бонус за ключевые слова
+        # base score + bonus per keyword hit
         score = min(0.3 + hits * 0.15, 1.0)
         return round(score, 2)
 
     def _extract_facts(self, dialogue_text: str) -> list[dict]:
-        """Извлекает структурированные факты из текста диалога через LLM."""
+        """Extracts structured facts from the dialogue text via the LLM."""
         system = (
             "Ты — система извлечения фактов. "
             "Отвечай ТОЛЬКО валидным JSON-массивом, без пояснений и markdown-блоков."
@@ -334,7 +338,7 @@ class MemoryManager:
         )
         try:
             raw = self._call_llm(prompt, system=system)
-            # Убираем возможные markdown-обёртки
+            # Strip possible markdown fences
             raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
             facts = json.loads(raw)
             return [
@@ -346,19 +350,19 @@ class MemoryManager:
                     and str(f.get("category",  "") or "").strip())
             ]
         except Exception as exc:
-            logger.warning("Не удалось извлечь факты: %s", exc)
+            logger.warning("Failed to extract facts: %s", exc)
             return []
 
     # ------------------------------------------------------------------
-    # Утилиты
+    # Utilities
     # ------------------------------------------------------------------
 
     def wipe_episodic(self, older_than_days: int = 30, min_importance: float = 0.0) -> int:
-        """Удаляет старые малозначимые эпизоды. Возвращает кол-во удалённых."""
+        """Deletes old, low-importance episodes. Returns the number deleted."""
         return self.episodic.cleanup(older_than_days=older_than_days, max_importance=min_importance)
 
     def status(self) -> dict:
-        """Краткая статистика состояния памяти."""
+        """Brief memory status summary."""
         return {
             "working": self.working.data,
             "episodic_count": self.episodic.count(),

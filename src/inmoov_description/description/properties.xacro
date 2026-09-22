@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!--
+LinkForge (Blender) exports inmoov_i2.urdf.xacro in raw CAD/Blender scene
+units, not meters — every <origin xyz> and <mesh scale> in that file is
+written as ${model_scale*...} against this property.
+
+0.1196 is carried over from the old Sentience-Robotics inmoov_urdf
+properties.xacro, which calibrated it to a measured crown height of 1.80 m
+on the same underlying model. Re-check/recalibrate against the physical
+robot if it drifts after a fresh LinkForge export.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:property name="model_scale" value="0.1196"/>
+
+</robot>

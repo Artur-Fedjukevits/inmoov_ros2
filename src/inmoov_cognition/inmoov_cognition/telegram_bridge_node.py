@@ -2,36 +2,40 @@
 """
 telegram_bridge_node.py
 ========================
-Telegram ↔ ROS2 мост для удалённого управления роботом InMoov.
+Telegram ↔ ROS2 bridge for remote control of the InMoov robot.
 
-/ask и свободный текст маршрутизируются через llm_node (/telegram_ask → /telegram_response),
-так что работают все tool calls, умный дом и персональная память.
+/ask and free-form text are routed through llm_node (/telegram_ask → /telegram_response),
+so all tool calls, smart home control and personal memory work fully.
 
-Идентификация: по telegram_id в таблице persons (заполняется вручную).
-При совпадении person_ctx инжектируется в llm_node, робот знает с кем общается.
+Identification: by telegram_id in the persons table (filled in manually).
+On a match, person_ctx is injected into llm_node so the robot knows who it's talking to.
 
-Безопасность:
-  - Только allowed_chat_id получает ответы (остальные молча игнорируются)
-  - Токен только из TELEGRAM_BOT_TOKEN env var
+Security:
+  - Only allowed_chat_id receives replies (everyone else is silently ignored)
+  - Token comes only from the TELEGRAM_BOT_TOKEN env var
 
-Команды:
-  /status          — режим, человек, CPU/RAM, состояние TTS/LLM серверов
-  /photo           — снимок с левой камеры → JPEG
-  /say <текст>     — TTS через Speak action (без LLM)
-  /ask <текст>     — через llm_node → полный пайплайн
+Commands:
+  /status          — mode, person present, CPU/RAM, TTS/LLM server health
+  /photo           — snapshot from the left camera → JPEG
+  /say <text>      — TTS via the Speak action (no LLM)
+  /ask <text>      — through llm_node → full pipeline
   /wake            — /robot_sleep False
-  /sleep           — /robot_sleep True (мгновенный переход в SLEEP, без LLM)
-  /restart_tts     — перезапуск локального Docker-контейнера cosyvoice_api
-  <любой текст>    — как /ask
+  /sleep           — /robot_sleep True (instant transition to SLEEP, no LLM)
+  /restart_tts     — restarts the local cosyvoice_api Docker container
+  <any text>       — same as /ask
 
-Топики:
-  /social_context  (in)   — состояние identity_manager
+Topics:
+  /social_context  (in)   — identity_manager state
   /robot_sleep     (in/out latched)
-  /telegram_ask    (out)  — запрос к llm_node
-  /telegram_response (in) — ответ от llm_node
-  /telegram_push   (in)   — push-уведомления от других нод (JSON: {"text": "..."})
+  /telegram_ask    (out)  — request to llm_node
+  /telegram_response (in) — response from llm_node
+  /telegram_push   (in)   — push notifications from other nodes (JSON: {"text": "..."})
 Actions:
   speak — inmoov_msgs/action/Speak → tts_node
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import asyncio
@@ -69,7 +73,7 @@ from telegram.ext import (
 )
 
 
-# ── Геолокация — хелперы ────────────────────────────────────────────────────
+# ── Geolocation helpers ──────────────────────────────────────────────────────
 
 _TRANSLIT_MAP = {
     'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh',
@@ -85,11 +89,11 @@ _WHERE_RE = re.compile(
 )
 
 def _translit(s: str) -> str:
-    """Транслитерация кириллицы → латиница для fuzzy-матчинга имён."""
+    """Transliterates Cyrillic → Latin for fuzzy name matching."""
     return ''.join(_TRANSLIT_MAP.get(c, c) for c in s.lower())
 
 def _parse_location_state(state: str) -> tuple[float, float] | None:
-    """Парсит состояние OpenHAB Location item: 'lat,lon[,alt]' → (lat, lon)."""
+    """Parses an OpenHAB Location item state: 'lat,lon[,alt]' → (lat, lon)."""
     if not state or state in ('NULL', 'UNDEF', '-', ''):
         return None
     parts = state.split(',')
@@ -114,7 +118,7 @@ _LATCHED = QoSProfile(
 )
 
 
-# ── Основной класс ───────────────────────────────────────────────────────────
+# ── Main class ───────────────────────────────────────────────────────────────
 
 class TelegramBridgeNode(LifecycleNode):
 
@@ -139,7 +143,7 @@ class TelegramBridgeNode(LifecycleNode):
         self._tg_thread           = None
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores re-declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -175,18 +179,18 @@ class TelegramBridgeNode(LifecycleNode):
 
         self._token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
         if not self._token or not self._allowed_chat_id:
-            self.get_logger().warn('Telegram bridge: нет токена или chat_id — бот не запущен')
+            self.get_logger().warn('Telegram bridge: no token or chat_id — bot not started')
             return TransitionCallbackReturn.SUCCESS
 
         self._loop       = asyncio.new_event_loop()
-        # Пересоздаём Queue для нового event loop — старая Queue привязана к
-        # предыдущему loop и вызывает RuntimeError при повторной активации.
+        # Recreate the Queue for the new event loop — the old Queue is bound to
+        # the previous loop and raises RuntimeError on re-activation.
         self._push_queue = asyncio.Queue()
         self._tg_thread  = threading.Thread(
             target=self._run_telegram_loop, daemon=True, name='telegram_loop')
         self._tg_thread.start()
         self.get_logger().info(
-            f'Telegram bridge активирован. allowed_chat_id={self._allowed_chat_id}')
+            f'Telegram bridge activated. allowed_chat_id={self._allowed_chat_id}')
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
@@ -215,7 +219,7 @@ class TelegramBridgeNode(LifecycleNode):
     # ── ROS callbacks ────────────────────────────────────────────────────────
 
     def _camera_cb(self, msg: CompressedImage):
-        """Кэширует последний сжатый кадр от face_capture_node."""
+        """Caches the latest compressed frame from face_capture_node."""
         with self._image_lock:
             self._latest_jpeg = bytes(msg.data)
 
@@ -238,7 +242,7 @@ class TelegramBridgeNode(LifecycleNode):
             pass
 
     def _telegram_response_cb(self, msg: String):
-        """Получает partial/final ответ от llm_node, кладёт в asyncio.Queue."""
+        """Receives a partial/final response from llm_node, puts it on the asyncio.Queue."""
         try:
             data = json.loads(msg.data)
         except json.JSONDecodeError:
@@ -247,18 +251,18 @@ class TelegramBridgeNode(LifecycleNode):
         with self._pending_lock:
             q = self._pending.get(req_id)
         if q and hasattr(self, '_loop'):
-            # thread-safe push в asyncio event loop
+            # thread-safe push into the asyncio event loop
             self._loop.call_soon_threadsafe(q.put_nowait, data)
 
     def _process_say_queue(self):
-        """Таймер 100 мс: /say text → Speak ActionClient."""
+        """100ms timer: /say text → Speak ActionClient."""
         while not self._say_queue.empty():
             try:
                 text = self._say_queue.get_nowait()
             except queue.Empty:
                 break
             if not self._speak_client.wait_for_server(timeout_sec=0.5):
-                self.get_logger().warn('Speak action server недоступен')
+                self.get_logger().warn('Speak action server unavailable')
                 continue
             goal = Speak.Goal()
             goal.text = text
@@ -266,10 +270,10 @@ class TelegramBridgeNode(LifecycleNode):
             self.get_logger().info(f'TG /say → TTS: "{text[:60]}"')
 
     def _telegram_push_cb(self, msg: String):
-        """Push-уведомление из другой ноды (openhab_bridge, memory_node) → Telegram.
+        """Push notification from another node (openhab_bridge, memory_node) → Telegram.
 
-        Ожидает JSON: {"text": "...", "parse_mode": "HTML"} (parse_mode опционален).
-        Без parse_mode → plain text (Telegram не интерпретирует тэги/спец-символы).
+        Expects JSON: {"text": "...", "parse_mode": "HTML"} (parse_mode optional).
+        Without parse_mode → plain text (Telegram does not interpret tags/special chars).
         """
         try:
             data = json.loads(msg.data)
@@ -279,11 +283,11 @@ class TelegramBridgeNode(LifecycleNode):
         if not text or not self._allowed_chat_id:
             return
         if hasattr(self, '_loop'):
-            # Передаём весь dict, чтобы сохранить parse_mode от отправителя
+            # Pass the whole dict along to preserve the sender's parse_mode
             self._loop.call_soon_threadsafe(self._push_queue.put_nowait, data)
 
     def _openhab_items_cb(self, msg: String):
-        """Кэширует items из openhab_bridge_node (нужно для геолокации)."""
+        """Caches items from openhab_bridge_node (needed for geolocation)."""
         try:
             items = json.loads(msg.data)
             with self._openhab_items_lock:
@@ -294,10 +298,10 @@ class TelegramBridgeNode(LifecycleNode):
     def _find_person_location(
         self, name_hint: str,
     ) -> tuple[float, float, str, str] | None:
-        """Ищет Location item по имени (fuzzy, кириллица/латиница).
+        """Looks up a Location item by name (fuzzy, Cyrillic/Latin).
 
-        Returns (lat, lon, item_name, display_name) или None.
-        None с причиной 'no_fix' если item найден, но GPS-данных нет.
+        Returns (lat, lon, item_name, display_name) or None.
+        None with reason 'no_fix' if the item was found but has no GPS data.
         """
         query_translit = _translit(name_hint.strip())
         query_lo       = name_hint.strip().lower()
@@ -312,7 +316,7 @@ class TelegramBridgeNode(LifecycleNode):
                 continue
             iname = item.get('name', '')
             parts = iname.split('_')
-            # Формат: Phone_Nastja_location
+            # Format: Phone_Nastja_location
             if (len(parts) < 3
                     or parts[0].lower() != 'phone'
                     or parts[-1].lower() != 'location'):
@@ -338,13 +342,13 @@ class TelegramBridgeNode(LifecycleNode):
         label_field = best_item.get('label', display)
 
         if coords is None:
-            # Item найден, но телефон офлайн / нет GPS-фикса
+            # Item found, but the phone is offline / has no GPS fix
             return None, None, iname, label_field or display
 
         return coords[0], coords[1], iname, label_field or display
 
     def _is_location_query(self, name_hint: str) -> bool:
-        """True если name_hint совпадает с известным Location item (или выглядит как имя)."""
+        """True if name_hint matches a known Location item (or looks like a name)."""
         known = self._list_location_names()
         if known:
             q_t = _translit(name_hint)
@@ -356,11 +360,11 @@ class TelegramBridgeNode(LifecycleNode):
                 ) >= 0.5
                 for k in known
             )
-        # OpenHAB недоступен — считаем именем только если начинается с заглавной
+        # OpenHAB unavailable — treat as a name only if it starts with a capital letter
         return name_hint[:1].isupper()
 
     def _list_location_names(self) -> list[str]:
-        """Возвращает список имён всех Phone_*_location items."""
+        """Returns the list of names of all Phone_*_location items."""
         with self._openhab_items_lock:
             items = list(self._openhab_items_cache)
         names = []
@@ -375,12 +379,12 @@ class TelegramBridgeNode(LifecycleNode):
                 names.append('_'.join(parts[1:-1]))
         return names
 
-    # ── Персональная идентификация ───────────────────────────────────────────
+    # ── Personal identification ──────────────────────────────────────────────
 
     def _lookup_person(self, telegram_id: int) -> dict | None:
-        """Ищет человека по telegram_id в SQLite persons.
+        """Looks up a person by telegram_id in the SQLite persons table.
 
-        Возвращает person_ctx совместимый с llm_node, или None.
+        Returns a person_ctx compatible with llm_node, or None.
         """
         try:
             conn = sqlite3.connect(self._db_path, timeout=5.0)
@@ -406,14 +410,14 @@ class TelegramBridgeNode(LifecycleNode):
             finally:
                 conn.close()
         except Exception as e:
-            self.get_logger().warn(f'DB lookup ошибка: {e}')
+            self.get_logger().warn(f'DB lookup error: {e}')
             return None
 
-    # ── Запрос к llm_node ────────────────────────────────────────────────────
+    # ── Request to llm_node ──────────────────────────────────────────────────
 
     def _publish_ask(self, req_id: str, text: str, telegram_id: int | None,
                       image_base64: str | None = None) -> None:
-        """Публикует /telegram_ask; person_ctx инжектируется из БД по telegram_id."""
+        """Publishes /telegram_ask; person_ctx is injected from the DB by telegram_id."""
         person_ctx = self._lookup_person(telegram_id) if telegram_id else None
         payload: dict = {'request_id': req_id, 'text': text}
         if person_ctx:
@@ -425,21 +429,21 @@ class TelegramBridgeNode(LifecycleNode):
         self._ask_pub.publish(pub_msg)
         self.get_logger().info(
             f'TG ask req={req_id[:8]}'
-            + (f' person={person_ctx["name"]}' if person_ctx else ' (анонимно)')
-            + (' +фото' if image_base64 else '')
+            + (f' person={person_ctx["name"]}' if person_ctx else ' (anonymous)')
+            + (' +photo' if image_base64 else '')
         )
 
-    # ── Вспомогательные ─────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _auth(self, chat_id: int) -> bool:
         return chat_id == self._allowed_chat_id
 
     def _capture_photo(self) -> bytes | None:
-        """Берёт кадр из ROS-топика (vision pipeline) или напрямую с камеры."""
+        """Grabs a frame from the ROS topic (vision pipeline) or directly from the camera."""
         with self._lock:
             sleeping = self._sleeping
 
-        # В режиме SLEEP face_capture_node деактивирован → кэш устарел
+        # In SLEEP mode face_capture_node is deactivated → the cache is stale
         if not sleeping:
             with self._image_lock:
                 cached = self._latest_jpeg
@@ -447,37 +451,37 @@ class TelegramBridgeNode(LifecycleNode):
             cached = None
 
         if cached is not None:
-            # Перекодируем в JPEG нужного качества если нужно
+            # Re-encode to the desired JPEG quality if needed
             arr = np.frombuffer(cached, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if frame is not None:
                 ok, buf = cv2.imencode(
                     '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 if ok:
-                    self.get_logger().info('Фото: кадр из ROS-топика')
+                    self.get_logger().info('Photo: frame from ROS topic')
                     return bytes(buf)
 
-        # Fallback: прямой захват с устройства (vision pipeline не запущен)
+        # Fallback: direct capture from the device (vision pipeline not running)
         cap = cv2.VideoCapture(self._cam_device)
         if not cap.isOpened():
-            self.get_logger().warn(f'Камера недоступна: {self._cam_device}')
+            self.get_logger().warn(f'Camera unavailable: {self._cam_device}')
             return None
         try:
             ret, frame = cap.read()
             if not ret:
-                self.get_logger().warn('cap.read() вернул False')
+                self.get_logger().warn('cap.read() returned False')
                 return None
             ok, buf = cv2.imencode(
                 '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            self.get_logger().info('Фото: прямой захват с камеры')
+            self.get_logger().info('Photo: direct camera capture')
             return bytes(buf) if ok else None
         finally:
             cap.release()
 
-    # ── Геолокация ───────────────────────────────────────────────────────────
+    # ── Geolocation ───────────────────────────────────────────────────────────
 
     async def _cmd_where(self, update: Update, context):
-        """/where <имя> — прислать геолокацию члена семьи из OwnTracks."""
+        """/where <name> — sends a family member's geolocation from OwnTracks."""
         if not self._auth(update.effective_chat.id):
             return
         name = ' '.join(context.args).strip() if context.args else ''
@@ -487,12 +491,12 @@ class TelegramBridgeNode(LifecycleNode):
         await self._send_family_location(update, name)
 
     async def _send_family_location(self, update: Update, name: str):
-        """Ищет Location item, отправляет pin на карте или сообщение об ошибке."""
+        """Looks up a Location item, sends a map pin or an error message."""
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, self._find_person_location, name)
 
         if result is None:
-            # Имя не совпало ни с одним Location item
+            # Name didn't match any Location item
             known = self._list_location_names()
             if known:
                 await update.message.reply_text(
@@ -504,7 +508,7 @@ class TelegramBridgeNode(LifecycleNode):
 
         lat, lon, item_name, display = result
         if lat is None:
-            # Item найден, но телефон офлайн или нет GPS-данных
+            # Item found, but the phone is offline or has no GPS data
             await update.message.reply_text(
                 f'📡 {display}: телефон офлайн или нет GPS-данных')
             return
@@ -514,7 +518,7 @@ class TelegramBridgeNode(LifecycleNode):
         self.get_logger().info(
             f'TG /where {name} → {display} ({lat:.5f}, {lon:.5f})')
 
-    # ── Форматирование ROS статуса ───────────────────────────────────────────
+    # ── ROS status formatting ─────────────────────────────────────────────────
 
     def _format_ros_status(self, lc: dict) -> list[str]:
         if not lc:
@@ -575,7 +579,7 @@ class TelegramBridgeNode(LifecycleNode):
                     parts.append('🔄')
                 lines.append(' '.join(parts))
 
-        # Ноды с рестартами (но сейчас OK) — только если нет деградации
+        # Nodes with restarts (but currently OK) — only if nothing is degraded
         if respawned_healthy and not degraded_details:
             for nname, count in respawned_healthy[:4]:
                 lines.append(f'  ⚡ `{nname}` ×{count}')
@@ -630,7 +634,7 @@ class TelegramBridgeNode(LifecycleNode):
         pname   = ctx.get('name', '')
         emotion = ctx.get('emotion', 'neutral')
 
-        # Идентификация пользователя
+        # User identification
         loop   = asyncio.get_event_loop()
         person = await loop.run_in_executor(
             None, self._lookup_person, update.effective_chat.id)
@@ -644,12 +648,12 @@ class TelegramBridgeNode(LifecycleNode):
         ram_total_gb = ram.total / (1024 ** 3)
         load = os.getloadavg()
 
-        # Диск
+        # Disk
         disk = psutil.disk_usage('/')
         disk_used_gb  = disk.used  / (1024 ** 3)
         disk_total_gb = disk.total / (1024 ** 3)
 
-        # Температура CPU (k10temp для AMD Ryzen)
+        # CPU temperature (k10temp for AMD Ryzen)
         temp_str = ''
         try:
             temps = psutil.sensors_temperatures()
@@ -662,7 +666,7 @@ class TelegramBridgeNode(LifecycleNode):
         except Exception:
             pass
 
-        # Аптайм системы
+        # System uptime
         uptime_sec = time.time() - psutil.boot_time()
         uptime_h   = int(uptime_sec // 3600)
         uptime_m   = int((uptime_sec % 3600) // 60)
@@ -683,7 +687,7 @@ class TelegramBridgeNode(LifecycleNode):
             detail = f'{lat:.0f}мс' if ok else 'недоступен'
             return f'  {icon} {label}: {detail}'
 
-        # ROS ноды
+        # ROS nodes
         ros_lines = self._format_ros_status(lc)
 
         robot_state = '💤 SLEEP' if sleeping else state.upper()
@@ -763,9 +767,9 @@ class TelegramBridgeNode(LifecycleNode):
         text = (update.message.text or '').strip()
         if not text or text.startswith('/'):
             return
-        # Быстрый путь: "где [сейчас] Имя?" → геолокация без LLM
-        # Проверяем совпадение с известными именами, чтобы не перехватывать
-        # вопросы вида "где сейчас включён свет?"
+        # Fast path: "where [is] Name?" → geolocation without the LLM
+        # Check the match against known names, so as not to intercept
+        # questions like "where is the light on right now?"
         m = _WHERE_RE.search(text)
         if m and self._is_location_query(m.group(1)):
             await self._send_family_location(update, m.group(1))
@@ -773,17 +777,17 @@ class TelegramBridgeNode(LifecycleNode):
         await self._ask_and_reply(update, text)
 
     async def _photo_handler(self, update: Update, context):
-        """Фото от пользователя — скачиваем, кодируем в base64, отдаём в LLM
-        (vision через ту же qwen3.8-27b/vLLM, см. llm_node._query_llm)."""
+        """A photo from the user — download it, encode to base64, hand it to the LLM
+        (vision via the same qwen3.8-27b/vLLM, see llm_node._query_llm)."""
         if not self._auth(update.effective_chat.id):
             return
         caption = (update.message.caption or '').strip()
-        photo = update.message.photo[-1]  # наибольшее доступное разрешение
+        photo = update.message.photo[-1]  # highest available resolution
         try:
             tg_file = await context.bot.get_file(photo.file_id)
             raw = await tg_file.download_as_bytearray()
         except Exception as e:
-            self.get_logger().warn(f'TG photo: не удалось скачать файл: {e}')
+            self.get_logger().warn(f'TG photo: failed to download the file: {e}')
             await update.message.reply_text('❌ Не смог скачать фото')
             return
         image_b64 = base64.b64encode(bytes(raw)).decode()
@@ -792,7 +796,7 @@ class TelegramBridgeNode(LifecycleNode):
 
     async def _ask_and_reply(self, update: Update, text: str,
                               image_base64: str | None = None):
-        """Отправляет запрос через llm_node и стримит ответ редактированием сообщения."""
+        """Sends the request via llm_node and streams the reply by editing the message."""
         sent = await update.message.reply_text(
             '👀 Смотрю...' if image_base64 else '⏳ Думаю...')
 
@@ -802,14 +806,14 @@ class TelegramBridgeNode(LifecycleNode):
         with self._pending_lock:
             self._pending[req_id] = q
 
-        # Публикуем запрос в llm_node (синхронно, быстро)
+        # Publish the request to llm_node (synchronous, fast)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None, self._publish_ask, req_id, text, update.effective_chat.id, image_base64)
 
         accumulated = ''
         last_edit = 0.0
-        THROTTLE   = 1.2   # минимальный интервал правок (Telegram rate limit)
+        THROTTLE   = 1.2   # minimum interval between edits (Telegram rate limit)
 
         try:
             while True:
@@ -829,14 +833,14 @@ class TelegramBridgeNode(LifecycleNode):
                     return
 
                 if not partial:
-                    # Финал — это сигнал "стоп", а не новый текст.
-                    # Весь контент уже пришёл через partial=True чанки.
-                    # chunk содержит error-текст только когда accumulated пустой.
+                    # The final message is a "stop" signal, not new text.
+                    # All the content already arrived via partial=True chunks.
+                    # chunk contains error text only when accumulated is empty.
                     final = accumulated if accumulated else chunk
                     await sent.edit_text(final or '🤔 Нет ответа')
                     return
 
-                # partial=True: добавляем чанк с пробелом-разделителем
+                # partial=True: append the chunk with a space separator
                 if chunk:
                     accumulated += (' ' if accumulated else '') + chunk
 
@@ -856,10 +860,10 @@ class TelegramBridgeNode(LifecycleNode):
         self._loop.run_until_complete(self._run_bot())
 
     async def _push_sender(self, app):
-        """Дренирует _push_queue и отправляет сообщения в Telegram.
+        """Drains _push_queue and sends messages to Telegram.
 
-        Каждый элемент очереди — dict {"text": ..., "parse_mode": ...}.
-        parse_mode берётся из payload; если не указан — plain text (None).
+        Each queue element is a dict {"text": ..., "parse_mode": ...}.
+        parse_mode comes from the payload; if not given — plain text (None).
         """
         while rclpy.ok():
             try:
@@ -876,9 +880,9 @@ class TelegramBridgeNode(LifecycleNode):
                     text=text,
                     parse_mode=parse_mode,
                 )
-                self.get_logger().info(f'TG push отправлен: {text[:80]}')
+                self.get_logger().info(f'TG push sent: {text[:80]}')
             except Exception as e:
-                self.get_logger().warn(f'TG push ошибка: {e}')
+                self.get_logger().warn(f'TG push error: {e}')
 
     async def _run_bot(self):
         app = Application.builder().token(self._token).build()
@@ -900,12 +904,12 @@ class TelegramBridgeNode(LifecycleNode):
         await app.initialize()
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
-        self.get_logger().info('Telegram polling запущен')
+        self.get_logger().info('Telegram polling started')
 
         while rclpy.ok():
             await asyncio.sleep(1.0)
 
-        self.get_logger().info('Telegram: завершение...')
+        self.get_logger().info('Telegram: shutting down...')
         await app.updater.stop()
         await app.stop()
         await app.shutdown()

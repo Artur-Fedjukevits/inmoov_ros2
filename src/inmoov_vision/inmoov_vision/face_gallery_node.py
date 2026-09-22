@@ -2,47 +2,52 @@
 """
 face_gallery_node.py
 ====================
-Автоматически сохраняет кропы лиц из обоих глаз в фотогалерею.
+Automatically saves face crops from both eyes into a photo gallery.
 
-Структура директорий:
+Directory structure:
   {gallery_dir}/
     persons/
-      1_Artur/        ← фото из сессий взаимодействия
+      1_Artur/        ← photos from interaction sessions
         left_20260430_143022_a1b2.jpg
         right_20260430_143022_a1b2.jpg
-    _pending/          ← фото собранные ДО завершения знакомства
+    _pending/          ← photos collected BEFORE introduction completes
         left_20260430_144500_c3d4.jpg
 
-Логика захвата:
-  INTRODUCING  → снимаем каждые enroll_interval_sec секунд в _pending/
-  INTERACTING  → снимаем каждые interact_interval_sec секунд в persons/{id}_{name}/
+Capture logic:
+  INTRODUCING  → shoot every enroll_interval_sec seconds into _pending/
+  INTERACTING  → shoot every interact_interval_sec seconds into persons/{id}_{name}/
 
-  После энролмента (INTRODUCING → INTERACTING + появился person_id):
-    _pending/ → persons/{id}_{name}/ + gallery_add для каждого фото
+  After enrollment (INTRODUCING → INTERACTING + person_id appeared):
+    _pending/ → persons/{id}_{name}/ + gallery_add for each photo
 
-Лимит фотографий (max_photos_per_person=30):
-  Если в директории уже 30 фото:
-    - за сессию добавляем только 1 left + 1 right (JPEG quality=100)
-    - удаляем 2 самые старые (oldest left + oldest right) из disk и DB
+Photo limit (max_photos_per_person=30):
+  If the directory already has 30 photos:
+    - only add 1 left + 1 right per session (JPEG quality=100)
+    - delete the 2 oldest (oldest left + oldest right) from disk and DB
 
-Пересчёт embedding:
-  По завершении сессии (interacting→idle или засыпание) — gallery_rebuild_embedding
-  для конкретного person_id: усредняет все gallery embeddings → обновляет persons.embedding
+Embedding recompute:
+  At the end of a session (interacting→idle, or going to sleep) —
+  gallery_rebuild_embedding for the specific person_id: averages all gallery
+  embeddings → updates persons.embedding
 
-Фильтрация качества:
+Quality filtering:
   - det_score >= min_det_score (0.80)
-  - ширина bbox >= min_face_px (60 пикселей)
-  - cosine similarity к последним N фото < max_diversity_sim (0.90) → не дублировать
+  - bbox width >= min_face_px (60 pixels)
+  - cosine similarity to the last N photos < max_diversity_sim (0.90) → don't duplicate
 
-Подписки:
-  /camera/eye_left/compressed   — для кропа левым bbox
-  /camera/eye_right/compressed  — для кропа правым bbox
-  /face/tracks/left             — bbox + det_score + embedding (главный трек)
-  /face/tracks/right            — bbox + det_score правого глаза
-  /social_context               — person_id + state (INTERACTING/INTRODUCING)
+Subscriptions:
+  /camera/eye_left/compressed   — for cropping with the left bbox
+  /camera/eye_right/compressed  — for cropping with the right bbox
+  /face/tracks/left             — bbox + det_score + embedding (main track)
+  /face/tracks/right            — bbox + det_score of the right eye
+  /social_context                — person_id + state (INTERACTING/INTRODUCING)
 
-Сервис:
+Service:
   /memory/query  — gallery_add, gallery_remove, gallery_rebuild_embedding
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -86,7 +91,7 @@ class FaceGalleryNode(LifecycleNode):
         self._target_track_id      = None
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores repeated declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -156,7 +161,7 @@ class FaceGalleryNode(LifecycleNode):
                 pid = self._last_interacting_pid
             if pid is not None:
                 self.get_logger().info(
-                    f'Сон → пересчёт embedding для person_id={pid}')
+                    f'Sleep → recomputing embedding for person_id={pid}')
                 threading.Thread(
                     target=self._rebuild_embedding, args=(pid,), daemon=True).start()
 
@@ -187,7 +192,7 @@ class FaceGalleryNode(LifecycleNode):
             return None
 
     def _identity_cb(self, msg: String):
-        """Обновляем track_id собеседника по результатам распознавания."""
+        """Update the interlocutor's track_id from recognition results."""
         if self._sleeping:
             return
         try:
@@ -215,10 +220,10 @@ class FaceGalleryNode(LifecycleNode):
                 return
             target_id = self._target_track_id
             if target_id is not None:
-                # В диалоге — берём только трек собеседника
+                # In a dialogue — only take the interlocutor's track
                 best = next((t for t in tracks if t.get('track_id') == target_id), None)
                 if best is None:
-                    return  # собеседник не виден — не трогаем bbox
+                    return  # interlocutor not visible — don't touch the bbox
             else:
                 best = max(tracks, key=lambda t: (
                     (t['bbox'][2] - t['bbox'][0]) * (t['bbox'][3] - t['bbox'][1])))
@@ -270,7 +275,7 @@ class FaceGalleryNode(LifecycleNode):
             self._person_id   = person_id
             self._person_name = person_name
 
-        # Переход INTRODUCING → INTERACTING — переносим pending фото
+        # Transition INTRODUCING → INTERACTING — move pending photos
         if (prev_state == 'introducing'
                 and new_state == 'interacting'
                 and person_id is not None):
@@ -280,16 +285,16 @@ class FaceGalleryNode(LifecycleNode):
                 daemon=True,
             ).start()
 
-        # Начало знакомства — очищаем буфер
+        # Introduction started — clear the buffer
         if new_state == 'introducing' and prev_state != 'introducing':
             with self._lock:
                 self._recent_embeddings = []
                 self._pending_photos    = []
                 self._last_capture      = 0.0
             self._clear_pending_dir()
-            self.get_logger().info('Галерея: начало знакомства — pending очищен')
+            self.get_logger().info('Gallery: introduction started — pending cleared')
 
-        # Начало взаимодействия — обновляем сессионные флаги
+        # Interaction started — update session flags
         if new_state == 'interacting' and person_id is not None:
             with self._lock:
                 new_session = (
@@ -300,23 +305,23 @@ class FaceGalleryNode(LifecycleNode):
                     self._session_person_id   = person_id
                     self._session_left_saved  = False
                     self._session_right_saved = False
-                    self._target_track_id     = None  # ждём подтверждения от identity
+                    self._target_track_id     = None  # wait for confirmation from identity
                 self._last_interacting_pid = person_id
         elif new_state != 'interacting':
             with self._lock:
                 self._target_track_id = None
 
-        # Конец сессии: был INTERACTING, стал не-INTERACTING
+        # End of session: was INTERACTING, became non-INTERACTING
         if prev_state == 'interacting' and new_state != 'interacting':
             with self._lock:
                 pid = self._last_interacting_pid
             if pid is not None:
                 self.get_logger().info(
-                    f'Сессия завершена → пересчёт embedding для person_id={pid}')
+                    f'Session ended → recomputing embedding for person_id={pid}')
                 threading.Thread(
                     target=self._rebuild_embedding, args=(pid,), daemon=True).start()
 
-    # ── Тикер захвата ──────────────────────────────────────────────────────
+    # ── Capture ticker ────────────────────────────────────────────────────
 
     def _capture_tick(self):
         if self._sleeping:
@@ -342,7 +347,7 @@ class FaceGalleryNode(LifecycleNode):
                 return
             self._do_capture(person_id=person_id, person_name=person_name, source='interact')
 
-    # ── Захват кадра ───────────────────────────────────────────────────────
+    # ── Frame capture ─────────────────────────────────────────────────────
 
     def _do_capture(self, person_id: int | None, person_name: str | None, source: str):
         with self._lock:
@@ -373,7 +378,7 @@ class FaceGalleryNode(LifecycleNode):
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         uid   = uuid.uuid4().hex[:6]
 
-        # ── Проверка лимита (только для известного человека) ──────────────
+        # ── Limit check (only for a known person) ──────────────────────────
         at_limit = False
         left_photos: list[Path]  = []
         right_photos: list[Path] = []
@@ -390,15 +395,15 @@ class FaceGalleryNode(LifecycleNode):
                 left_done  = self._session_left_saved
                 right_done = self._session_right_saved
             if left_done and right_done:
-                return  # Уже добавили сессионные фото для этого человека
-            quality = 100  # максимальное качество при ротации
+                return  # already added the session photos for this person
+            quality = 100  # maximum quality during rotation
         else:
             left_done = right_done = False
             quality   = 90
 
         saved: list[tuple[str, list]] = []
 
-        # Левый глаз
+        # Left eye
         if frame_left is not None and (not at_limit or not left_done):
             path = self._save_crop(
                 frame_left, left_bbox, padding=0.20,
@@ -412,8 +417,8 @@ class FaceGalleryNode(LifecycleNode):
                     with self._lock:
                         self._session_left_saved = True
 
-        # Правый глаз — используем right_emb (buffalo_l на правой камере),
-        # fallback на left_emb только если правый детектор не вернул embedding
+        # Right eye — uses right_emb (buffalo_l on the right camera),
+        # falls back to left_emb only if the right detector didn't return an embedding
         if (frame_right is not None
                 and right_bbox is not None
                 and right_score >= self._min_det_score
@@ -450,17 +455,17 @@ class FaceGalleryNode(LifecycleNode):
                 ).start()
 
         self.get_logger().debug(
-            f'gallery capture: {len(saved)} фото | source={source} | '
+            f'gallery capture: {len(saved)} photo(s) | source={source} | '
             f'det={left_score:.2f} | at_limit={at_limit}')
 
     def _rotate_oldest(self, oldest_path: Path):
-        """Удаляет старейшее фото с диска и из БД галереи."""
+        """Deletes the oldest photo from disk and from the gallery DB."""
         path_str = str(oldest_path)
         try:
             oldest_path.unlink(missing_ok=True)
-            self.get_logger().debug(f'gallery rotate: удалено {oldest_path.name}')
+            self.get_logger().debug(f'gallery rotate: deleted {oldest_path.name}')
         except Exception as e:
-            self.get_logger().warn(f'rotate_oldest: ошибка удаления {oldest_path}: {e}')
+            self.get_logger().warn(f'rotate_oldest: error deleting {oldest_path}: {e}')
             return
         threading.Thread(
             target=self._gallery_remove, args=(path_str,), daemon=True).start()
@@ -501,10 +506,10 @@ class FaceGalleryNode(LifecycleNode):
             cv2.imwrite(dest, crop, [cv2.IMWRITE_JPEG_QUALITY, quality])
             return dest
         except Exception as e:
-            self.get_logger().warn(f'Ошибка сохранения кропа: {e}')
+            self.get_logger().warn(f'Error saving crop: {e}')
             return None
 
-    # ── Перенос pending → person dir после энролмента ────────────────────
+    # ── Move pending → person dir after enrollment ───────────────────────
 
     def _flush_pending(self, person_id: int, person_name: str):
         with self._lock:
@@ -531,10 +536,10 @@ class FaceGalleryNode(LifecycleNode):
                 self._gallery_add(person_id, dst_path, embedding, 1.0, 'enroll')
                 moved += 1
             except Exception as e:
-                self.get_logger().warn(f'Ошибка переноса {src_path}: {e}')
+                self.get_logger().warn(f'Error moving {src_path}: {e}')
 
         self.get_logger().info(
-            f'flush_pending: {moved} фото → persons/{person_id}_{person_name}')
+            f'flush_pending: {moved} photo(s) → persons/{person_id}_{person_name}')
 
         with self._lock:
             self._recent_embeddings = []
@@ -547,11 +552,11 @@ class FaceGalleryNode(LifecycleNode):
         except Exception:
             pass
 
-    # ── Вызовы /memory/query ──────────────────────────────────────────────
+    # ── /memory/query calls ─────────────────────────────────────────────
 
     def _call_memory(self, payload: dict, timeout: float = 5.0) -> dict | None:
         if not self._mem.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn(f'/memory/query недоступен (op={payload.get("op")})')
+            self.get_logger().warn(f'/memory/query unavailable (op={payload.get("op")})')
             return None
         req = MemoryQuery.Request()
         req.request_json = json.dumps(payload)
@@ -559,12 +564,12 @@ class FaceGalleryNode(LifecycleNode):
         done   = threading.Event()
         future.add_done_callback(lambda _: done.set())
         if not done.wait(timeout=timeout):
-            self.get_logger().warn(f'Таймаут /memory/query (op={payload.get("op")})')
+            self.get_logger().warn(f'Timeout on /memory/query (op={payload.get("op")})')
             return None
         try:
             return json.loads(future.result().response_json)
         except Exception as e:
-            self.get_logger().warn(f'Ошибка ответа /memory/query: {e}')
+            self.get_logger().warn(f'Error parsing /memory/query response: {e}')
             return None
 
     def _gallery_add(self, person_id: int, photo_path: str,
@@ -579,12 +584,12 @@ class FaceGalleryNode(LifecycleNode):
         })
         if result and not result.get('added'):
             self.get_logger().debug(
-                f'gallery_add: пропущено ({result.get("reason", "unknown")}) {photo_path}')
+                f'gallery_add: skipped ({result.get("reason", "unknown")}) {photo_path}')
 
     def _gallery_remove(self, photo_path: str):
         result = self._call_memory({'op': 'gallery_remove', 'photo_path': photo_path})
         if result and result.get('removed'):
-            self.get_logger().debug(f'gallery_remove: удалено из БД {Path(photo_path).name}')
+            self.get_logger().debug(f'gallery_remove: removed from DB {Path(photo_path).name}')
 
     def _rebuild_embedding(self, person_id: int):
         result = self._call_memory(
@@ -592,8 +597,8 @@ class FaceGalleryNode(LifecycleNode):
             timeout=10.0)
         if result and result.get('rebuilt'):
             self.get_logger().info(
-                f'Embedding пересчитан: person_id={person_id} | '
-                f'{result.get("gallery_count", 0)} фото галереи')
+                f'Embedding recomputed: person_id={person_id} | '
+                f'{result.get("gallery_count", 0)} gallery photo(s)')
 
 
 

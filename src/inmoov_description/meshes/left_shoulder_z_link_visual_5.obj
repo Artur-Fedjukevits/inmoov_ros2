@@ -1,0 +1,13 @@
+# Blender 5.0.1
+# www.blender.org
+mtllib left_shoulder_z_link_visual_5.mtl
+o i01.leftArm.rotate.full.006_visual.001
+v 0.000000 0.018857 0.015894
+v -0.000000 0.013139 -0.020895
+v 0.000000 -0.013143 0.020895
+v -0.000000 -0.018857 -0.015874
+vn 1.0000 -0.0000 -0.0000
+s 0
+usemtl [0131_Silver].001
+f 4//1 2//1 1//1
+f 3//1 4//1 1//1

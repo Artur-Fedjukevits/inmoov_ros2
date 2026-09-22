@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-voice.launch.py — запуск всего голосового пайплайна InMoov.
+voice.launch.py — launches the whole InMoov voice pipeline.
 
-Порядок запуска:
+Startup order:
   audio_source_node  → raw_audio
   openwakeword_node  → wake_detected
   voice_detector_node → audio_to_whisper
   parakeet_stt_node  → voice_command
   tts_node           (action server /speak)
-  llm_node           (intent generator — пакет behavior_manager_node)
+  llm_node           (intent generator — from the behavior_manager_node package)
 
-Использование:
+Usage:
   ros2 launch inmoov_voice voice.launch.py
   ros2 launch inmoov_voice voice.launch.py llm_url:=http://localhost:18020/v1/chat/completions
   ros2 launch inmoov_voice voice.launch.py tavily_api_key:=tvly-...
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import os
@@ -23,7 +27,7 @@ from launch.actions import DeclareLaunchArgument, TimerAction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-# PulseAudio/PipeWire сессия для аудио нод
+# PulseAudio/PipeWire session for the audio nodes
 _uid = os.getuid()
 _AUDIO_ENV = {
     'PULSE_SERVER': f'unix:/run/user/{_uid}/pulse/native',
@@ -33,10 +37,10 @@ _AUDIO_ENV = {
 
 def generate_launch_description():
 
-    # ── Аргументы (переопределяются из командной строки) ──────────────────────
+    # ── Arguments (overridable from the command line) ─────────────────────────
     args = [
-        # Серверы
-        # llm_url — OpenAI-совместимый chat.completions endpoint (сейчас vLLM).
+        # Servers
+        # llm_url — OpenAI-compatible chat.completions endpoint (currently vLLM).
         DeclareLaunchArgument('llm_url',
             default_value='http://192.168.10.118:18020/v1/chat/completions'),
         DeclareLaunchArgument('llm_fallback_url',
@@ -47,7 +51,7 @@ def generate_launch_description():
         DeclareLaunchArgument('tts_fallback_url',    default_value='http://localhost:8000'),
         DeclareLaunchArgument('openhab_url',         default_value='http://192.168.10.118:8080'),
 
-        # Модель LLM
+        # LLM model
         DeclareLaunchArgument('llm_model',           default_value='qwen3.8-27b'),
         DeclareLaunchArgument('llm_temperature',     default_value='0.1'),
         DeclareLaunchArgument('llm_max_tokens',      default_value='512'),
@@ -56,8 +60,8 @@ def generate_launch_description():
         DeclareLaunchArgument('wakeword_model',      default_value='/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'),
         DeclareLaunchArgument('wakeword_threshold',  default_value='0.3'),
 
-        # Аудио
-        DeclareLaunchArgument('audio_device_index',  default_value='-1'),   # -1 = системное по умолчанию
+        # Audio
+        DeclareLaunchArgument('audio_device_index',  default_value='-1'),   # -1 = system default
         DeclareLaunchArgument('audio_device_name',   default_value='pulse'),
         DeclareLaunchArgument('output_device_name',  default_value=''),
         DeclareLaunchArgument('sample_rate',         default_value='16000'),
@@ -73,9 +77,9 @@ def generate_launch_description():
         DeclareLaunchArgument('sv_segment_sec',         default_value='3.0'),
     ]
 
-    # ── Ноды ──────────────────────────────────────────────────────────────────
+    # ── Nodes ─────────────────────────────────────────────────────────────────
 
-    # 1. Источник аудио — запускается первым
+    # 1. Audio source — started first
     audio_source = Node(
         package='inmoov_voice',
         executable='audio_source_node',
@@ -90,7 +94,7 @@ def generate_launch_description():
         }],
     )
 
-    # 2. Wake word — подписывается на raw_audio
+    # 2. Wake word — subscribes to raw_audio
     wakeword = Node(
         package='inmoov_voice',
         executable='wakeword_node',
@@ -104,7 +108,7 @@ def generate_launch_description():
         }],
     )
 
-    # 3. Voice detector (VAD) — подписывается на raw_audio + wake_detected
+    # 3. Voice detector (VAD) — subscribes to raw_audio + wake_detected
     voice_detector = Node(
         package='inmoov_voice',
         executable='voice_detector_node',
@@ -125,9 +129,9 @@ def generate_launch_description():
         }],
     )
 
-    # 4. Voice emotion — читает audio_to_whisper (после VAD), загружает SpeechBrain wav2vec2
+    # 4. Voice emotion — reads audio_to_whisper (after VAD), loads SpeechBrain wav2vec2
     voice_emotion = TimerAction(
-        period=5.0,   # ждём пока SpeechBrain/wav2vec2 загрузится без гонки с VAD
+        period=5.0,   # wait so that SpeechBrain/wav2vec2 loads without racing the VAD
         actions=[Node(
             package='inmoov_voice',
             executable='voice_emotion_node',
@@ -140,7 +144,7 @@ def generate_launch_description():
         )],
     )
 
-    # 5. TTS — Action Server, запускаем до LLM
+    # 5. TTS — Action Server, started before the LLM
     tts = Node(
         package='inmoov_voice',
         executable='tts_node',
@@ -158,7 +162,7 @@ def generate_launch_description():
         }],
     )
 
-    # 5. STT — Parakeet-TDT-0.6b-v3 (CPU, ONNX), заменил whisper.cpp 2026-08-27
+    # 5. STT — Parakeet-TDT-0.6b-v3 (CPU, ONNX), replaced whisper.cpp on 2026-08-27
     parakeet = TimerAction(
         period=2.0,
         actions=[Node(
@@ -173,9 +177,9 @@ def generate_launch_description():
         )],
     )
 
-    # 6. LLM — запускаем последним (зависит от TTS action server)
+    # 6. LLM — started last (depends on the TTS action server)
     llm = TimerAction(
-        period=3.0,   # ждём пока TTS action server поднимется
+        period=3.0,   # wait for the TTS action server to come up
         actions=[Node(
             package='inmoov_cognition',
             executable='llm_node',

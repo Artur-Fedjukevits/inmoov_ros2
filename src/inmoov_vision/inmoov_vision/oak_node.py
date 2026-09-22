@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-oak_node.py — OAK-D Lite: YOLO детекция + стерео глубина (depthai v3)
+oak_node.py — OAK-D Lite: YOLO detection + stereo depth (depthai v3)
 
-Pipeline по официальному примеру:
+Pipeline follows the official example:
   https://docs.luxonis.com/software-v3/depthai/examples/spatial_detection_network/spatial_detection/
 
-Публикует:
-  /objects/detections  (String JSON) — все объекты с XYZ координатами
-  /objects/nearest     (String JSON) — ближайший объект
+Publishes:
+  /objects/detections  (String JSON) — all objects with XYZ coordinates
+  /objects/nearest     (String JSON) — the nearest object
 
-Параметры:
-  model_name      — имя модели в Luxonis HubAI (default: yolov6-nano)
-  conf_threshold  — порог уверенности (default 0.5)
-  fps             — FPS всех камер (default 15)
+Parameters:
+  model_name      — model name in Luxonis HubAI (default: yolov6-nano)
+  conf_threshold  — confidence threshold (default 0.5)
+  fps             — FPS of all cameras (default 15)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -57,7 +61,7 @@ class OakNode(LifecycleNode):
         self._near_pub   = None
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores re-declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -79,7 +83,7 @@ class OakNode(LifecycleNode):
         self._near_pub.on_activate(state)
 
         if not _depthai_available:
-            self.get_logger().error('depthai не установлен — degraded (oak_node)')
+            self.get_logger().error('depthai is not installed — degraded (oak_node)')
             self._det_pub.on_deactivate(state)
             self._near_pub.on_deactivate(state)
             return TransitionCallbackReturn.FAILURE
@@ -111,14 +115,14 @@ class OakNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def _run_oak(self):
-        # Официальный паттерн: https://docs.luxonis.com/software-v3/depthai/examples/
+        # Official pattern: https://docs.luxonis.com/software-v3/depthai/examples/
         # spatial_detection_network/spatial_detection/
         size = (640, 400)
 
         try:
             pipeline = dai.Pipeline()
 
-            # ── Камеры ────────────────────────────────────────────────────────
+            # ── Cameras ───────────────────────────────────────────────────────
             camRgb    = pipeline.create(dai.node.Camera).build(
                 dai.CameraBoardSocket.CAM_A, sensorFps=self._fps)
             monoLeft  = pipeline.create(dai.node.Camera).build(
@@ -126,14 +130,14 @@ class OakNode(LifecycleNode):
             monoRight = pipeline.create(dai.node.Camera).build(
                 dai.CameraBoardSocket.CAM_C, sensorFps=self._fps)
 
-            # ── StereoDepth — только то что в официальном примере ────────────
+            # ── StereoDepth — only what the official example uses ─────────────
             depthSource = pipeline.create(dai.node.StereoDepth)
             depthSource.setExtendedDisparity(True)
             monoLeft.requestOutput(size).link(depthSource.left)
             monoRight.requestOutput(size).link(depthSource.right)
 
-            # ── SpatialDetectionNetwork.build() — официальный паттерн ─────────
-            # build() внутри сам запрашивает нужный output у камеры и линкует depth.
+            # ── SpatialDetectionNetwork.build() — official pattern ────────────
+            # build() itself requests the needed output from the camera and links depth.
             modelDescription = dai.NNModelDescription(self._model_name)
             spatialNet = pipeline.create(dai.node.SpatialDetectionNetwork).build(
                 camRgb, depthSource, modelDescription)
@@ -143,17 +147,17 @@ class OakNode(LifecycleNode):
             spatialNet.setDepthUpperThreshold(8000)
             spatialNet.input.setBlocking(False)
 
-            # ── Очередь вывода ────────────────────────────────────────────────
+            # ── Output queue ──────────────────────────────────────────────────
             det_queue = spatialNet.out.createOutputQueue(maxSize=4, blocking=False)
 
         except Exception as e:
-            self.get_logger().error(f'Ошибка создания pipeline: {e}')
+            self.get_logger().error(f'Failed to create pipeline: {e}')
             return
 
         try:
             with pipeline:
                 pipeline.start()
-                self.get_logger().info('OAK-D Lite подключён (depthai v3)')
+                self.get_logger().info('OAK-D Lite connected (depthai v3)')
 
                 while self._running and pipeline.isRunning():
                     packet = det_queue.tryGet()
@@ -163,12 +167,12 @@ class OakNode(LifecycleNode):
                     self._process(packet.detections)
 
         except Exception as e:
-            self.get_logger().error(f'Ошибка OAK: {e}')
+            self.get_logger().error(f'OAK error: {e}')
 
     def _process(self, detections):
         objects = []
         for det in detections:
-            # v3: labelName встроен в модель; fallback на COCO_LABELS по индексу
+            # v3: labelName is built into the model; fall back to COCO_LABELS by index
             label = getattr(det, 'labelName', None)
             if not label:
                 label = (COCO_LABELS[det.label]
@@ -197,10 +201,10 @@ class OakNode(LifecycleNode):
         self._near_pub.publish(near_msg)
 
         self.get_logger().debug(
-            f'Объекты: {[o["label"] for o in objects]}, '
-            f'ближайший: {nearest["label"]} @ {nearest["z_mm"]:.0f}мм')
+            f'Objects: {[o["label"] for o in objects]}, '
+            f'nearest: {nearest["label"]} @ {nearest["z_mm"]:.0f} mm')
 
-    # destroy_node заменён на on_shutdown / on_deactivate (lifecycle)
+    # destroy_node replaced by on_shutdown / on_deactivate (lifecycle)
 
 
 def main():

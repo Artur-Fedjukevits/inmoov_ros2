@@ -2,22 +2,26 @@
 """
 face_recognition_node.py
 ========================
-Распознаёт личность по трекам лиц с обоих глаз.
+Recognizes identity from face tracks of both eyes.
 
-Режимы работы:
-  left-primary  — левый глаз активен: его track_id канонический,
-                  правый обогащает embed_buf совпадающего левого трека.
-  right-only    — левый недоступен > STALE_SEC: правый становится primary,
-                  публикует со своими track_id.
+Modes of operation:
+  left-primary  — left eye active: its track_id is canonical, the right eye
+                  enriches the embed_buf of the matching left track.
+  right-only    — left unavailable > STALE_SEC: right becomes primary,
+                  publishes with its own track_id.
 
-Переключение сопровождается сбросом кеша (чистый старт).
+Switching is accompanied by a cache reset (clean start).
 
-Подписки:
+Subscriptions:
   /face/tracks/left   (String JSON)
   /face/tracks/right  (String JSON)
 
-Публикует:
+Publishes:
   /face/identity  (String JSON)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -32,7 +36,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 from inmoov_msgs.srv import MemoryQuery
 
-_STALE_SEC = 2.0  # порог недоступности камеры (с)
+_STALE_SEC = 2.0  # camera unavailability threshold (s)
 
 
 def _bbox_area(bbox: list) -> float:
@@ -62,7 +66,7 @@ class FaceRecognitionNode(LifecycleNode):
         self._left_tracks  = []
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores repeated declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -123,7 +127,7 @@ class FaceRecognitionNode(LifecycleNode):
         try:
             tracks = json.loads(msg.data).get('tracks', [])
         except Exception as e:
-            self.get_logger().error(f'JSON ошибка left: {e}')
+            self.get_logger().error(f'JSON error (left): {e}')
             return
 
         now = time.time()
@@ -132,11 +136,11 @@ class FaceRecognitionNode(LifecycleNode):
             self._left_tracks = tracks
 
             if self._active_side != 'left':
-                self.get_logger().info('FaceRecognition: активен левый глаз')
+                self.get_logger().info('FaceRecognition: left eye active')
                 self._cache       = {}
                 self._active_side = 'left'
 
-            # Удаляем кеш исчезнувших левых треков
+            # Drop cache entries for left tracks that disappeared
             current_ids = {t['track_id'] for t in tracks}
             for tid in list(self._cache):
                 if tid not in current_ids:
@@ -152,7 +156,7 @@ class FaceRecognitionNode(LifecycleNode):
         try:
             tracks = json.loads(msg.data).get('tracks', [])
         except Exception as e:
-            self.get_logger().error(f'JSON ошибка right: {e}')
+            self.get_logger().error(f'JSON error (right): {e}')
             return
 
         now = time.time()
@@ -164,11 +168,11 @@ class FaceRecognitionNode(LifecycleNode):
             self._enrich_from_right(tracks)
             return
 
-        # Fallback: правый глаз становится primary
+        # Fallback: the right eye becomes primary
         with self._lock:
             if self._active_side != 'right':
                 self.get_logger().warn(
-                    'FaceRecognition: левый глаз недоступен → fallback на правый')
+                    'FaceRecognition: left eye unavailable → falling back to right')
                 self._cache       = {}
                 self._active_side = 'right'
                 self._left_tracks = []
@@ -180,7 +184,7 @@ class FaceRecognitionNode(LifecycleNode):
 
         self._process_tracks(tracks, now)
 
-    # ── Обогащение кеша левых треков embedding'ами правого глаза ─────────
+    # ── Enrich the left-track cache with the right eye's embeddings ──────
 
     def _enrich_from_right(self, right_tracks: list):
         if not right_tracks:
@@ -199,7 +203,7 @@ class FaceRecognitionNode(LifecycleNode):
             return
 
         if _cosine_sim(r_emb, l_emb) < self._cross_sim_thr:
-            return  # разные люди или низкое качество — не мёрджим
+            return  # different people or low quality — don't merge
 
         tid = l_primary['track_id']
         with self._lock:
@@ -211,7 +215,7 @@ class FaceRecognitionNode(LifecycleNode):
             if len(buf) > self._embed_buf_size * 2:
                 buf.pop(0)
 
-    # ── Унифицированная обработка треков ─────────────────────────────────
+    # ── Unified track processing ─────────────────────────────────────────
 
     def _process_tracks(self, tracks: list, now: float):
         for track in tracks:
@@ -254,7 +258,7 @@ class FaceRecognitionNode(LifecycleNode):
                 daemon=True,
             ).start()
 
-    # ── Утилиты ───────────────────────────────────────────────────────────
+    # ── Utilities ─────────────────────────────────────────────────────────
 
     @staticmethod
     def _average_embeddings(embeddings: list) -> list:
@@ -265,11 +269,11 @@ class FaceRecognitionNode(LifecycleNode):
             avg /= norm
         return avg.tolist()
 
-    # ── Запрос к БД ───────────────────────────────────────────────────────
+    # ── DB query ──────────────────────────────────────────────────────────
 
     def _recognize(self, track_id: int, embedding: list):
         if not self._mem_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn('/memory/query недоступен')
+            self.get_logger().warn('/memory/query unavailable')
             return
 
         req = MemoryQuery.Request()
@@ -282,14 +286,14 @@ class FaceRecognitionNode(LifecycleNode):
         done_event = threading.Event()
         future.add_done_callback(lambda _: done_event.set())
         if not done_event.wait(timeout=5.0):
-            self.get_logger().warn('Таймаут /memory/query')
+            self.get_logger().warn('Timeout on /memory/query')
             return
 
         try:
             resp   = future.result()
             result = json.loads(resp.response_json)
         except Exception as e:
-            self.get_logger().error(f'Ошибка сервиса: {e}')
+            self.get_logger().error(f'Service error: {e}')
             return
 
         is_known = result.get('person_id') is not None
@@ -311,18 +315,18 @@ class FaceRecognitionNode(LifecycleNode):
             if is_known and self._lock_known:
                 entry['locked'] = True
                 self.get_logger().info(
-                    f'Трек {track_id} → {identity["name"]} '
+                    f'Track {track_id} → {identity["name"]} '
                     f'(sim={identity["similarity"]:.3f}, side={self._active_side}) — LOCKED')
             elif entry['attempts'] >= self._lock_attempts:
                 entry['locked'] = True
                 self.get_logger().info(
-                    f'Трек {track_id} → неизвестный после {entry["attempts"]} попыток — LOCKED')
+                    f'Track {track_id} → unknown after {entry["attempts"]} attempts — LOCKED')
 
             identity['locked'] = entry.get('locked', False)
 
         self._publish(track_id, identity)
 
-    # ── Публикация ────────────────────────────────────────────────────────
+    # ── Publishing ────────────────────────────────────────────────────────
 
     def _publish(self, track_id: int, identity: dict):
         msg = String()

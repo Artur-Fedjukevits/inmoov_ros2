@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""
+inmoov_control.launch.py
+========================
+
+Standalone launch file for the inmoov_control package: starts both Arduino
+bridge nodes (right / left), joint_state_publisher and face_expressions_node.
+
+Launch arguments:
+  port_right  Serial port of the Right Arduino Mega
+              (default: /dev/serial/by-path/pci-0000:c6:00.3-usb-0:5:1.0-port0)
+  port_left   Serial port of the Left Arduino Mega
+              (default: /dev/serial/by-path/pci-0000:c6:00.3-usb-0:1.3:1.0-port0)
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
+"""
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument

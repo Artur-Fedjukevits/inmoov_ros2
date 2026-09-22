@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-behavior_manager.launch.py — запуск behavior_manager_node + identity_manager_node.
+behavior_manager.launch.py — launches behavior_manager_node + identity_manager_node.
 
-identity_manager — центральный поведенческий блок: агрегирует лицо, голос
-и память, публикует /social_context для Behavior Tree.
+identity_manager — the central behavioral hub: aggregates face, voice
+and memory, publishes /social_context for the Behavior Tree.
 
-Использование:
+Usage:
   ros2 launch inmoov_cognition behavior_manager.launch.py
   ros2 launch inmoov_cognition behavior_manager.launch.py tavily_api_key:=tvly-...
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import os
@@ -21,11 +25,11 @@ from launch_ros.actions import Node
 def generate_launch_description():
     args = [
         DeclareLaunchArgument('tavily_api_key',  default_value=os.environ.get('TAVILY_API_KEY', ''),
-                              description='Tavily Search API key (для web_search)'),
+                              description='Tavily Search API key (for web_search)'),
         DeclareLaunchArgument('bt_tick_rate_hz', default_value='10.0',
-                              description='Частота тика Behavior Tree'),
+                              description='Behavior Tree tick rate'),
         DeclareLaunchArgument('greet_cooldown_sec',  default_value='120.0'),
-        # llm_url — OpenAI-совместимый chat.completions endpoint (сейчас vLLM).
+        # llm_url — OpenAI-compatible chat.completions endpoint (currently vLLM).
         DeclareLaunchArgument('llm_url',
             default_value='http://192.168.10.118:18020/v1/chat/completions'),
         DeclareLaunchArgument('llm_fallback_url',

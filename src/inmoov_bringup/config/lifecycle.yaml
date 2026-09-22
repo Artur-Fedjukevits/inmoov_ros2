@@ -1,9 +1,13 @@
-# lifecycle.yaml — конфигурация тиров и политик для InmoovLifecycleManager
+# lifecycle.yaml — tier and policy configuration for InmoovLifecycleManager
 #
-# critical: нода обязательна, её отказ блокирует тир и всю систему
-# optional: retry → degraded (робот продолжает работать без неё)
+# critical: the node is mandatory, its failure blocks the tier and the whole system
+# optional: retry → degraded (the robot keeps running without it)
 #
-# Добавить CAN-bus ноги: вписать в tier 1, critical: true — и больше ничего не менять.
+# To add CAN-bus legs: list them in tier 1, critical: true — nothing else needs to change.
+#
+# Author: Artur Fedjukevits
+# Assisted by: Claude Code (Anthropic)
+# License: GNU General Public License v3.0 (see repository root LICENSE)
 
 lifecycle_manager:
   ros__parameters:
@@ -11,22 +15,22 @@ lifecycle_manager:
     retry_interval_sec: 10.0
     transition_timeout_sec: 30.0
     tier_advance_timeout_sec: 90.0
-    watchdog_interval_sec: 5.0       # как часто опрашивать get_state (сек)
-    watchdog_startup_delay_sec: 15.0 # не смотреть на ноды пока система поднимается
-    max_respawn_count: 5             # после N watchdog-recovery — сдаться
+    watchdog_interval_sec: 5.0       # how often to poll get_state (sec)
+    watchdog_startup_delay_sec: 15.0 # don't look at nodes while the system is still starting up
+    max_respawn_count: 5             # after N watchdog-recovery attempts — give up
 
     tiers:
-      # ── Тир 0: Foundation ────────────────────────────────────────────────
+      # ── Tier 0: Foundation ───────────────────────────────────────────────
       - id: 0
-        description: "Слой данных — должен быть готов раньше всего"
+        description: "Data layer — must be ready before everything else"
         nodes:
           - memory_node
         critical:
           - memory_node
 
-      # ── Тир 1: Hardware Drivers ──────────────────────────────────────────
+      # ── Tier 1: Hardware Drivers ─────────────────────────────────────────
       - id: 1
-        description: "Прямой доступ к железу"
+        description: "Direct hardware access"
         nodes:
           - audio_source_node
           - arduino_left
@@ -35,13 +39,13 @@ lifecycle_manager:
           - oak_node
           - sound_localization_node
         critical:
-          - arduino_left        # без Arduino нет движения
+          - arduino_left        # no Arduino means no motion
           - arduino_right
         # face_capture_node, oak_node, sound_localization_node: retry → degraded
 
-      # ── Тир 2: HW Consumers ─────────────────────────────────────────────
+      # ── Tier 2: HW Consumers ────────────────────────────────────────────
       - id: 2
-        description: "Ноды потребляющие железо первого тира"
+        description: "Nodes consuming tier-1 hardware"
         nodes:
           - wakeword_node
           - voice_detector_node
@@ -51,21 +55,21 @@ lifecycle_manager:
           - face_detection_node_left
           - face_detection_node_right
         critical: []
-        # все: retry → degraded (без них робот всё равно может работать, просто хуже)
+        # all: retry → degraded (the robot can still work without them, just worse)
 
-      # ── Тир 3: Processing ───────────────────────────────────────────────
+      # ── Tier 3: Processing ──────────────────────────────────────────────
       - id: 3
-        description: "Обработка сигналов"
+        description: "Signal processing"
         nodes:
           - face_tracker_node_left
           - face_tracker_node_right
           - voice_emotion_node
           - parakeet_stt_node
         critical: []
-        # все: retry → degraded (без них робот всё равно может работать, просто хуже)
-      # ── Тир 4: Intelligence ─────────────────────────────────────────────
+        # all: retry → degraded (the robot can still work without them, just worse)
+      # ── Tier 4: Intelligence ────────────────────────────────────────────
       - id: 4
-        description: "Распознавание и интеллект"
+        description: "Recognition and intelligence"
         nodes:
           - face_recognition_node
           - face_gallery_node
@@ -76,12 +80,12 @@ lifecycle_manager:
           - llm_node
           - openhab_bridge_node
         critical:
-          - llm_node             # без LLM нет ответов (есть fallback CPU-модель)
-        # остальные: degraded
+          - llm_node             # no LLM means no responses (there's a fallback CPU model)
+        # the rest: degraded
 
-      # ── Тир 5: Context & Orchestration ──────────────────────────────────
+      # ── Tier 5: Context & Orchestration ─────────────────────────────────
       - id: 5
-        description: "Контекст и управление поведением"
+        description: "Context and behavior control"
         nodes:
           - identity_manager_node
           - behavior_manager_node
@@ -89,10 +93,10 @@ lifecycle_manager:
           - identity_manager_node
           - behavior_manager_node
 
-      # ── Тир 6: Optional External ────────────────────────────────────────
+      # ── Tier 6: Optional External ───────────────────────────────────────
       - id: 6
-        description: "Опциональные внешние интерфейсы"
+        description: "Optional external interfaces"
         nodes:
           - telegram_bridge_node
         critical: []
-        # Полностью опциональный — degraded не влияет на работу
+        # Fully optional — degraded doesn't affect operation

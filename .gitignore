@@ -1,4 +1,4 @@
-# Сгенерированное colcon (install/ — не symlink-install, обычные копии из src/)
+# colcon build output (install/ is a plain copy, not symlink-install)
 build/
 install/
 log/
@@ -7,16 +7,16 @@ log/
 __pycache__/
 *.pyc
 
-# Большие модели/чекпоинты — не исходники проекта
+# Large models/checkpoints — not project sources
 wav2vec2_checkpoints/
 .depthai_cached_models/
 .cache/
 
-# Бэкапы, оставленные вручную при правках без git
+# Manual backups left behind while editing outside git
 *.bak-*
 
 # IDE
 .vscode/
 
-# Claude Code — персональные permission-настройки, не для коммита
+# Claude Code — personal permission settings, not for commit
 .claude/settings.local.json

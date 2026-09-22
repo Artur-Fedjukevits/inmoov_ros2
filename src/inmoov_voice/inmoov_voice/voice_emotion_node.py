@@ -2,19 +2,23 @@
 """
 voice_emotion_node.py
 =====================
-Определяет эмоцию по голосу с помощью SpeechBrain wav2vec2-IEMOCAP.
+Detects emotion from voice using SpeechBrain wav2vec2-IEMOCAP.
 
-Подписки:
-  audio_to_whisper  (Float32MultiArray) — аудиосегмент после VAD, 16kHz float32
+Subscribes:
+  audio_to_whisper  (Float32MultiArray) — post-VAD audio segment, 16kHz float32
   /robot_sleep      (Bool, latched)
 
-Публикует:
+Publishes:
   /voice/emotion  (String JSON)
   {
     "emotion":    "sad",
     "confidence": 0.87,
     "all":        {"neutral": 0.12, "angry": 0.01, "happy": 0.00, "sad": 0.87}
   }
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -35,7 +39,7 @@ _SB_TO_EMOTION = {
     'sad': 'sad',
 }
 
-_MIN_SAMPLES = 16000  # 1.0с @ 16kHz — wav2vec2 нужен запас для context окна
+_MIN_SAMPLES = 16000  # 1.0 s @ 16kHz — wav2vec2 needs headroom for its context window
 
 
 class VoiceEmotionNode(LifecycleNode):
@@ -50,7 +54,7 @@ class VoiceEmotionNode(LifecycleNode):
     # ── Lifecycle: Phase 2 ─────────────────────────────────────────────────
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores re-declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -61,7 +65,7 @@ class VoiceEmotionNode(LifecycleNode):
         self._min_conf = self.get_parameter('min_confidence').value
         savedir        = self.get_parameter('savedir').value
 
-        self.get_logger().info('Загрузка SpeechBrain emotion model (wav2vec2-IEMOCAP)...')
+        self.get_logger().info('Loading SpeechBrain emotion model (wav2vec2-IEMOCAP)...')
         from speechbrain.inference.classifiers import EncoderClassifier
         self._model = EncoderClassifier.from_hparams(
             'speechbrain/emotion-recognition-wav2vec2-IEMOCAP',
@@ -69,7 +73,7 @@ class VoiceEmotionNode(LifecycleNode):
         )
         self._labels = self._model.hparams.label_encoder.ind2lab
         self.get_logger().info(
-            f'Voice-emotion model готова. Классы: {list(self._labels.values())}')
+            f'Voice-emotion model ready. Classes: {list(self._labels.values())}')
 
         latched_qos = QoSProfile(
             depth=1,
@@ -109,7 +113,7 @@ class VoiceEmotionNode(LifecycleNode):
         audio = np.array(msg.data, dtype=np.float32)
         if len(audio) < _MIN_SAMPLES:
             self.get_logger().debug(
-                f'VoiceEmotion: аудио {len(audio)/16000:.2f}с < 1.0с — пропуск'
+                f'VoiceEmotion: audio {len(audio)/16000:.2f}s < 1.0s — skipping'
             )
             return
 
@@ -137,7 +141,7 @@ class VoiceEmotionNode(LifecycleNode):
 
             dur = len(audio) / 16000.0
             self.get_logger().info(
-                f'Голос-эмоция: {emotion} (conf={conf:.2f}, dur={dur:.1f}с)'
+                f'Voice emotion: {emotion} (conf={conf:.2f}, dur={dur:.1f}s)'
             )
 
             msg = String()
@@ -149,7 +153,7 @@ class VoiceEmotionNode(LifecycleNode):
             self._pub.publish(msg)
 
         except Exception as e:
-            self.get_logger().error(f'VoiceEmotion ошибка: {e}')
+            self.get_logger().error(f'VoiceEmotion error: {e}')
         finally:
             self._busy = False
 

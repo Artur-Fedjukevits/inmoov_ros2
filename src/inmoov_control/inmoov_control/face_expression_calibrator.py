@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-face_expression_calibrator.py — Калибровка выражений лица InMoov.
+face_expression_calibrator.py — InMoov face expression calibrator.
 
-Левая панель: список эмоций — кликни чтобы загрузить.
-Правая панель: слайдеры для 16 face-серво с группами.
-  Checkbox "✓" = серво входит в эту экспрессию (будет сохранено).
-  Slider двигает серво на роботе в реальном времени.
+Left panel: list of emotions — click one to load it.
+Right panel: sliders for the 16 face servos, grouped.
+  Checkbox "✓" = the servo is part of this expression (will be saved).
+  Slider moves the servo on the robot in real time.
 
-Сохранение: кнопка "Сохранить" пишет face_expressions_calibration.json
-рядом с face_expressions_node.py. Этот файл автоматически подхватывается при
-следующем запуске face_expressions_node.py.
+Saving: the "Сохранить" (Save) button writes face_expressions_calibration.json
+next to face_expressions_node.py. That file is picked up automatically the
+next time face_expressions_node.py is started.
 
-Запуск (ROS2 должен быть инициализирован):
+Run (ROS2 must be initialised):
   cd ~/ros2_ws && source install/setup.bash
   python3 src/inmoov_control/test/face_expression_calibrator.py
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -28,7 +32,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Пути
+# Paths
 # ─────────────────────────────────────────────────────────────────────────────
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,9 +41,9 @@ CALIBRATION_FILE = os.path.normpath(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Определения серво лица
+# Face servo definitions
 # (name, min_deg, max_deg, rest_deg, label, group)
-# Значения из InMoovLeft.ino / InMoovRight.ino
+# Values taken from InMoovLeft.ino / InMoovRight.ino
 # ─────────────────────────────────────────────────────────────────────────────
 
 SERVO_DEFS: list[tuple] = [
@@ -67,8 +71,8 @@ SERVO_LIMITS = {name: (mn, mx)                   for name, mn, mx, _, _, _      
 SERVO_NAMES  = [name for name, *_ in SERVO_DEFS]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Дефолтные позиции экспрессий (до калибровки)
-# Переведены из face_expressions_node.py: _MIN → min_angle, _MAX → max_angle
+# Default expression positions (before calibration)
+# Ported from face_expressions_node.py: _MIN → min_angle, _MAX → max_angle
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_defaults() -> dict[str, dict[str, int]]:
@@ -209,11 +213,11 @@ EXPRESSIONS_DEFAULTS = _build_defaults()
 EXPRESSION_NAMES = list(EXPRESSIONS_DEFAULTS.keys())
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JSON — загрузка / сохранение
+# JSON — load / save
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_calibration() -> dict[str, dict[str, int]]:
-    """Загружает JSON-файл калибровки, возвращает defaults если не существует."""
+    """Load the calibration JSON file; return defaults if it does not exist."""
     if os.path.exists(CALIBRATION_FILE):
         with open(CALIBRATION_FILE, encoding='utf-8') as f:
             data = json.load(f)
@@ -264,7 +268,7 @@ class FaceCalibNode(Node):
 # GUI
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Цвета групп
+# Group colours
 GROUP_COLORS = {
     'Веки':   '#4a6fa5',
     'Брови':  '#6a994e',
@@ -273,8 +277,8 @@ GROUP_COLORS = {
     'Глаза':  '#386641',
     'Рот':    '#c77dff',
 }
-ACTIVE_BG   = '#d6eaf8'   # фон активной строки (входит в экспрессию)
-INACTIVE_BG = '#f5f5f5'   # фон неактивной строки
+ACTIVE_BG   = '#d6eaf8'   # background of an active row (part of the expression)
+INACTIVE_BG = '#f5f5f5'   # background of an inactive row
 
 
 class FaceExpressionCalibrator:
@@ -285,16 +289,16 @@ class FaceExpressionCalibrator:
         self.root.geometry('900x680')
         self.root.resizable(True, True)
 
-        # Состояние
+        # State
         self._calib_data: dict[str, dict[str, int]] = load_calibration()
         self._current_expr: str = EXPRESSION_NAMES[0]
         self._auto_send    = tk.BooleanVar(value=True)
 
-        # Виджеты per-servo
-        self._vars:       dict[str, tk.IntVar]      = {}  # текущее значение слайдера
-        self._checks:     dict[str, tk.BooleanVar]  = {}  # включён ли в экспрессию
+        # Per-servo widgets
+        self._vars:       dict[str, tk.IntVar]      = {}  # current slider value
+        self._checks:     dict[str, tk.BooleanVar]  = {}  # whether it is part of the expression
         self._val_labels: dict[str, tk.Label]       = {}
-        self._rows:       dict[str, tk.Frame]       = {}  # frame строки
+        self._rows:       dict[str, tk.Frame]       = {}  # row frame
 
         self._build_ui()
         self._load_expression(self._current_expr)
@@ -302,7 +306,7 @@ class FaceExpressionCalibrator:
     # ── Build ─────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # ── Верхняя панель ────────────────────────────────────────────────────
+        # ── Top bar ───────────────────────────────────────────────────────────
         top = ttk.Frame(self.root)
         top.pack(side='top', fill='x', padx=8, pady=(6, 0))
 
@@ -318,11 +322,11 @@ class FaceExpressionCalibrator:
 
         ttk.Separator(self.root, orient='horizontal').pack(fill='x', padx=8, pady=4)
 
-        # ── Основная область ─────────────────────────────────────────────────
+        # ── Main area ─────────────────────────────────────────────────────────
         main = ttk.Frame(self.root)
         main.pack(fill='both', expand=True, padx=8)
 
-        # Левая колонка — список эмоций
+        # Left column — emotion list
         left = ttk.Frame(main, width=150)
         left.pack(side='left', fill='y', padx=(0, 8))
         left.pack_propagate(False)
@@ -346,11 +350,11 @@ class FaceExpressionCalibrator:
         ttk.Button(left, text='↩  REST все',
                    command=self._all_rest).pack(fill='x', pady=2)
 
-        # Правая колонка — слайдеры
+        # Right column — sliders
         right = ttk.Frame(main)
         right.pack(side='left', fill='both', expand=True)
 
-        # Заголовок
+        # Header
         hdr = ttk.Frame(right)
         hdr.pack(fill='x', pady=(0, 2))
         tk.Label(hdr, text='✓',  width=3,  anchor='center', font=('', 9, 'bold')).pack(side='left')
@@ -389,7 +393,7 @@ class FaceExpressionCalibrator:
 
         self._build_sliders()
 
-        # ── Нижняя панель ─────────────────────────────────────────────────────
+        # ── Bottom bar ────────────────────────────────────────────────────────
         ttk.Separator(self.root, orient='horizontal').pack(fill='x', padx=8, pady=4)
 
         bot = ttk.Frame(self.root)
@@ -411,7 +415,7 @@ class FaceExpressionCalibrator:
         current_group = None
 
         for name, mn, mx, rest, label, group in SERVO_DEFS:
-            # Разделитель группы
+            # Group separator
             if group != current_group:
                 current_group = group
                 color = GROUP_COLORS.get(group, '#888')
@@ -478,7 +482,7 @@ class FaceExpressionCalibrator:
     # ── Expression logic ──────────────────────────────────────────────────────
 
     def _load_expression(self, expr_name: str):
-        """Загружает экспрессию в слайдеры и подсвечивает активные серво."""
+        """Load an expression into the sliders and highlight the active servos."""
         self._current_expr = expr_name
         expr_data = self._calib_data.get(expr_name, {})
         active_count = 0
@@ -502,7 +506,7 @@ class FaceExpressionCalibrator:
         n_active_str = f'{active_count} серво активно' if active_count else 'все серво → REST'
         self._status.set(f'{expr_name.upper()} — {n_active_str}')
 
-        # Отправляем полное состояние на робот
+        # Send the full state to the robot
         self._send_all()
 
     def _update_row_style(self, name: str, active: bool):
@@ -519,16 +523,16 @@ class FaceExpressionCalibrator:
         self._update_row_style(name, self._checks[name].get())
 
     def _set_servo(self, name: str, deg: int):
-        """Устанавливает слайдер и отправляет команду."""
-        self._vars[name].set(deg)  # trace вызовет send_single если auto_send
+        """Set the slider and send the command."""
+        self._vars[name].set(deg)  # the trace callback calls send_single if auto_send is on
 
     def _send_all(self):
-        """Отправляет все текущие позиции слайдеров на робот."""
+        """Send all current slider positions to the robot."""
         positions = {name: self._vars[name].get() for name in SERVO_NAMES}
         self.node.send_batch(positions)
 
     def _all_rest(self):
-        """Сбрасывает все слайдеры в REST и снимает чекбоксы."""
+        """Reset all sliders to REST and clear the checkboxes."""
         for name in SERVO_NAMES:
             self._checks[name].set(False)
             self._update_row_style(name, False)
@@ -537,7 +541,7 @@ class FaceExpressionCalibrator:
     # ── Save / Reset ──────────────────────────────────────────────────────────
 
     def _save_expression(self):
-        """Сохраняет только отмеченные серво для текущей экспрессии."""
+        """Save only the checked servos for the current expression."""
         expr = self._current_expr
         positions = {
             name: self._vars[name].get()
@@ -551,7 +555,7 @@ class FaceExpressionCalibrator:
         self._status.set(f'✓ Сохранено: {expr} ({n} серво) → {os.path.basename(CALIBRATION_FILE)}')
 
     def _reset_to_defaults(self):
-        """Сбрасывает текущую экспрессию к defaults из MRL."""
+        """Reset the current expression to the MRL defaults."""
         expr = self._current_expr
         if messagebox.askyesno('Сброс', f'Сбросить "{expr}" к defaults (MRL)?'):
             self._calib_data[expr] = dict(EXPRESSIONS_DEFAULTS.get(expr, {}))

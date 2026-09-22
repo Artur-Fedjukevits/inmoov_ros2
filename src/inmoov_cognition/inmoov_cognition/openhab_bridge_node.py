@@ -3,33 +3,37 @@
 """
 openhab_bridge_node.py
 ======================
-Мост между OpenHAB и ROS2.
+Bridge between OpenHAB and ROS2.
 
-Загружает список устройств (тег ChatGPT) при старте и подписывается на
-WebSocket-поток OpenHAB для получения обновлений состояния в реальном времени.
+Loads the device list (tagged ChatGPT) on startup and subscribes to OpenHAB's
+WebSocket stream for real-time state updates.
 
-Публикует:
-  /openhab_items  (String, JSON) — полный список с актуальными state.
-                  Публикуется при старте и при каждом изменении состояния.
-  /openhab_schema (String, JSON) — статичная схема: name/label/type/options.
-                  Публикуется один раз при старте (и по таймеру для опоздавших подписчиков).
-  /telegram_push  (String, JSON) — push-уведомления о критических сенсорах.
-                  Rate limit: не чаще одного раза в ALERT_RATE_LIMIT_SEC (900 с = 15 мин)
-                  на один сенсор. При нормализации — однократное ✅ сообщение.
+Publishes:
+  /openhab_items  (String, JSON) — full list with current state.
+                  Published on startup and on every state change.
+  /openhab_schema (String, JSON) — static schema: name/label/type/options.
+                  Published once on startup (and on a timer for late subscribers).
+  /telegram_push  (String, JSON) — push notifications about critical sensors.
+                  Rate limit: at most once per ALERT_RATE_LIMIT_SEC (900 s = 15 min)
+                  per sensor. On recovery — a single-shot ✅ message.
 
-Параметры:
-  openhab_url       — базовый URL OpenHAB (default: http://192.168.10.118:8080)
-  items_tag         — тег фильтрации Items (default: ChatGPT)
-  reconnect_sec     — пауза перед переподключением WS (default: 15.0)
-  schema_repeat_sec — интервал повтора публикации schema (default: 10.0)
-  ws_ping_interval  — интервал WS ping keepalive в секундах (default: 30)
+Parameters:
+  openhab_url       — OpenHAB base URL (default: http://192.168.10.118:8080)
+  items_tag         — Items filter tag (default: ChatGPT)
+  reconnect_sec     — pause before WS reconnect (default: 15.0)
+  schema_repeat_sec — schema re-publish interval (default: 10.0)
+  ws_ping_interval  — WS ping keepalive interval in seconds (default: 30)
 
-Мониторинг окружающей среды (→ Telegram push, НЕ в базу напоминаний):
-  Температура: > 25°C или < 16°C
-  Влажность:   > 70%  или < 30%
+Environment monitoring (→ Telegram push, NOT the reminders DB):
+  Temperature: > 25°C or < 16°C
+  Humidity:    > 70%  or < 30%
   CO₂:         > 1200 ppm
   VOC:         > 300 ppb
-  Батарея:     < 20%
+  Battery:     < 20%
+
+Author: Artur Fedjukevits
+Assisted by: Claude Code (Anthropic)
+License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
@@ -46,9 +50,9 @@ from inmoov_memory.openhab_alerts import (
     classify_sensor, parse_value, evaluate_threshold,
 )
 
-# ── Константы мониторинга ──────────────────────────────────────────────────────
+# ── Monitoring constants ────────────────────────────────────────────────────
 
-ALERT_RATE_LIMIT_SEC = 900.0  # 15 минут между повторными алертами одного сенсора
+ALERT_RATE_LIMIT_SEC = 900.0  # 15 minutes between repeated alerts for the same sensor
 
 
 class OpenHABBridgeNode(LifecycleNode):
@@ -66,7 +70,7 @@ class OpenHABBridgeNode(LifecycleNode):
         self._alert_last_sent = {}
 
     def _dp(self, name, default=None):
-        """Безопасный declare_parameter: игнорирует повторное объявление при re-configure."""
+        """Safe declare_parameter: ignores re-declaration on re-configure."""
         if not self.has_parameter(name):
             self.declare_parameter(name, default)
 
@@ -100,14 +104,14 @@ class OpenHABBridgeNode(LifecycleNode):
             self._publish_schema()
             self._check_all_alerts()
         else:
-            self.get_logger().error('Не удалось загрузить items из OpenHAB при старте')
+            self.get_logger().error('Failed to load items from OpenHAB on startup')
 
         self._stop_event.clear()
         threading.Thread(target=self._ws_worker, daemon=True).start()
 
         self.get_logger().info(
-            f'OpenHAB bridge активирован. URL: {self.openhab_url}, '
-            f'tag: {self.items_tag}, устройств: {len(self._cache)}')
+            f'OpenHAB bridge activated. URL: {self.openhab_url}, '
+            f'tag: {self.items_tag}, devices: {len(self._cache)}')
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
@@ -132,7 +136,7 @@ class OpenHABBridgeNode(LifecycleNode):
         self._stop_event.set()
         return TransitionCallbackReturn.SUCCESS
 
-    # ── Загрузка Items ─────────────────────────────────────────────────────────
+    # ── Loading Items ────────────────────────────────────────────────────────
 
     def _load_items(self) -> bool:
         url = f'{self.openhab_url}/rest/items?tags={self.items_tag}'
@@ -145,7 +149,7 @@ class OpenHABBridgeNode(LifecycleNode):
                     self._cache[item['name']] = self._normalize(item)
             return True
         except Exception as e:
-            self.get_logger().warn(f'Ошибка загрузки items: {e}')
+            self.get_logger().warn(f'Error loading items: {e}')
             return False
 
     def _normalize(self, item: dict) -> dict:
@@ -161,7 +165,7 @@ class OpenHABBridgeNode(LifecycleNode):
             entry['options'] = [o['value'] for o in opts]
         return entry
 
-    # ── WebSocket Worker ───────────────────────────────────────────────────────
+    # ── WebSocket worker ─────────────────────────────────────────────────────
 
     def _ws_worker(self):
         ws_url = (self.openhab_url
@@ -180,17 +184,17 @@ class OpenHABBridgeNode(LifecycleNode):
                 self._ws.run_forever(ping_interval=self._ping_interval, ping_timeout=10)
             except Exception as e:
                 if not self._stop_event.is_set():
-                    self.get_logger().warn(f'WS: исключение в run_forever ({e})')
+                    self.get_logger().warn(f'WS: exception in run_forever ({e})')
 
             if not self._stop_event.is_set():
-                self.get_logger().info(f'WS: переподключение через {self.reconnect_sec}с...')
+                self.get_logger().info(f'WS: reconnecting in {self.reconnect_sec}s...')
                 time.sleep(self.reconnect_sec)
                 if self._load_items():
                     self._publish_items()
                     self._check_all_alerts()
 
     def _on_ws_open(self, ws):
-        self.get_logger().info('WS: подключён к OpenHAB')
+        self.get_logger().info('WS: connected to OpenHAB')
 
     def _on_ws_message(self, ws, message):
         try:
@@ -227,47 +231,48 @@ class OpenHABBridgeNode(LifecycleNode):
 
     def _on_ws_error(self, ws, error):
         if not self._stop_event.is_set():
-            self.get_logger().warn(f'WS: ошибка ({error})')
+            self.get_logger().warn(f'WS: error ({error})')
 
     def _on_ws_close(self, ws, close_status_code, close_msg):
         if not self._stop_event.is_set():
             self.get_logger().warn(
-                f'WS: соединение закрыто (код={close_status_code}, msg={close_msg})'
+                f'WS: connection closed (code={close_status_code}, msg={close_msg})'
             )
 
-    # ── Мониторинг окружающей среды ────────────────────────────────────────────
+    # ── Environment monitoring ───────────────────────────────────────────────
 
     def _send_telegram(self, text: str):
-        """Публикует push-уведомление в /telegram_push (→ telegram_bridge_node)."""
+        """Publishes a push notification to /telegram_push (→ telegram_bridge_node)."""
         msg = String()
         msg.data = json.dumps({'text': text}, ensure_ascii=False)
         self._telegram_push.publish(msg)
 
     def _check_all_alerts(self):
-        """Проверяет все закэшированные items при старте и после переподключения."""
+        """Checks all cached items on startup and after reconnect."""
         with self._lock:
             snapshot = [(v['name'], v['type'], v['state']) for v in self._cache.values()]
         for name, typ, state in snapshot:
             self._check_alert(name, typ, state)
 
     def _check_alert(self, item_name: str, item_type: str, state_str: str):
-        """Проверяет один item на критические пороги и отправляет Telegram push."""
+        """Checks a single item against critical thresholds and sends a Telegram push."""
         sensor_type = classify_sensor(item_name, item_type)
         if sensor_type is None:
             return
 
-        # Switch BatteryLow: ON/OFF — не требует числового парсинга
+        # Switch BatteryLow: ON/OFF — no numeric parsing needed
         if sensor_type == 'battery_low':
             if state_str not in ('ON', 'OFF'):
-                return  # NULL/UNDEF — пропускаем
+                return  # NULL/UNDEF — skip
             is_critical = (state_str == 'ON')
             if is_critical:
                 raw = item_name[: item_name.lower().rfind('_batterylow')]
+                # NOTE: user-facing Telegram message text — stays in Russian.
                 alert_msg = f'Садится батарейка: {raw.replace("_", " ")}'
             else:
                 alert_msg = ''
         else:
-            # Числовые датчики
+            # Numeric sensors
             value = parse_value(state_str)
             if value is None:
                 self._alerted_items.discard(item_name)
@@ -282,12 +287,12 @@ class OpenHABBridgeNode(LifecycleNode):
                 self._alert_last_sent[item_name] = now
                 self._send_telegram(f'⚠️ {alert_msg}')
                 self.get_logger().warn(
-                    f'ALERT [{item_name}]: {alert_msg} (значение: {state_str}) → Telegram'
+                    f'ALERT [{item_name}]: {alert_msg} (value: {state_str}) → Telegram'
                 )
             else:
                 self.get_logger().debug(
-                    f'ALERT [{item_name}]: rate limit, пропускаем '
-                    f'({int(ALERT_RATE_LIMIT_SEC - (now - last))}с до следующего)'
+                    f'ALERT [{item_name}]: rate limited, skipping '
+                    f'({int(ALERT_RATE_LIMIT_SEC - (now - last))}s until next)'
                 )
         else:
             if item_name in self._alerted_items:
@@ -295,12 +300,13 @@ class OpenHABBridgeNode(LifecycleNode):
                 self._alert_last_sent.pop(item_name, None)
                 with self._lock:
                     label = self._cache.get(item_name, {}).get('label', item_name)
+                # NOTE: user-facing Telegram message text — stays in Russian.
                 self._send_telegram(f'✅ {label}: значение вернулось к норме ({state_str})')
                 self.get_logger().info(
-                    f'ALERT СНЯТ [{item_name}]: значение вернулось к норме ({state_str})'
+                    f'ALERT CLEARED [{item_name}]: value back to normal ({state_str})'
                 )
 
-    # ── Публикация ─────────────────────────────────────────────────────────────
+    # ── Publishing ───────────────────────────────────────────────────────────
 
     def _publish_items(self):
         with self._lock:

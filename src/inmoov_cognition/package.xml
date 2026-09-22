@@ -2,10 +2,10 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>inmoov_cognition</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="fedjukevitsh@gmail.com">artur</maintainer>
-  <license>TODO: License declaration</license>
+  <version>0.1.0</version>
+  <description>Cognition layer for the InMoov robot — Behavior Tree (Data/Decision/Action), social context (IdentityManager), LLM-driven dialogue and tool calls, and bridges to openHAB and Telegram</description>
+  <maintainer email="fedjukevitsh@gmail.com">Artur Fedjukevits</maintainer>
+  <license>GPL-3.0-only</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
