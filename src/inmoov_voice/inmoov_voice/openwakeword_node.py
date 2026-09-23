@@ -42,6 +42,7 @@ class WakeWordNode(LifecycleNode):
         self.activation_count = 0
         self.wake_pub         = None
         self.score_pub        = None
+        self._active          = False   # set in on_activate — inference only when active
 
     def _dp(self, name, default=None):
         """Safe declare_parameter: ignores re-declaration on re-configure."""
@@ -77,9 +78,11 @@ class WakeWordNode(LifecycleNode):
     def on_activate(self, state):
         self.wake_pub.on_activate(state)
         self.score_pub.on_activate(state)
+        self._active = True
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
+        self._active = False
         self.wake_pub.on_deactivate(state)
         self.score_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
@@ -94,6 +97,9 @@ class WakeWordNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def _audio_callback(self, msg: Float32MultiArray):
+        # The subscription exists from on_configure — skip inference until activated
+        if not self._active:
+            return
         # float32 [-1, 1] → int16 (openWakeWord expects int16)
         audio = (np.array(msg.data, dtype=np.float32) * 32768.0).astype(np.int16)
 

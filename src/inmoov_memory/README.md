@@ -94,6 +94,7 @@ Declared in `on_configure` (safe against re-declaration on re-configure):
 | `telegram_reminder_person_id` | int | `5` | `persons.id` whose due reminders are pushed to Telegram; `<= 0` disables the timer. The default is specific to the author's database. |
 | `telegram_reminder_check_sec` | double | `60.0` | Period (s) of the Telegram-reminder check. |
 | `reminder_default_time` | string | `07:00` | Time of day used for reminders that have a date but no `trigger_time`. |
+| `gallery_dir` | string | `/home/artur/inmoov_faces` | Face photo gallery root (same as `face_gallery_node`'s `gallery_dir`); `merge_persons` removes `persons/<from_id>_*` there. |
 | `episodic_retention_days` | int | `7` | Episodic sliding window: episodes older than this with low importance are purged. |
 | `episodic_cleanup_max_importance` | double | `0.5` | Only episodes with `importance <=` this are purged; more important ones are kept. |
 | `episodic_cleanup_interval_sec` | double | `21600.0` | Period (s) of the episodic cleanup timer (also run once on activation); `<= 0` disables it. |
@@ -199,7 +200,7 @@ arrays of floats and are L2-normalised by the node):
 | `save_episode` | `summary`, `raw_text?`, `participants?`, `location?` (current room), `importance?` (0.3), `type?` (`conversation`), `emotion_tag?` (`neutral`) | `{episode_id, saved: true}`. |
 | `get_working_memory` | – | `{working_memory: {...}}`. |
 | `update_working_memory` | `location?` `{room, landmark, coordinates}`, `robot_state?` `{mode, battery, current_task, facing}`, `environment?` `{people, noise, lighting}` | `{updated: true}`. |
-| `get_memory_context` | `limit?` (5) | `{context: "<text>"}` — same text as `/memory/context` (note: header wording differs from `MemoryManager.build_system_prompt`). |
+| `get_memory_context` | `limit?` (5) | `{context: "<text>"}` — same text as `/memory/context`. |
 
 *Reminders* (see [Reminder system](#reminder-system-and-openhab-alerts))
 
@@ -218,24 +219,12 @@ it may be read back to the user by the LLM.
 
 **Known issues / TODOs (from code and cross-checks)**
 
-- Several paths are hardcoded and ignore the parameters: `merge_persons`
-  deletes photo directories under `/home/artur/inmoov_faces/persons/` and opens
-  `/home/artur/inmoov_episodic.db` directly, instead of using
-  `episodic_db_path`. On another machine the participant rename silently fails
-  (logged as a warning) and no photo directory is removed.
 - All ops run on the service callback of the node's default (single-threaded)
   executor; LLM-based work is moved to background threads, but a slow
   `merge_persons` or ChromaDB query blocks other requests.
-- Code fences returned by the LLM are stripped with `str.lstrip('```json')`,
-  which strips a *character set*, not a prefix; it works for normal answers but
-  can eat leading `j`, `s`, `o`, `n` characters of a raw JSON answer (JSON
-  arrays start with `[`, so in practice it is harmless).
 - `_gallery_add` / `_gallery_remove` keep the RAM cache in sync, but
   `persons.embedding` (the mean) is only recomputed through
   `gallery_rebuild_embedding`.
-- `memory_node` does not use `MemoryManager.build_system_prompt`,
-  `get_tool_definitions` / `execute_tool` or the episodic clean-up/migration
-  helpers; see [Known issues to verify](#known-issues-to-verify).
 
 ### `MemoryManager` (`inmoov_memory/memory_manager.py`)
 
@@ -257,14 +246,11 @@ given the semantic facts share the episodic DB file.
   `temperature 0.1`, `max_tokens 512`, `timeout 30 s` and
   `chat_template_kwargs: {enable_thinking: false}` (a vLLM/Qwen extension); the
   bearer token is sent only if configured.
-- `build_system_prompt`, `get_tool_definitions` (OpenAI tool schema for
-  `search_memory`, `save_fact`, `get_episode`, `update_location`) and
-  `execute_tool` are provided as a library API but are **not used by
-  `memory_node`** or any other package in this workspace; `llm_node` in
-  `inmoov_cognition` has its own prompt building and tool set and reaches memory
-  through `/memory/query`.
-- `ROBOT_PERSONA` (Russian) is the persona used by `build_system_prompt` only.
-- `wipe_episodic` and `status` are helper utilities, not called by the node.
+- The LLM context (`/memory/context`) is assembled by `memory_node` itself;
+  `llm_node` in `inmoov_cognition` has its own prompt and tool set and reaches
+  memory through `/memory/query`.
+- `strip_code_fence()` removes a surrounding markdown fence from LLM answers
+  before JSON parsing (shared with `memory_node`).
 
 ### Memory layers
 
@@ -287,14 +273,13 @@ summary TEXT NOT NULL, raw_text TEXT, location TEXT, emotion_tag TEXT DEFAULT 'n
 importance REAL DEFAULT 0.3, migrated INTEGER DEFAULT 0
 ```
 
-Indexes `idx_ep_date(date)` and `idx_ep_importance(importance)`. The module
+Indexes `idx_ep_date(date)` and `idx_ep_importance(importance)`. The
 sliding window is enforced by `memory_node`: every
 `episodic_cleanup_interval_sec` (and once on activation) `cleanup()` deletes
 episodes older than `episodic_retention_days` with
 `importance <= episodic_cleanup_max_importance`. Important episodes are kept;
 when `after_conversation` extracts facts from an episode (importance `>= 0.6`)
-the episode is marked `migrated = 1`. `get_unmigrated_important()` is
-currently unused.
+the episode is marked `migrated = 1`.
 
 **`SemanticMemory`** — table `facts`:
 
@@ -312,8 +297,8 @@ document text `"<subject> — <predicate>: <value>"` and id
 (`score = 1 - distance`, source `vector`), then supplements with a SQLite
 `LIKE` search (source `sqlite`) if fewer than `limit` results were found.
 If `chromadb` is not installed or fails to initialise, only SQLite is used
-(a warning is logged). `delete_fact` removes only the SQLite row (not the
-ChromaDB entry).
+(a warning is logged). `delete_fact` removes both the SQLite row and the
+ChromaDB entry.
 
 ## Reminder system and openhab_alerts
 
@@ -403,7 +388,7 @@ plain parameters; nothing is created under the ROS install prefix.
 | Semantic DB (`semantic_db_path`) | `/home/artur/inmoov_semantic.db` | `facts` |
 | ChromaDB (`chroma_path`) | `/home/artur/inmoov_chroma` | collection `robot_memory` |
 | Reminder DB (`reminder_db_path`) | `/home/artur/inmoov_reminders.db` | `reminders` |
-| Face photo gallery (not managed here) | `/home/artur/inmoov_faces/persons/<id>_<name>/` | JPG/PNG photos; hardcoded in `merge_persons`, default `--gallery` of `rebuild_gallery.py` |
+| Face photo gallery (not managed here) | `/home/artur/inmoov_faces/persons/<id>_<name>/` | JPG/PNG photos; `gallery_dir` parameter (used by `merge_persons`, must match `face_gallery_node`'s `gallery_dir`), default `--gallery` of `rebuild_gallery.py` |
 
 Embeddings: face embeddings are InsightFace `buffalo_l` vectors (512-d, stored
 as float32, normalised on load); voice embeddings are 192-d ECAPA-TDNN vectors
@@ -451,9 +436,10 @@ face are skipped and counted. Output is a progress line per person
 (`+` added, `.` skipped).
 
 Notes: it does not touch `persons.embedding` (call `gallery_rebuild_embedding`
-per person if you need the mean refreshed), nor the voice gallery. It prints
-"Notify memory_node to reload:" at the end but does not print the command
-(see the command above). Requires `insightface`, `opencv-python`, `numpy`.
+per person if you need the mean refreshed), nor the voice gallery. The
+`DELETE` of the old gallery and all inserts run in a single transaction, so an
+interruption (Ctrl+C, crash) rolls back to the old gallery. At the end it
+prints the `reload_gallery` command shown above. Requires `insightface`, `opencv-python`, `numpy`.
 
 ## Launch
 
@@ -464,9 +450,6 @@ The package has **no launch file of its own**. `memory_node` is started by:
   `llm_url`, `llm_model`, `bearer_token` come from the launch arguments
   `memory_db_path`, `llm_url`, `llm_model`, `llm_bearer_token`
   (`llm_bearer_token` defaults to the `VLLM_BEARER_TOKEN` environment variable).
-- `inmoov_cognition/launch/inmoov_full.launch.py` — as a plain `Node`; since
-  `memory_node` is a lifecycle node this leaves it in `Unconfigured` until it is
-  transitioned by hand.
 
 Manual start:
 
@@ -506,27 +489,9 @@ ros2 lifecycle set /memory_node activate
 
 ## Known issues to verify
 
-- `merge_persons` uses hardcoded `/home/artur/...` paths (photo directory,
-  episodic DB) instead of the configured parameters.
-- `/memory/context` (node) and `MemoryManager.build_system_prompt` use different
-  section headers ("Последние события" vs "Что происходило сегодня"); only the
-  node version is published.
-- `openhab_alerts.py` docstring says `identity_manager_node` uses it to verify
-  environment reminders; in the current workspace only `openhab_bridge_node`
-  imports it, and `identity_manager_node` states that environment reminders are
-  no longer stored in the DB.
-- `openhab_bridge_node`'s docstring lists slightly different thresholds
-  (temperature `> 25 °C`, battery `< 20 %`) than the constants in
-  `openhab_alerts.py` (`> 27 °C`, `< 10 %`); the constants in this package are
-  what the code uses.
-- `SemanticMemory.delete_fact` does not remove the ChromaDB entry.
 - Shipped defaults contain author-specific values: `/home/artur/...` paths, the
   LAN address `192.168.10.118:18020` for `llm_url`, `telegram_reminder_person_id=5`
   and `qwen3.8-27b` as model name — override them on your installation.
-- `rebuild_gallery.py` commits `DELETE FROM person_gallery` before it processes
-  any photo, so an interruption mid-run leaves a partial gallery (the missing
-  directory and model-loading failures are detected before the delete). Back up
-  the DB before running it.
 - No automated tests are shipped for this package (`package.xml` lists only the
   ament lint test dependencies).
 

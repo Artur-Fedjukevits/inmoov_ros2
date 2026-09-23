@@ -9,7 +9,7 @@ microphones on a CM6206 sound card (USB 0d8c:0102, ALSA name
 GCC-PHAT (TDOA), NOT via inter-channel level difference (ILD) and NOT
 via a physical angle model.
 
-History (see project_sound_localization_gcc_phat.md for details):
+History:
 1) The original broadband GCC-PHAT worked cleanly on an open table
    (±90°, hiss noise), but once mounted in the head's ears it produced
    physically impossible delays: the open skull skeleton (servos,

@@ -38,6 +38,7 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import collections
+import os
 import time
 
 import rclpy
@@ -80,6 +81,8 @@ class VoiceDetectorNode(LifecycleNode):
         self._dp('speaker_verification',  True)
         self._dp('sv_threshold',          0.55)
         self._dp('sv_segment_sec',        1.0)
+        self._dp('sv_savedir',
+                 os.path.expanduser('~/.cache/speechbrain/spkrec-ecapa-voxceleb'))
 
         self.rate              = self.get_parameter('sample_rate').value
         self.vad_threshold     = self.get_parameter('vad_threshold').value
@@ -134,7 +137,7 @@ class VoiceDetectorNode(LifecycleNode):
                 self.get_logger().info('Loading ECAPA-TDNN (spkrec-ecapa-voxceleb)...')
                 self._sv_encoder = EncoderClassifier.from_hparams(
                     source='speechbrain/spkrec-ecapa-voxceleb',
-                    savedir='/home/artur/.cache/speechbrain/spkrec-ecapa-voxceleb',
+                    savedir=self.get_parameter('sv_savedir').value,
                     run_opts={'device': 'cpu'},
                 )
                 self.get_logger().info(

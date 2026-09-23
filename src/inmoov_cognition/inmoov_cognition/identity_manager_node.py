@@ -254,8 +254,7 @@ class IdentityManagerNode(LifecycleNode):
                     # We tried selecting by embedding similarity here instead
                     # of bbox area (live bug 2026-08-31: hijacking someone else's/
                     # a false track) — reverted 2026-08-31: it did not fix the
-                    # head-drift itself (see project_face_search_retry.md), just
-                    # added complexity. Left as it was — by bbox area.
+                    # head-drift itself, just added complexity. Left as it was — by bbox area.
                     best = max(tracks, key=lambda t: (
                         (t['bbox'][2] - t['bbox'][0]) * (t['bbox'][3] - t['bbox'][1])))
                     new_track = best['track_id']

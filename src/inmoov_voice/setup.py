@@ -10,9 +10,6 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', [
-            'launch/voice.launch.py',
-        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -34,7 +31,7 @@ setup(
             'tts_node             = inmoov_voice.tts_node:main',
 'voice_emotion_node   = inmoov_voice.voice_emotion_node:main',
             'sound_localization_node = inmoov_voice.sound_localization_node:main',
-            'diagnose             = scripts.diagnose:main',
+            'diagnose             = inmoov_voice.diagnose:main',
         ],
     },
 )

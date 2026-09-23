@@ -4,8 +4,8 @@ parakeet_stt_node.py
 =====================
 Primary STT on NVIDIA Parakeet-TDT-0.6B-v3 (ONNX, int8, CPU).
 Replaced whisper.cpp (removed from the system 2026-08-27) — 2-4x faster in
-live use (RTF 0.07-0.23 vs. 0.4-0.6 for whisper large-v3-turbo/Vulkan iGPU),
-see project_stt_parakeet_eval.md. The model (onnx-asr) loads directly into
+live use (RTF 0.07-0.23 vs. 0.4-0.6 for whisper large-v3-turbo/Vulkan iGPU).
+The model (onnx-asr) loads directly into
 the process — no separate HTTP server needed.
 
 Subscribes:

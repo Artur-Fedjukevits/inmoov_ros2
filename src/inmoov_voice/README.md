@@ -12,8 +12,8 @@ The **LLM** stage of the dialogue loop is *not* in this package — it lives in
 All nodes are ROS2 **managed-lifecycle nodes** (`rclpy.lifecycle.LifecycleNode`)
 and stay in `Unconfigured` until something drives them through
 `configure` → `activate`. In the full robot this is done by
-`lifecycle_manager` in [`inmoov_bringup`](../inmoov_bringup/README.md); see
-[Launch](#launch) for what that means for this package's own launch file.
+`lifecycle_manager` in [`inmoov_bringup`](../inmoov_bringup/README.md) (see
+[Launch](#launch)).
 
 Everything here is Python (`ament_python`). Runtime strings that are matched
 against or spoken in Russian (the wake phrase "Эй Лёня", TTS text, the STT
@@ -78,7 +78,7 @@ Executables registered in [`setup.py`](setup.py):
 | `tts_node` | `inmoov_voice.tts_node:main` | `tts_node` |
 | `voice_emotion_node` | `inmoov_voice.voice_emotion_node:main` | `voice_emotion_node` |
 | `sound_localization_node` | `inmoov_voice.sound_localization_node:main` | `sound_localization_node` |
-| `diagnose` | `scripts.diagnose:main` | (not a node, see [below](#scriptsdiagnosepy)) |
+| `diagnose` | `inmoov_voice.diagnose:main` | (not a node, see [below](#diagnose)) |
 
 Topic names below are written as in the code; names without a leading `/`
 are relative to the node namespace (empty in the default launch, so they
@@ -137,7 +137,7 @@ lifecycle manager retries); `on_deactivate` closes the stream.
   `wireplumber`.
 - If 5 stream restarts happen within 30 s the node assumes a reader thread is
   stuck in PortAudio's C-level busy-retry loop, logs `fatal` and calls
-  `os._exit(1)`; the launch file's `respawn=True` then brings up a clean
+  `os._exit(1)`; the bringup launch file's `respawn=True` then brings up a clean
   process.
 
 ### `wakeword_node`
@@ -164,10 +164,8 @@ the first model key returned is used as the score.
 | `wake_detected` | `std_msgs/Bool` | publish (lifecycle, depth 10) | `True` on activation (debounced). |
 | `wake_score` | `std_msgs/Float32` | publish (lifecycle, depth 10) | Raw model score for every chunk; for tuning. |
 
-The model is loaded in `on_configure`. The subscription is created there too
-and is not a lifecycle entity, so audio is processed (and the model is run)
-as soon as the node is *configured*; only the publishers are gated by
-`activate`.
+The model is loaded in `on_configure`. The `raw_audio` subscription is created
+there too, but the callback skips inference until the node is *activated*.
 
 ### `voice_detector_node`
 
@@ -243,6 +241,7 @@ embeddings, RMS-normalised to 0.05 before embedding).
 | `speaker_verification` | bool | `True` | Enable ECAPA-TDNN filtering; disabled automatically if the model fails to load. |
 | `sv_threshold` | double | `0.55` | Cosine-similarity threshold for a full segment. |
 | `sv_segment_sec` | double | `1.0` | Length of the segments that are verified. |
+| `sv_savedir` | string | `~/.cache/speechbrain/spkrec-ecapa-voxceleb` | Local directory for the ECAPA-TDNN model. |
 
 **Topics**
 
@@ -398,7 +397,7 @@ running, or the robot is asleep, new segments are skipped.
 | Name | Type | Default | Meaning |
 |---|---|---|---|
 | `min_confidence` | double | `0.55` | Read and logged, but **not used** to filter results (every result is published). |
-| `savedir` | string | `/home/artur/.cache/speechbrain/voice_emotion` | Local directory for the downloaded model. **Machine-specific default — override it.** |
+| `savedir` | string | `~/.cache/speechbrain/voice_emotion` | Local directory for the downloaded model. |
 
 **Topics**
 
@@ -503,48 +502,14 @@ ros2 topic echo /sound_direction
 
 ## Launch
 
-[`launch/voice.launch.py`](launch/voice.launch.py) is installed with the
-package:
-
-```bash
-ros2 launch inmoov_voice voice.launch.py
-ros2 launch inmoov_voice voice.launch.py llm_url:=http://localhost:18020/v1/chat/completions
-```
-
-It starts `audio_source_node`, `wakeword_node`, `voice_detector_node`,
-`sound_localization_node`, `voice_emotion_node` (delayed 5 s), `tts_node`, `parakeet_stt_node` (delayed
-2 s) and `inmoov_cognition`'s `llm_node` (delayed 3 s), with `PULSE_SERVER`
-(`unix:/run/user/<uid>/pulse/native`) and `DBUS_SESSION_BUS_ADDRESS` set for
-the audio nodes.
-
-Launch arguments (all with defaults; the `llm_*`/`openhab_url` ones are only
-forwarded to `llm_node`):
-
-| Argument | Default |
-|---|---|
-| `llm_url` | `http://192.168.10.118:18020/v1/chat/completions` |
-| `llm_fallback_url` | `''` (no fallback) |
-| `llm_bearer_token` | env `VLLM_BEARER_TOKEN`, else empty |
-| `tts_server_url` | `http://192.168.10.118:8000` |
-| `tts_fallback_url` | `''` (no fallback) |
-| `openhab_url` | `http://192.168.10.118:8080` |
-| `llm_model`, `llm_temperature`, `llm_max_tokens` | `qwen3.8-27b`, `0.1`, `512` |
-| `wakeword_model` | `/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx` |
-| `wakeword_threshold` | `0.2` |
-| `audio_device_index`, `audio_device_name` | `-1`, `pulse` |
-| `output_device_name` | `''` |
-| `sample_rate` | `16000` |
-| `vad_threshold` | `0.4` |
-| `silence_duration_sec` | `2.5` |
-| `pipeline_timeout_sec` | `45.0` |
-| `speaker_verification`, `sv_threshold`, `sv_segment_sec` | `true`, `0.55`, `1.0` |
-
-**Important:** this launch file starts plain `Node` actions, but every node in
-this package is a *lifecycle* node, so with this launch file alone they stay
-`Unconfigured` and do nothing until they are configured/activated manually
-(`ros2 lifecycle set /<node> configure` then `activate`). The launch file used on the robot is
+The package has no launch file of its own. All nodes are started by
 [`inmoov_bringup/launch/inmoov.launch.py`](../inmoov_bringup/launch/inmoov.launch.py)
-(lifecycle nodes, `respawn=True`, tiered activation); prefer that one.
+as `LifecycleNode` actions (`respawn=True`, `PULSE_SERVER` /
+`DBUS_SESSION_BUS_ADDRESS` set for the audio nodes) and brought up tier by tier
+by `lifecycle_manager`; the voice-related launch arguments (`wakeword_*`,
+`vad_threshold`, `sv_*`, `tts_*`, audio devices, ...) are documented in that
+package's README. To run a single node by hand: `ros2 run inmoov_voice <node>`
+and then `ros2 lifecycle set /<node> configure` / `activate`.
 
 Where the nodes live in `inmoov_bringup/config/lifecycle.yaml`: tier 1
 (hardware) `audio_source_node`, `sound_localization_node`; tier 2 `wakeword_node`,
@@ -575,9 +540,8 @@ and `setup.py` only `setuptools`, so install these yourself):
   (`<name>.onnx.data`) keep it next to the `.onnx`.
 - *Silero VAD*: downloaded automatically with `torch.hub.load('snakers4/silero-vad')`
   on first run (needs network or a populated `~/.cache/torch/hub`).
-- *ECAPA-TDNN*: `speechbrain/spkrec-ecapa-voxceleb`, saved to
-  `/home/artur/.cache/speechbrain/spkrec-ecapa-voxceleb`. **This path is
-  hard-coded in `voice_detector_node.py` and is not a parameter.**
+- *ECAPA-TDNN*: `speechbrain/spkrec-ecapa-voxceleb`, saved to `sv_savedir`
+  (default `~/.cache/speechbrain/spkrec-ecapa-voxceleb`).
 - *Voice emotion*: `speechbrain/emotion-recognition-wav2vec2-IEMOCAP`, saved to
   `savedir` (see parameter).
 - *Parakeet*: `nemo-parakeet-tdt-0.6b-v3` (int8), resolved by `onnx-asr`.
@@ -589,34 +553,33 @@ and `setup.py` only `setuptools`, so install these yourself):
   (WirePlumber); set `jabra_card_name:=''` to disable the PipeWire/`pactl`
   handling for other hardware. The code comments also note that the Jabra
   `PCM` mixer must be at 100 %.
-- The audio nodes expect a PipeWire/PulseAudio user session; the launch files
-  point `PULSE_SERVER` at `/run/user/<uid>/pulse/native`.
+- The audio nodes expect a PipeWire/PulseAudio user session; the bringup launch file
+  points `PULSE_SERVER` at `/run/user/<uid>/pulse/native`.
 - System commands used by the recovery code: `pactl`, `aplay`, `amixer`,
   `systemctl --user`.
 - Sound localization needs the separate CM6206 stereo card described above.
 
-## `scripts/diagnose.py`
+## `diagnose`
 
-[`scripts/diagnose.py`](scripts/diagnose.py) is a stand-alone health check
+[`inmoov_voice/diagnose.py`](inmoov_voice/diagnose.py) is a stand-alone health check
 (not a ROS node) that prints coloured OK/WARN/FAIL/SKIP lines grouped into:
 ROS2 environment (`ROS_DISTRO`, sourced workspace, `ros2 node list`), Python
-packages, filesystem (wake-word model, Silero cache, Whisper cache), LLM
-servers (primary and local `/health` + `/v1/models`, plus a 5-token inference
-test), TTS servers (`/health`, plus a short synthesis test on `/tts/stream`),
+packages (incl. `onnx_asr`, `speechbrain`), filesystem (wake-word model,
+Silero VAD cache, Parakeet STT cache), LLM server (`/health` + `/v1/models`,
+plus a 5-token inference test), TTS server (`/health`, plus a short synthesis test on `/tts/stream`),
 openHAB (`/rest/items`, counting items tagged `ChatGPT`) and audio devices.
 Exit code is `1` if any check failed.
 
 ```bash
-python3 src/inmoov_voice/scripts/diagnose.py            # everything
-python3 src/inmoov_voice/scripts/diagnose.py --quick    # skip inference/synthesis tests
-python3 src/inmoov_voice/scripts/diagnose.py --no-audio # skip audio device checks
+ros2 run inmoov_voice diagnose              # everything
+ros2 run inmoov_voice diagnose --quick      # skip inference/synthesis tests
+ros2 run inmoov_voice diagnose --no-audio   # skip audio device checks
 ```
 
 The script's configuration is hard-coded at the top (`PRIMARY_HOST =
 '192.168.10.118'`, `WAKEWORD_MODEL`, `LLM_MODEL`, workspace path
 `/home/artur/ros2_ws`); edit it for your setup. The LLM bearer token is read
-from the environment variable `VLLM_BEARER_TOKEN`. The script is somewhat
-outdated compared to the nodes (see below).
+from the environment variable `VLLM_BEARER_TOKEN`.
 
 ## Known issues / TODOs
 
@@ -656,23 +619,8 @@ From code comments and cross-checks:
   on the other side starts; short utterances (< 1-2 s) may not reach a confident
   result; speech beyond ~1 m is noisier than hiss; front/back ambiguity;
   `mic_distance_m` is unused; no runtime parameter updates.
-- `voice_detector_node`: the ECAPA `savedir` is hard-coded; the pipeline
+- `voice_detector_node`: the pipeline
   timeout only clears an internal flag (it does not cancel anything downstream).
-- `wakeword_node`: subscribes to `raw_audio` from `on_configure`, so it runs
-  inference even before `activate` (publishers are gated, the model is not).
-- `voice.launch.py` starts lifecycle nodes as plain `Node`s (they stay
-  `Unconfigured`), and its docstring
-  mentions a `tavily_api_key` launch argument that is not declared. The
-  comments in the nodes refer to `respawn=True` "in the launch file", which is
-  only true for the `inmoov_bringup` launch file.
-- The `diagnose` console script points at `scripts.diagnose:main`, but
-  `scripts/` has no `__init__.py`, so it is not packaged as a module; run the
-  file directly. The script itself still checks for `faster_whisper` and a
-  Whisper cache (no longer used) and `py_trees`, and does not check for
-  `onnx_asr` or `speechbrain`.
-- Comments in the source refer to project notes files
-  (`project_sound_localization_gcc_phat.md`, `project_stt_parakeet_eval.md`,
-  `MIGRATION_NOTES.md`) that are not part of the repository.
 
 ## License
 

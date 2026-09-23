@@ -123,8 +123,8 @@ class VisionHeadTrackerNode(LifecycleNode):
         #
         # IMPORTANT (live bug 2026-09-01): comparing mag with the PREVIOUS
         # step (step by step) is not viable — the real bbox noise between two
-        # neighbouring detections is easily +-0.05-0.15 (see
-        # project_face_search_retry.md), so "did not improve by at least EPS
+        # neighbouring detections is easily +-0.05-0.15 (measured in live tests),
+        # so "did not improve by at least EPS
         # on EVERY single step" is almost never satisfied even with genuine
         # convergence — the head froze for ~10 s on a perfectly normal (just
         # noisy) track. Instead we compare with a BASELINE recorded at the
@@ -146,13 +146,10 @@ class VisionHeadTrackerNode(LifecycleNode):
     def on_configure(self, state):
         self._dp('image_width',        640)
         self._dp('image_height',       480)
-        self._dp('fov_h_deg',          60.0)
-        self._dp('fov_v_deg',          45.0)
         self._dp('gain_head',           0.5)
         self._dp('gain_eye',            0.2)
         self._dp('dead_zone_px',        20)
         self._dp('head_dead_zone_px',   80)
-        self._dp('eye_limit_deg',       8.0)
         self._dp('return_timeout_sec', 12.0)
         self._dp('track_hz',           15.0)
         self._dp('min_det_score',       0.50)
@@ -166,7 +163,6 @@ class VisionHeadTrackerNode(LifecycleNode):
         self._dp('rest_eye_lr',    90.0)
         self._dp('rest_eye_ud',   100.0)
         self._dp('bbox_ema_alpha',  0.4)
-        self._dp('max_stale_ticks', 5)  # no longer used (see _bbox_seq), kept so as not to break launch files
 
         self._img_w          = self.get_parameter('image_width').value
         self._img_h          = self.get_parameter('image_height').value
@@ -251,8 +247,12 @@ class VisionHeadTrackerNode(LifecycleNode):
                 # Reset stale timestamps so as not to log "no track for 348 s"
                 # right after enabling (the tracker was disabled, the old timestamps remained)
                 now = time.time()
-                self._last_left_t  = now
-                self._last_right_t = now
+                self._last_left_t     = now
+                self._last_right_t    = now
+                # Also the left "camera alive" stamp — otherwise after a long disabled
+                # period the left eye looks absent (> _FALLBACK_SEC) and the right one
+                # takes the lead until the first left message arrives.
+                self._last_left_msg_t = now
                 self._at_rest      = False
         if not msg.data:
             self._return_to_rest()
@@ -367,8 +367,8 @@ class VisionHeadTrackerNode(LifecycleNode):
 
         # We tried here to prefer continuity with the previous bbox over area
         # (live bug 2026-08-31: hijack by someone else's / a false object) —
-        # reverted 2026-08-31: it did not fix the head drift itself (see
-        # project_face_search_retry.md), extra complexity. Left as it
+        # reverted 2026-08-31: it did not fix the head drift itself, extra
+        # complexity. Left as it
         # was — the largest face.
         return max(tracks, key=lambda t: _bbox_area(t.get('bbox', [0, 0, 0, 0]))).get('bbox')
 
@@ -456,10 +456,10 @@ class VisionHeadTrackerNode(LifecycleNode):
         # ── Eyes: one set of joint names, EYE_SYNC mirrors the other ──
         self._set_eye(norm_x, norm_y)
 
-        # Diagnostics: once a second show where and why the head is moving —
-        # previously the P controller logged NOTHING between "enabled" and "no
-        # track -> rest", drift away from the real face was not visible in the logs.
-        # (NOTE: the actual throttle interval is _TRACK_LOG_INTERVAL_SEC = 3.0 s.)
+        # Diagnostics: every _TRACK_LOG_INTERVAL_SEC (3 s) show where and why the
+        # head is moving — previously the P controller logged NOTHING between
+        # "enabled" and "no track -> rest", drift away from the real face was not
+        # visible in the logs.
         now_mono = time.monotonic()
         if now_mono - self._last_track_log_mono >= self._TRACK_LOG_INTERVAL_SEC:
             self._last_track_log_mono = now_mono

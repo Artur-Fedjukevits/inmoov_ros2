@@ -440,7 +440,7 @@ def generate_launch_description():
     )
 
     # STT: Parakeet-TDT-0.6b-v3 (ONNX/CPU) — replaced whisper.cpp on 2026-08-27,
-    # 2-4x faster in live testing. See project_stt_parakeet_eval.md
+    # 2-4x faster in live testing.
     parakeet_stt = LifecycleNode(
         package='inmoov_voice',
         executable='parakeet_stt_node',
@@ -508,8 +508,6 @@ def generate_launch_description():
         parameters=[{
             'image_width':        640,
             'image_height':       480,
-            'fov_h_deg':          60.0,
-            'fov_v_deg':          45.0,
             'gain_head':          LaunchConfiguration('gain_head'),
             'gain_eye':           LaunchConfiguration('gain_eye'),
             'rest_rothead':       LaunchConfiguration('rest_rothead'),
@@ -518,12 +516,10 @@ def generate_launch_description():
             'rest_eye_ud':        100.0,
             'dead_zone_px':       20,
             'head_dead_zone_px':  80,
-            'eye_limit_deg':      8.0,
             'return_timeout_sec': 10.0,  # was 7.0 — still too little, dropped the head to rest mid-dialogue on a brief loss of face at the edge of the frame (2026-09-01)
             'track_hz':           10.0,
             'max_step_deg':       2.0,
             'bbox_ema_alpha':     0.4,
-            'max_stale_ticks':    5,
         }],
     )
 

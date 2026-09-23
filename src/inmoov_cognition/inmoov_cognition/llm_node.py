@@ -604,7 +604,7 @@ _TOOL_START_TOKENS = ('<tool_call>', '<tools>')
 _TOOL_CALL_AE_RE = re.compile(r'ᐈ.{0,10}\{', re.DOTALL)
 _MIN_SENT_CHARS   = 12    # minimum characters before a sentence split
 _MAX_CHUNK_CHARS  = 80    # maximum characters before a forced comma split (~5-6s TTS)
-# TTS request batching (see MIGRATION_NOTES.md): OmniVoice sounds less stable
+# TTS request batching: OmniVoice sounds less stable
 # on very short isolated phrases — sentences are accumulated up to ~80-120 characters
 # OR 2 sentences (whichever comes first), instead of sending literally one short
 # sentence at a time. Measured: TTFA ≈1.1-1.2s, total 7-19% longer than a single request.
@@ -622,7 +622,7 @@ _CJK_RE = re.compile(
     re.UNICODE,
 )
 
-# OmniVoice non-speech inline tags (see MIGRATION_NOTES.md) — the LLM
+# OmniVoice non-speech inline tags — the LLM
 # inserts them directly into the response text, in square brackets, anywhere
 # in the phrase. The list is the full set supported by the server; the system
 # prompt (build_system_prompt) gives the LLM this exact same list verbatim. Any
@@ -1030,7 +1030,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
     # any cache of the common prefix (system prompt) breaks at that point on every
     # turn of the dialogue, and all the static blocks after it (the OpenHAB table
     # etc.) have to be recomputed from scratch.
-    # Static first, dynamic last. See project_llm_backend_bench.md.
+    # Static first, dynamic last (keeps the vLLM prefix cache warm).
     return f"""Ты робот по имени Лёня. Ты член семьи. Твоя главная задача - общение. Стараться узнать о собеседнике или семье что-то новое и сохранять в базу данных с помощью инструментов. Так же твоя задача отвечать на любые вопросы, и выполнять команды. Ты можешь управлять умным домом через OpenHAB, двигаться и выражать эмоции.
 Используй инструменты (tools) для выполнения команд.
 ВАЖНО: Никогда не используй азиатские языки в ответах, никаких иероглифов!
@@ -1441,7 +1441,7 @@ class LLMNode(LifecycleNode):
     def _stream_with_tts(self, payload: dict) -> tuple[str, list]:
         """
         Streams the LLM's response and speaks it as it becomes ready via the 'speak'
-        action (POST /tts/stream on the TTS server, see MIGRATION_NOTES.md — OmniVoice
+        action (POST /tts/stream on the TTS server — OmniVoice
         does not provide a WS bistream, hence one Speak goal per text block,
         rather than one WS session for the whole response).
         Returns (full_content, api_tool_calls).
@@ -1463,7 +1463,7 @@ class LLMNode(LifecycleNode):
             """Sends the accumulated block as a single Speak goal.
             By default waits for _TTS_CHUNK_MIN_CHARS or _TTS_CHUNK_MAX_SENTENCES —
             OmniVoice sounds less stable on very short isolated
-            phrases (see MIGRATION_NOTES.md), so we don't send one
+            phrases, so we don't send one
             sentence at a time. force=True — end of the response, send the rest as-is."""
             nonlocal chunk_buf, chunk_chars
             if not chunk_buf:
@@ -2738,7 +2738,7 @@ class LLMNode(LifecycleNode):
             # The field kept its old name (voice_instruct) for compatibility with
             # behavior_manager_node.py: it used to hold the instruct phrase for
             # CosyVoice3, now it's the OmniVoice voice-preset name
-            # (neutral/happy/sad/surprise), see MIGRATION_NOTES.md.
+            # (neutral/happy/sad/surprise).
             'voice_instruct': voice_preset,
             'streamed':       streamed,
             'telegram':       bool(tg_req_id),

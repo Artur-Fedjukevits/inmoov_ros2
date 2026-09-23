@@ -6,9 +6,8 @@ Manages the robot's three memory layers:
   - EpisodicMemory : SQLite, short-term episodes (dialogues, events)
   - SemanticMemory : ChromaDB + SQLite, long-term facts and knowledge
 
-Usage:
+Usage (memory_node builds the LLM context itself, see _publish_memory_context):
     mm = MemoryManager(db_path="memory.db", chroma_path="./chroma")
-    system_prompt = mm.build_system_prompt()
     mm.after_conversation("Artur said he does not like loud music")
 
 Author: Artur Fedjukevits
@@ -20,9 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
-from datetime import datetime, timezone
-from pathlib import Path
+import re
 from typing import Optional
 
 from inmoov_memory.working_memory import WorkingMemory
@@ -32,13 +29,18 @@ from inmoov_memory.semantic_memory import SemanticMemory
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Persona — edit to match your robot
-# ---------------------------------------------------------------------------
-ROBOT_PERSONA = """Ты InMoov — гуманоидный робот-ассистент.
-Ты дружелюбен, внимателен и стараешься быть полезным.
-Отвечай на языке собеседника (русский или английский).
-Не выдумывай факты, которых не знаешь — лучше честно скажи об этом."""
+_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*\n?(.*?)\n?```$", re.S)
+
+
+def strip_code_fence(raw: str) -> str:
+    """Removes a surrounding markdown code fence (```json ... ```), if any.
+
+    (str.lstrip('```json') strips a *character set*, not a prefix, and could eat
+    leading 'j'/'s'/'o'/'n' characters of the payload.)
+    """
+    raw = raw.strip()
+    m = _FENCE_RE.match(raw)
+    return m.group(1).strip() if m else raw
 
 
 class MemoryManager:
@@ -69,162 +71,6 @@ class MemoryManager:
             "MemoryManager initialized. episodic=%s semantic=%s chroma=%s",
             db_path, semantic_db_path or db_path, chroma_path,
         )
-
-    # ------------------------------------------------------------------
-    # System prompt assembly (called before every LLM request)
-    # ------------------------------------------------------------------
-
-    def build_system_prompt(self) -> str:
-        """
-        Assembles the system prompt from:
-          - the robot's persona
-          - working memory (time, location, state)
-          - the last 5 episodes from today
-        """
-        working_text = self.working.to_text()
-        recent_text = self.episodic.get_recent_text(limit=5)
-
-        parts = [
-            ROBOT_PERSONA,
-            "",
-            "== Текущий момент ==",
-            working_text,
-        ]
-        if recent_text:
-            parts += ["", "== Что происходило сегодня ==", recent_text]
-
-        return "\n".join(parts)
-
-    # ------------------------------------------------------------------
-    # Tool-call functions (registered with the LLM as tools)
-    # ------------------------------------------------------------------
-
-    def get_tool_definitions(self) -> list[dict]:
-        """Returns the tool descriptions to pass to the LLM (OpenAI tools format)."""
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_memory",
-                    "description": (
-                        "Поиск фактов в долговременной (семантической) памяти. "
-                        "Используй когда нужно вспомнить предпочтения, имена, события."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Запрос для семантического поиска",
-                            },
-                            "category": {
-                                "type": "string",
-                                "enum": ["person", "preference", "event", "rule", ""],
-                                "description": "Фильтр по категории (опционально)",
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Максимум результатов (по умолчанию 5)",
-                            },
-                        },
-                        "required": ["query"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "save_fact",
-                    "description": (
-                        "Сохранить новый факт в долговременную память. "
-                        "Используй когда узнаёшь что-то важное о человеке или ситуации."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "subject": {"type": "string", "description": "О ком/о чём факт"},
-                            "predicate": {"type": "string", "description": "Свойство или отношение"},
-                            "value": {"type": "string", "description": "Значение"},
-                            "category": {
-                                "type": "string",
-                                "enum": ["person", "preference", "event", "rule"],
-                            },
-                        },
-                        "required": ["subject", "predicate", "value", "category"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_episode",
-                    "description": "Получить конкретный эпизод из краткосрочной памяти по дате или ключевому слову.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "keyword": {"type": "string", "description": "Ключевое слово для поиска"},
-                            "date": {
-                                "type": "string",
-                                "description": "Дата в формате YYYY-MM-DD (опционально)",
-                            },
-                        },
-                        "required": ["keyword"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "update_location",
-                    "description": "Обновить текущее местоположение робота.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "room": {"type": "string"},
-                            "landmark": {"type": "string"},
-                        },
-                        "required": ["room"],
-                    },
-                },
-            },
-        ]
-
-    def execute_tool(self, tool_name: str, arguments: dict) -> str:
-        """Dispatches tool calls coming from the LLM."""
-        handlers = {
-            "search_memory": self._tool_search_memory,
-            "save_fact": self._tool_save_fact,
-            "get_episode": self._tool_get_episode,
-            "update_location": self._tool_update_location,
-        }
-        handler = handlers.get(tool_name)
-        if not handler:
-            return json.dumps({"error": f"Неизвестный инструмент: {tool_name}"})
-        try:
-            return handler(**arguments)
-        except Exception as exc:
-            logger.exception("Error in tool %s", tool_name)
-            return json.dumps({"error": str(exc)})
-
-    def _tool_search_memory(self, query: str, category: str = "", limit: int = 5) -> str:
-        results = self.semantic.search(query, category=category or None, limit=limit)
-        if not results:
-            return json.dumps({"result": "Ничего не найдено в памяти."})
-        return json.dumps({"facts": results})
-
-    def _tool_save_fact(self, subject: str, predicate: str, value: str, category: str) -> str:
-        self.semantic.save_fact(subject=subject, predicate=predicate, value=value, category=category)
-        return json.dumps({"status": "ok", "message": f"Факт сохранён: {subject} — {predicate}: {value}"})
-
-    def _tool_get_episode(self, keyword: str, date: Optional[str] = None) -> str:
-        episodes = self.episodic.search(keyword=keyword, date=date)
-        if not episodes:
-            return json.dumps({"result": "Эпизоды не найдены."})
-        return json.dumps({"episodes": episodes})
-
-    def _tool_update_location(self, room: str, landmark: str = "") -> str:
-        self.working.update_location(room=room, landmark=landmark)
-        return json.dumps({"status": "ok", "location": room})
 
     # ------------------------------------------------------------------
     # Post-processing a dialogue (called after every completed conversation)
@@ -340,7 +186,7 @@ class MemoryManager:
         try:
             raw = self._call_llm(prompt, system=system)
             # Strip possible markdown fences
-            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            raw = strip_code_fence(raw)
             facts = json.loads(raw)
             return [
                 f for f in facts
@@ -353,19 +199,3 @@ class MemoryManager:
         except Exception as exc:
             logger.warning("Failed to extract facts: %s", exc)
             return []
-
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
-
-    def wipe_episodic(self, older_than_days: int = 30, min_importance: float = 0.0) -> int:
-        """Deletes old, low-importance episodes. Returns the number deleted."""
-        return self.episodic.cleanup(older_than_days=older_than_days, max_importance=min_importance)
-
-    def status(self) -> dict:
-        """Brief memory status summary."""
-        return {
-            "working": self.working.data,
-            "episodic_count": self.episodic.count(),
-            "semantic_count": self.semantic.count(),
-        }

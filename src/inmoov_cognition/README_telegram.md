@@ -88,14 +88,16 @@ print('done')
 ## 5. Запуск
 
 ```bash
-# Только мост (llm_node должен быть запущен отдельно):
-ros2 launch inmoov_cognition telegram_bridge.launch.py \
-  allowed_chat_id:=$TELEGRAM_ALLOWED_CHAT_ID
-
-# Вместе с полным стеком:
-ros2 launch inmoov_cognition inmoov_full.launch.py \
+# Вместе с полным стеком (lifecycle_manager поднимет мост в тире 6):
+ros2 launch inmoov_bringup inmoov.launch.py \
   telegram:=true \
   allowed_chat_id:=$TELEGRAM_ALLOWED_CHAT_ID
+
+# Только мост вручную (llm_node должен быть запущен отдельно):
+ros2 run inmoov_cognition telegram_bridge_node --ros-args \
+  --params-file src/inmoov_cognition/config/telegram_params.yaml
+ros2 lifecycle set /telegram_bridge_node configure
+ros2 lifecycle set /telegram_bridge_node activate
 ```
 
 ## 6. Сборка

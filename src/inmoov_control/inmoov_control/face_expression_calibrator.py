@@ -7,13 +7,15 @@ Right panel: sliders for the 16 face servos, grouped.
   Checkbox "✓" = the servo is part of this expression (will be saved).
   Slider moves the servo on the robot in real time.
 
-Saving: the "Сохранить" (Save) button writes face_expressions_calibration.json
-next to face_expressions_node.py. That file is picked up automatically the
-next time face_expressions_node.py is started.
+Saving: the "Сохранить" (Save) button writes the user calibration file
+(face_expressions_node.USER_CALIB_FILE: $INMOOV_FACE_CALIBRATION or
+~/.config/inmoov/face_expressions_calibration.json). face_expressions_node picks
+it up on its next start; it survives rebuilds. Servo limits/rests are imported
+from face_expressions_node, so they are defined in one place.
 
 Run (ROS2 must be initialised):
   cd ~/ros2_ws && source install/setup.bash
-  python3 src/inmoov_control/test/face_expression_calibrator.py
+  ros2 run inmoov_control face_expression_calibrator
 
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
@@ -31,38 +33,44 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
+from inmoov_control import face_expressions_node as _fen
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────────────────────────────────────
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-CALIBRATION_FILE = os.path.normpath(
-    os.path.join(_HERE, '..', 'inmoov_control', 'face_expressions_calibration.json')
-)
+CALIBRATION_FILE = _fen.USER_CALIB_FILE   # where Save writes
+_LOAD_FILE       = _fen._CALIB_FILE       # user file if present, else the packaged one
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Face servo definitions
 # (name, min_deg, max_deg, rest_deg, label, group)
-# Values taken from InMoovLeft.ino / InMoovRight.ino
+# Limits/rests: face_expressions_node (which mirrors InMoovLeft.ino / InMoovRight.ino)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# (name, label, group); min/max/rest come from face_expressions_node (_MN/_MX/FACE_REST)
+_SERVO_LABELS: list[tuple] = [
+    ('eyelid_L_Upper',  'Eyelid L Upper',  'Веки'),
+    ('eyelid_L_Lower',  'Eyelid L Lower',  'Веки'),
+    ('eyelid_R_Upper',  'Eyelid R Upper',  'Веки'),
+    ('eyelid_R_Lower',  'Eyelid R Lower',  'Веки'),
+    ('eyebrow_L',       'Eyebrow Left',    'Брови'),
+    ('eyebrow_R',       'Eyebrow Right',   'Брови'),
+    ('cheek_L',         'Cheek Left',      'Щёки'),
+    ('cheek_R',         'Cheek Right',     'Щёки'),
+    ('forhead_L',       'Forehead Left',   'Лоб'),
+    ('forhead_R',       'Forehead Right',  'Лоб'),
+    ('eye_lr_L',        'Eye LR Left',     'Глаза'),
+    ('eye_ud_L',        'Eye UD Left',     'Глаза'),
+    ('eye_lr_R',        'Eye LR Right',    'Глаза'),
+    ('eye_ud_R',        'Eye UD Right',    'Глаза'),
+    ('upperLip',        'Upper Lip',       'Рот'),
+    ('jaw',             'Jaw',             'Рот'),
+]
+
 SERVO_DEFS: list[tuple] = [
-    ('eyelid_L_Upper',  70,  95,  85,  'Eyelid L Upper',  'Веки'),
-    ('eyelid_L_Lower',  75,  95,  85,  'Eyelid L Lower',  'Веки'),
-    ('eyelid_R_Upper',  65, 100,  85,  'Eyelid R Upper',  'Веки'),
-    ('eyelid_R_Lower',  70,  95,  85,  'Eyelid R Lower',  'Веки'),
-    ('eyebrow_L',       60, 110,  90,  'Eyebrow Left',    'Брови'),
-    ('eyebrow_R',       70, 105,  80,  'Eyebrow Right',   'Брови'),
-    ('cheek_L',         75, 115, 100,  'Cheek Left',      'Щёки'),
-    ('cheek_R',         68, 105,  87,  'Cheek Right',     'Щёки'),
-    ('forhead_L',       90, 110,  90,  'Forehead Left',   'Лоб'),
-    ('forhead_R',       85, 105,  85,  'Forehead Right',  'Лоб'),
-    ('eye_lr_L',        80, 100,  90,  'Eye LR Left',     'Глаза'),
-    ('eye_ud_L',        80, 110, 100,  'Eye UD Left',     'Глаза'),
-    ('eye_lr_R',        80, 100,  90,  'Eye LR Right',    'Глаза'),
-    ('eye_ud_R',        85, 115, 100,  'Eye UD Right',    'Глаза'),
-    ('upperLip',        90, 105,  90,  'Upper Lip',       'Рот'),
-    ('jaw',             10,  90,  10,  'Jaw',             'Рот'),
+    (name, _fen._MN[name], _fen._MX[name], _fen.FACE_REST[name], label, group)
+    for name, label, group in _SERVO_LABELS
 ]
 
 SERVO_INFO   = {name: (mn, mx, rest, label, grp) for name, mn, mx, rest, label, grp in SERVO_DEFS}
@@ -218,8 +226,8 @@ EXPRESSION_NAMES = list(EXPRESSIONS_DEFAULTS.keys())
 
 def load_calibration() -> dict[str, dict[str, int]]:
     """Load the calibration JSON file; return defaults if it does not exist."""
-    if os.path.exists(CALIBRATION_FILE):
-        with open(CALIBRATION_FILE, encoding='utf-8') as f:
+    if os.path.exists(_LOAD_FILE):
+        with open(_LOAD_FILE, encoding='utf-8') as f:
             data = json.load(f)
         # Merge: defaults as base, loaded values override
         merged = {expr: dict(EXPRESSIONS_DEFAULTS.get(expr, {})) for expr in EXPRESSION_NAMES}

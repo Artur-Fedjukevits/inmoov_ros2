@@ -22,6 +22,7 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
+import os
 import threading
 
 import numpy as np
@@ -60,7 +61,7 @@ class VoiceEmotionNode(LifecycleNode):
 
     def on_configure(self, state):
         self._dp('min_confidence', 0.55)
-        self._dp('savedir', '/home/artur/.cache/speechbrain/voice_emotion')
+        self._dp('savedir', os.path.expanduser('~/.cache/speechbrain/voice_emotion'))
 
         self._min_conf = self.get_parameter('min_confidence').value
         savedir        = self.get_parameter('savedir').value

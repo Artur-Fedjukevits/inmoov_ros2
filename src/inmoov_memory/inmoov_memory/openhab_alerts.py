@@ -3,7 +3,6 @@ openhab_alerts.py — Shared sensor alert logic for OpenHAB monitoring.
 
 Used by:
   openhab_bridge_node  — creates alerts when thresholds are crossed
-  identity_manager_node — verifies env reminders before announcing (fresh state)
 
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)

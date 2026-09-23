@@ -199,8 +199,7 @@ largest file in the package, ~3200 lines).
 
 The "intent generator": calls an OpenAI-compatible `chat.completions`
 endpoint with function calling, streams sentence-sized chunks straight into
-TTS as they arrive (`_stream_with_tts`, target TTFA ~2–4 s — see
-`project_llm_tts_streaming.md` in the project memory), and resolves tool
+TTS as they arrive (`_stream_with_tts`, target TTFA ~2–4 s), and resolves tool
 calls in up to three rounds (R1 → R2 → R3) depending on whether a tool
 already produced a `speak_text` or the LLM needs to see tool results before
 answering. Never controls TTS/servos directly — dialogue text goes to
@@ -408,10 +407,8 @@ just logs an error without a key); `inmoov_msgs`; `py_trees`.
   rothead/midstom turn-direction convention (`LEFT=60°`/`RIGHT=120°` for
   both — re-verified by hand 2026-08-24 after an earlier, wrong note).
 - Face-search retry (`FaceSearchAttempt`/`record_face_search_attempt`) went
-  through several rounds of live bug fixes; see the project memory notes
-  referenced in code comments (`project_face_search_retry.md`) for the
-  history — the final round was committed but not fully re-tested per those
-  notes.
+  through several rounds of live bug fixes (history in the code comments) —
+  the final round was committed but not fully re-tested live.
 
 ---
 
@@ -433,11 +430,15 @@ database, pushing straight to Telegram:
 
 | Sensor | Alert threshold |
 |---|---|
-| Temperature | `> 25°C` or `< 16°C` |
+| Temperature (indoor only) | `> 27°C` or `< 16°C` |
 | Humidity | `> 70%` or `< 30%` |
 | CO₂ | `> 1200 ppm` |
 | VOC | `> 300 ppb` |
+| Radon | `> 200 Bq/m³` short-term, `> 100 Bq/m³` long-term |
+| Battery (`*_Battery` numbers) | `< 10%` |
 | Battery (`*_BatteryLow` switches) | `ON` |
+
+(The constants live in `inmoov_memory/openhab_alerts.py`.)
 
 Rate-limited to at most one repeat alert per sensor per
 `ALERT_RATE_LIMIT_SEC` (900 s = 15 min); recovery (value back to normal)
@@ -545,37 +546,25 @@ Telegram bot token (`TELEGRAM_BOT_TOKEN` env var) and an allowed chat id
 
 ## Launch
 
+The package has no launch files of its own. All nodes (`llm_node`,
+`openhab_bridge_node` — tier 4; `identity_manager_node`,
+`behavior_manager_node` — tier 5; `telegram_bridge_node` — tier 6, only with
+`telegram:=true`) are started by
+[`inmoov_bringup/launch/inmoov.launch.py`](../inmoov_bringup/launch/inmoov.launch.py)
+as `LifecycleNode`s and brought up by `lifecycle_manager` — see that package's
+README for the launch arguments, the tier breakdown and the
+`/lifecycle/status` / `/lifecycle/command` API that `telegram_bridge_node`'s
+`/status` command reads.
+
 ```bash
-# behavior_manager + identity_manager + openhab_bridge only
-ros2 launch inmoov_cognition behavior_manager.launch.py
-ros2 launch inmoov_cognition behavior_manager.launch.py tavily_api_key:=tvly-...
-
-# Telegram bridge only (llm_node must already be running)
-ros2 launch inmoov_cognition telegram_bridge.launch.py \
-  allowed_chat_id:=$TELEGRAM_ALLOWED_CHAT_ID
-
-# The full stack: inmoov_control + inmoov_voice + this package + inmoov_memory
-# + inmoov_vision (optional) + Telegram bridge (optional)
-ros2 launch inmoov_cognition inmoov_full.launch.py
-ros2 launch inmoov_cognition inmoov_full.launch.py vision:=false
-ros2 launch inmoov_cognition inmoov_full.launch.py telegram:=true \
+ros2 launch inmoov_bringup inmoov.launch.py tavily_api_key:=tvly-...
+ros2 launch inmoov_bringup inmoov.launch.py telegram:=true \
   allowed_chat_id:=$TELEGRAM_ALLOWED_CHAT_ID
 ```
 
-`inmoov_full.launch.py`'s notable arguments (all forwarded to the includes
-above): `llm_url`, `llm_fallback_url`, `llm_bearer_token` (defaults from
-`VLLM_BEARER_TOKEN`), `tts_server_url`, `tts_fallback_url`, `openhab_url`,
-`llm_model`, `wakeword_model`, `wakeword_threshold`, `audio_device_name`,
-`tavily_api_key` (defaults from `TAVILY_API_KEY`), `port_right`/`port_left`
-(Arduino serial ports), `memory_db_path`, `vision` (bool, default `true`),
-`cam_left`/`cam_right`, `greet_cooldown_sec`, `telegram` (bool, default
-`false`), `allowed_chat_id` (defaults from `TELEGRAM_ALLOWED_CHAT_ID`).
-
-In production this package is normally started via
-[`inmoov_bringup`](../inmoov_bringup/README.md)'s `lifecycle_manager`
-(tiers 4–6), not these launch files directly — see that package's README for
-the tier breakdown and the `/lifecycle/status`/`/lifecycle/command` API that
-`telegram_bridge_node`'s `/status` command reads.
+To run a single node by hand: `ros2 run inmoov_cognition <node>` (e.g. with
+`--params-file src/inmoov_cognition/config/telegram_params.yaml` for the
+Telegram bridge), then `ros2 lifecycle set /<node> configure` / `activate`.
 
 ## Requirements / Setup
 

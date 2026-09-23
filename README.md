@@ -101,10 +101,10 @@ and launch arguments):
 ros2 launch inmoov_bringup inmoov.launch.py
 ```
 
-Individual packages also ship their own stand-alone launch files
-(`ros2 launch inmoov_<pkg> <pkg>.launch.py`) for developing against a subset
-of the system — see each package's README for what they start and their
-limitations versus the full `inmoov_bringup` orchestration.
+This is the only launch file of the stack (all nodes are lifecycle nodes
+driven by `lifecycle_manager`); `vision:=false` / `telegram:=true` toggle the
+optional parts. Single nodes can be run with `ros2 run` and transitioned with
+`ros2 lifecycle set` — see each package's README.
 
 ## Arduino firmware
 

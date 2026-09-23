@@ -10,11 +10,6 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', [
-            'launch/behavior_manager.launch.py',
-            'launch/inmoov_full.launch.py',
-            'launch/telegram_bridge.launch.py',
-        ]),
         ('share/' + package_name + '/config', [
             'config/telegram_params.yaml',
         ]),

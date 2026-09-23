@@ -60,7 +60,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String, Bool
 from inmoov_msgs.srv import MemoryQuery
 
-from inmoov_memory.memory_manager import MemoryManager
+from inmoov_memory.memory_manager import MemoryManager, strip_code_fence
 from inmoov_memory.reminder_db import ReminderDB
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,7 @@ class MemoryNode(LifecycleNode):
         self._dp('semantic_db_path',           '/home/artur/inmoov_semantic.db')
         self._dp('chroma_path',                '/home/artur/inmoov_chroma')
         self._dp('reminder_db_path',           '/home/artur/inmoov_reminders.db')
+        self._dp('gallery_dir',                '/home/artur/inmoov_faces')  # face_gallery_node's gallery_dir
         self._dp('llm_url',   'http://192.168.10.118:18020/v1/chat/completions')
         self._dp('llm_model', 'qwen3.8-27b')
         self._dp('bearer_token', '')
@@ -118,6 +119,8 @@ class MemoryNode(LifecycleNode):
 
         db_path      = self.get_parameter('db_path').value
         episodic_db  = self.get_parameter('episodic_db_path').value
+        self._episodic_db_path = episodic_db
+        self._gallery_dir      = self.get_parameter('gallery_dir').value
         semantic_db  = self.get_parameter('semantic_db_path').value
         chroma_path  = self.get_parameter('chroma_path').value
         reminder_db  = self.get_parameter('reminder_db_path').value
@@ -500,7 +503,7 @@ class MemoryNode(LifecycleNode):
         )
         try:
             raw = self._mm._call_llm(prompt, system=system)
-            raw = raw.strip().lstrip('```json').lstrip('```').rstrip('```').strip()
+            raw = strip_code_fence(raw)
             items = json.loads(raw)
             count = 0
             for item in items:
@@ -1181,14 +1184,14 @@ class MemoryNode(LifecycleNode):
             self._voice_gallery_cache[to_id] = dst[:VOICE_LIMIT]
 
         # ── Source's physical directory ─────────────────────────────────
-        for d in glob.glob(f'/home/artur/inmoov_faces/persons/{from_id}_*'):
+        for d in glob.glob(os.path.join(self._gallery_dir, 'persons', f'{from_id}_*')):
             if os.path.isdir(d):
                 shutil.rmtree(d, ignore_errors=True)
 
         # ── Episodic memory: rename the participant ──────────────────────
         try:
             import sqlite3 as _sq
-            ep_conn = _sq.connect('/home/artur/inmoov_episodic.db')
+            ep_conn = _sq.connect(self._episodic_db_path)
             ep_cur  = ep_conn.cursor()
             ep_cur.execute('SELECT id, participants FROM episodes')
             for ep_id, parts_json in ep_cur.fetchall():

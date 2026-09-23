@@ -107,7 +107,8 @@ class ArduinoCommNode(LifecycleNode):
         self._rx_thread  = None
         self._tx_timer   = None
 
-        # Publisher handles (set in on_configure)
+        # Subscription/publisher handles (set in on_configure, destroyed in on_cleanup)
+        self._subs           = []
         self._ultrasonic_pub = None
         self._pir_pub        = None
         self._hall_pub       = None
@@ -115,13 +116,16 @@ class ArduinoCommNode(LifecycleNode):
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
     def on_configure(self, state):
-        self.create_subscription(JointState, '/joint_command', self._joint_cmd_cb, 10)
+        self._subs = [
+            self.create_subscription(JointState, '/joint_command', self._joint_cmd_cb, 10)]
         if self.FACE_JOINTS:
-            self.create_subscription(JointState, '/face_command', self._face_cmd_cb, 10)
+            self._subs.append(
+                self.create_subscription(JointState, '/face_command', self._face_cmd_cb, 10))
 
         # /robot_sleep is latched (TRANSIENT_LOCAL) — forward to Arduino as CMD_SLEEP
         sleep_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(Bool, '/robot_sleep', self._sleep_cb, sleep_qos)
+        self._subs.append(
+            self.create_subscription(Bool, '/robot_sleep', self._sleep_cb, sleep_qos))
 
         if self.HAS_ULTRASONIC:
             self._ultrasonic_pub = self.create_lifecycle_publisher(
@@ -207,6 +211,14 @@ class ArduinoCommNode(LifecycleNode):
 
     def on_cleanup(self, state):
         self._close_serial()
+        # Destroy what on_configure created — a re-configure must not duplicate them
+        for s in self._subs:
+            self.destroy_subscription(s)
+        self._subs = []
+        for p in (self._ultrasonic_pub, self._pir_pub, self._hall_pub):
+            if p is not None:
+                self.destroy_lifecycle_publisher(p)
+        self._ultrasonic_pub = self._pir_pub = self._hall_pub = None
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state):

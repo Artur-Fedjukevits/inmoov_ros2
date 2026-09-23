@@ -140,8 +140,8 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
     _REST_NECK    = 40.0
 
     # Torso (midstom): rest=90, min=60, max=120 (arduino_left_node) — same sign
-    # convention as rothead: LEFT=60/RIGHT=120 (verified by hand 2026-08-24, see
-    # memory project_sound_localization_gcc_phat.md). scope='partial' adds part of
+    # convention as rothead: LEFT=60/RIGHT=120 (verified by hand 2026-08-24).
+    # scope='partial' adds part of
     # this range in the same direction as pan — used when the head alone isn't
     # enough to aim the camera at a conversation partner standing to the side.
     _REST_MIDSTOM           = 90.0
@@ -756,7 +756,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     """
     On wake word — turn the TORSO (midstom), not the head, toward wherever
     the voice came from (per /sound_direction — TDOA sign-vote, see
-    sound_localization_node / project_sound_localization_gcc_phat.md).
+    sound_localization_node).
     Replaces the old PIRScan head-scan specifically for the "heard a voice"
     case (PIR motion without voice still uses PIRScanBehaviour — there is no
     direction to work with there).

@@ -177,18 +177,6 @@ class EpisodicMemory:
             )
             return cur.rowcount
 
-    def get_unmigrated_important(self, min_importance: float = 0.7) -> list[dict]:
-        """High-importance episodes not yet migrated to semantic memory."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT id, timestamp, summary, raw_text
-                   FROM episodes
-                   WHERE importance >= ? AND migrated = 0
-                   ORDER BY importance DESC""",
-                (min_importance,),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
     def mark_migrated(self, episode_id: int) -> None:
         with self._conn() as conn:
             conn.execute("UPDATE episodes SET migrated=1 WHERE id=?", (episode_id,))

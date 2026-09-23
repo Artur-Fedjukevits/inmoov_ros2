@@ -63,7 +63,7 @@ board has; the base class does all the I/O.
 | PIR topic | `pir_state` | – |
 | Hall topic | `hall_right_raw` | `hall_left_raw` |
 
-The launch files in this workspace override the node name (`arduino_right`,
+The bringup launch file overrides the node name (`arduino_right`,
 `arduino_left`), so the lifecycle services are
 `/arduino_right/change_state` etc.
 
@@ -132,15 +132,9 @@ the full lists.
   the TX path the node sets its serial handle to `None` and silently stops
   sending/receiving; it stays `active` and only reopens the port after a
   deactivate/activate cycle (or a process respawn by `ros2 launch`).
-- The trailing `rest/min/max` comments in the Python joint tables are
-  informational and partly stale compared to the firmware tables (see
+- The Python joint tables mirror the firmware tables (see
   [Protocol](#protocol)); the firmware is the authority for limits. A value of
-  `0` in `SET_SERVOS` means "go to the firmware rest angle", so the `rest=0`
-  entries for fingers/wrist/bicep rely on this quirk.
-- `on_cleanup` does not destroy the subscriptions/publishers created in
-  `on_configure`; a second `configure` on the same process would create
-  duplicates (not observed in the normal launch flow, where a crashed process is
-  respawned instead).
+  `0` in `SET_SERVOS` means "go to the firmware rest angle".
 - The sleep flag is only sent when it changes; if the Arduino resets while the
   robot is asleep it wakes up (firmware default is awake) and the node does not
   resend the flag.
@@ -171,13 +165,9 @@ It tracks the joints of both Arduino classes (joint lists are imported from
 
 **Known issues**
 
-- The state is *commanded*, not measured (no encoders / feedback). The module
-  docstring mentions reading an "echo channel" from the Arduino, but no such
-  channel exists in the current protocol or firmware.
-- Joints that have never been commanded are reported at `0.0` rad, which is
-  **not** their rest position (rest is `rest_deg` in the joint tables, which
-  maps to a non-zero angle for most joints); consumers should not treat the
-  initial values as the physical pose.
+- The state is *commanded*, not measured (no encoders / feedback, no echo
+  channel in the protocol). Joints that have never been commanded are reported
+  at their rest position (`rest_deg` of the joint tables).
 - Because the values are re-published regardless of whether the servo really
   moved (e.g. clamped by firmware limits), the reported pose can differ from the
   real one.
@@ -234,12 +224,16 @@ ros2 topic pub --once /face_expression std_msgs/msg/String "data: happy"
 ros2 topic pub --once /face_expression_hold std_msgs/msg/String "data: neutral"
 ```
 
-**Calibration file.** At import time the module loads
-`face_expressions_calibration.json` from the same directory (if present) and
-*replaces* the default entry of every expression it contains (an expression in
+**Calibration file.** At import time the module loads the user calibration
+file (`$INMOOV_FACE_CALIBRATION`, default
+`~/.config/inmoov/face_expressions_calibration.json`, written by the
+calibrator GUI and surviving rebuilds) or, if it does not exist, the
+`face_expressions_calibration.json` shipped with the package (installed via
+`package_data`), and *replaces* the default entry of every expression it contains (an expression in
 the JSON overrides the whole default dict, it is not merged joint by joint).
 The repository ships a JSON with all 15 expressions. The node logs
-`calib: loaded` or `calib: defaults` on configure.
+`calib: <path>` or `calib: defaults` on configure. To make a user calibration
+the shipped default, copy it over `inmoov_control/face_expressions_calibration.json`.
 
 **Firmware quirk.** A `/face_command` position of exactly `0°` means "go to the
 rest angle" in the firmware (`val == 0 → rest_angle`, otherwise clamp to
@@ -254,16 +248,12 @@ rest angle" in the firmware (`val == 0 → rest_angle`, otherwise clamp to
   publisher are plain (not lifecycle) entities created in `on_configure`, so
   expressions execute as soon as the node is *configured*, even before
   `activate`.
-- `face_expressions_calibration.json` is not listed in `setup.py`
-  (`data_files` / `package_data`), so an installed (non-`--symlink-install`)
-  build runs with the built-in defaults.
 - Mouth/jaw lip-sync is not done here (`tts_node` publishes the jaw directly on
   `/face_command`); this node only sets the jaw for `happy`/`smile`/`surprise`.
 
 ### `face_expression_calibrator`
 
-Source: [`inmoov_control/face_expression_calibrator.py`](inmoov_control/face_expression_calibrator.py)
-(an identical copy is kept in [`test/`](test/face_expression_calibrator.py)).
+Source: [`inmoov_control/face_expression_calibrator.py`](inmoov_control/face_expression_calibrator.py).
 
 Interactive Tk GUI (not a lifecycle node; requires a display and `tkinter`) to
 tune the face expressions on the real robot. Left: list of expressions. Right:
@@ -271,7 +261,7 @@ one slider per face servo (16), grouped (eyelids, eyebrows, cheeks, forehead,
 eyes, mouth), with a checkbox saying whether the servo is part of the current
 expression. Moving a slider publishes that servo on `/face_command` in real time
 ("auto send" toggle); *Save* writes only the checked servos of the current
-expression into `face_expressions_calibration.json`; *Reset* restores the
+expression into the user calibration file (see above); *Reset* restores the
 built-in (MRL) defaults for the expression. The GUI labels are in Russian.
 
 Run (ROS2 sourced, the face expression nodes and Arduino nodes must be running
@@ -279,23 +269,12 @@ so the servos react):
 
 ```bash
 cd ~/ros2_ws && source install/setup.bash
-python3 src/inmoov_control/test/face_expression_calibrator.py
-# or, after installation:
 ros2 run inmoov_control face_expression_calibrator
 ```
 
 **Parameters:** none. **Topic:** publishes `/face_command` (`JointState`).
-
-**Known issues**
-
-- The output path is computed relative to the script
-  (`<script dir>/../inmoov_control/face_expressions_calibration.json`). This
-  points at the source-tree JSON only when run from `test/` in the source
-  tree; running the installed entry point writes to a location under the install
-  prefix that `face_expressions_node` does not read.
-- The face servo limits/rests are duplicated in `SERVO_DEFS` (copied from the
-  `.ino` files) and in `face_expressions_node.py`; they must be kept in sync by
-  hand.
+Servo limits/rests are imported from `face_expressions_node` (`_MN`, `_MX`,
+`FACE_REST`), so they are defined in one place.
 
 ## Protocol
 
@@ -413,38 +392,17 @@ is 0–180 and `Servo.write` caps at 180, so the effective max is 180.
 
 ## Launch
 
-Standalone (control layer only):
+The package has no launch file of its own. `arduino_right`, `arduino_left`,
+`joint_state_publisher` and `face_expressions` are started by
+[`inmoov_bringup/launch/inmoov.launch.py`](../inmoov_bringup/launch/inmoov.launch.py)
+as `LifecycleNode`s (`respawn=True`) and configured/activated by
+`lifecycle_manager`; the serial ports are the `port_right` / `port_left`
+launch arguments there. To run a node by hand:
 
 ```bash
-ros2 launch inmoov_control inmoov_control.launch.py
-ros2 launch inmoov_control inmoov_control.launch.py \
-    port_right:=/dev/ttyACM0 port_left:=/dev/ttyACM1
+ros2 run inmoov_control arduino_left_node --port /dev/ttyACM1
+ros2 lifecycle set /arduino_left_node configure && ros2 lifecycle set /arduino_left_node activate
 ```
-
-| Argument | Default | Meaning |
-|---|---|---|
-| `port_right` | `/dev/serial/by-path/pci-0000:c6:00.3-usb-0:5:1.0-port0` | Serial port of the Right Arduino Mega. |
-| `port_left` | `/dev/serial/by-path/pci-0000:c6:00.3-usb-0:1.3:1.0-port0` | Serial port of the Left Arduino Mega. |
-
-Nodes started (all with `output='screen'`): `arduino_right_node` (as
-`arduino_right`, `--port <port_right>`), `arduino_left_node` (as
-`arduino_left`, `--port <port_left>`), `joint_state_publisher`,
-`face_expressions_node` (as `face_expressions`).
-
-**Important:** this launch file starts them as plain `Node` actions, but they
-are lifecycle nodes, so they will sit in `Unconfigured` and do nothing until
-transitioned, e.g.:
-
-```bash
-for n in arduino_right arduino_left joint_state_publisher face_expressions; do
-  ros2 lifecycle set /$n configure && ros2 lifecycle set /$n activate
-done
-```
-
-In the full robot stack, use `ros2 launch inmoov_bringup inmoov.launch.py`,
-which launches the same executables as `LifecycleNode`s (with `respawn=True`)
-and lets `lifecycle_manager` configure/activate them in the right order; the
-port arguments there are also called `port_right` / `port_left`.
 
 Testing without the robot / servo power (the Arduino only needs USB power):
 
@@ -496,16 +454,6 @@ Some of these scripts still have Russian docstrings/GUI text.
 - Serial-error recovery (see `arduino_*_node`): unplugging a board while the node
   is active silently stops all traffic; the node does not go to an error state.
 - `joint_state_publisher` reports commanded, not measured, state.
-- `face_expressions_calibration.json` is not installed by `setup.py`.
-- `face_expression_calibrator` writes to a path relative to the script; the
-  installed entry point and the source-tree script use different paths.
-- `inmoov_control.launch.py` starts lifecycle nodes as plain nodes (needs manual
-  lifecycle transitions).
-- Python joint-table `rest/min/max` comments differ from the firmware tables
-  (firmware is authoritative).
-- `test/face_expression_calibrator.py` and
-  `inmoov_control/face_expression_calibrator.py` are duplicate copies and can
-  drift.
 - The firmware defines `CMD_ACK` in `protocol.py`, but neither sketch sends it;
   the nodes therefore have no delivery confirmation for commands.
 

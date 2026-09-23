@@ -6,10 +6,8 @@ facial emotion, a photo gallery for face enrolment, head/eye tracking of the
 interlocutor, and body / object perception with an OAK-D Lite depth camera.
 
 All nodes are ROS2 **managed lifecycle nodes** (`rclpy.lifecycle.LifecycleNode`)
-and are normally started and supervised by the `lifecycle_manager` of
-`inmoov_bringup` (see that package's README); the package's own
-`vision.launch.py` is a stand-alone convenience launch (see
-[Launch](#launch) for its limitation).
+and are started and supervised by the `lifecycle_manager` of
+`inmoov_bringup` (see that package's README and [Launch](#launch)).
 
 ## Dual-eye topology
 
@@ -90,8 +88,8 @@ in `inmoov_cognition`; this package only produces the signal.
 
 Executables are registered in [`setup.py`](setup.py) `console_scripts`. Default
 values below are the **code defaults** (`_dp(...)` calls); where
-[`launch/vision.launch.py`](launch/vision.launch.py) overrides them, the launch
-value is given too. All topic names are fully qualified except the ones noted
+[`inmoov_bringup/launch/inmoov.launch.py`](../inmoov_bringup/launch/inmoov.launch.py)
+overrides them, the launch value (the one used on the robot) is given too. All topic names are fully qualified except the ones noted
 as relative (they resolve to the same absolute names when no namespace is set,
 which is how `inmoov_bringup` launches them).
 
@@ -371,13 +369,11 @@ tracked face. Runs a timer at `track_hz` while `/head_tracker/enable` is
 |---|---|---|---|
 | `image_width` | int | `640` | Frame width used to normalize bbox offsets. |
 | `image_height` | int | `480` | Frame height. |
-| `fov_h_deg`, `fov_v_deg` | double | `60.0`, `45.0` | **Declared but not read** anywhere in the code. |
 | `gain_head` | double | `0.5` | Head proportional gain. Launch: `0.3` (`gain_head` arg). |
 | `gain_eye` | double | `0.2` | Eye gain. Launch: `0.6` (`gain_eye` arg). |
 | `dead_zone_px` | int | `20` | Eye dead zone. Launch: `20`. |
 | `head_dead_zone_px` | int | `80` | Head dead zone. Launch: `80`. |
-| `eye_limit_deg` | double | `8.0` | **Declared but not read** (eye range is the hard-coded `_eye_*_range`). |
-| `return_timeout_sec` | double | `12.0` | Seconds without a track before returning to rest. Launch: `10.0` (kept in sync with `inmoov_bringup`). |
+| `return_timeout_sec` | double | `12.0` | Seconds without a track before returning to rest. Launch: `10.0`. |
 | `track_hz` | double | `15.0` | Control-loop rate. Launch: `10.0`. |
 | `min_det_score` | double | `0.50` | Tracks below this score are ignored. |
 | `head_pan_dir`, `head_tilt_dir` | int | `1`, `-1` | Sign conventions for head axes. |
@@ -388,7 +384,6 @@ tracked face. Runs a timer at `track_hz` while `/head_tracker/enable` is
 | `rest_eye_lr` | double | `90.0` | Rest angle of eye left/right. |
 | `rest_eye_ud` | double | `100.0` | Rest angle of eye up/down. |
 | `bbox_ema_alpha` | double | `0.4` | EMA weight of the new bbox. |
-| `max_stale_ticks` | int | `5` | **No longer used** (kept so launch files do not break). |
 
 | Topic | Type | Dir | Notes |
 |---|---|---|---|
@@ -493,17 +488,15 @@ to `top_k_objects`.
 
 ## Launch
 
-```bash
-ros2 launch inmoov_vision vision.launch.py
-ros2 launch inmoov_vision vision.launch.py cam_left:=/dev/v4l/by-path/... cam_right:=/dev/v4l/by-path/...
-```
+The package has no launch file of its own. All nodes are started by
+[`inmoov_bringup/launch/inmoov.launch.py`](../inmoov_bringup/launch/inmoov.launch.py)
+as `LifecycleNode` actions (`respawn=True`) and brought up tier by tier by
+`lifecycle_manager`; `vision:=false` skips all of them:
 
-[`launch/vision.launch.py`](launch/vision.launch.py) starts, as plain `Node`
-actions: `face_capture_node`, `face_detection_node_left`,
-`face_detection_node_right`, `face_tracker_node_left`,
-`face_tracker_node_right`, `face_recognition_node`, `face_gallery_node`,
-`emotion_recognition_node`, `vision_head_tracker_node`, `oak_node`,
-`human_detection_node`, `scene_manager_node`.
+```bash
+ros2 launch inmoov_bringup inmoov.launch.py
+ros2 launch inmoov_bringup inmoov.launch.py cam_left:=/dev/v4l/by-path/... cam_right:=/dev/v4l/by-path/...
+```
 
 **How left/right are parameterized.** The same two executables
 (`face_detection_node`, `face_tracker_node`) are launched twice under
@@ -511,6 +504,8 @@ different node names (`..._left`, `..._right`), and the `camera_side`
 parameter selects the input/output topic pair. The right detection instance
 additionally gets `fallback_for: /face/detections/left` and
 `primary_timeout_sec: 1.5`, which makes it an on-demand standby.
+
+Vision-related launch arguments of `inmoov.launch.py`:
 
 | Launch argument | Default | Goes to |
 |---|---|---|
@@ -532,14 +527,8 @@ Other values (tracker `iou_threshold` 0.20, `max_lost_frames` 20,
 `max_tracks` 4; gallery `gallery_dir`, `min_det_score` 0.75; head-tracker
 `track_hz` 10, `return_timeout_sec` 10, ...) are hard-coded in the launch file.
 
-**Limitation:** every node in this package is a lifecycle node, but
-`vision.launch.py` starts them with the plain `Node` action, so they stay
-`Unconfigured` until something drives them (for example
-`ros2 lifecycle set /face_capture_node configure` then `activate`, per node).
-For the full robot, use `ros2 launch inmoov_bringup inmoov.launch.py`, which
-declares the same nodes with the same parameters as `LifecycleNode` actions
-(with `respawn=True`) and lets `lifecycle_manager` configure/activate them in
-tier order. Nothing publishes `/face_detection/enable` or
+To run a single node by hand: `ros2 run inmoov_vision <node>` and then
+`ros2 lifecycle set /<node> configure` / `activate`. Nothing publishes `/face_detection/enable` or
 `/head_tracker/enable` from this package: they come from
 `behavior_manager_node` in `inmoov_cognition`, and the detection and head
 tracker nodes stay idle until they are `True`.
@@ -611,13 +600,6 @@ tracker nodes stay idle until they are `True`.
   module docstring ("ultrasonic validates the distance").
 - `/human_angle_deg` sign convention is not validated physically (noted in the
   code).
-- Head-tracker parameters `fov_h_deg`, `fov_v_deg`, `eye_limit_deg` and
-  `max_stale_ticks` are declared but unused; joint ranges are hard-coded.
-  Also the head tracker's diagnostics comment says "once a second" but
-  `_TRACK_LOG_INTERVAL_SEC` is 3.0 s.
-- `vision_head_tracker_node` `_last_left_msg_t` is not reset on
-  `/head_tracker/enable`; after a long disabled period the left camera can look
-  "absent" (> 5 s) until its first message arrives after re-enabling.
 - Live-bug history in the code comments (2026-08-24 ... 2026-09-01): the head
   drifting away from the real face or running to the servo limit (runaway),
   hijack by another face at identity confirmation, and "frozen" USB frames.
@@ -634,11 +616,9 @@ tracker nodes stay idle until they are `True`.
   times out to `False`.
 - `emotion_recognition_node` crops the newest frame of the active eye using
   the latest tracks bbox, not the frame the bbox was computed on.
-- Several defaults in the code differ from the values `vision.launch.py`
+- Several defaults in the code differ from the values `inmoov_bringup`
   passes (see the tables above); the launch values are the ones used on the
   robot.
-- `vision.launch.py` starts lifecycle nodes as plain nodes (needs manual
-  lifecycle transitions or `inmoov_bringup`).
 - No automated tests beyond the stock ament copyright/flake8/pep257 checks in
   `test/`.
 

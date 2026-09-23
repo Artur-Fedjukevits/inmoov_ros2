@@ -69,69 +69,77 @@ def rebuild(db_path: str, gallery_dir: str):
     db = sqlite3.connect(db_path)
     app = load_insightface()
 
-    # Clear the current gallery
-    db.execute('DELETE FROM person_gallery')
-    db.commit()
-    print('Gallery cleared. Starting recomputation...\n')
+    try:
+        # Clear the current gallery. DELETE and all INSERTs run in ONE transaction:
+        # an interruption (Ctrl+C, crash) rolls back to the old gallery instead of
+        # leaving a partial one.
+        db.execute('DELETE FROM person_gallery')
+        print('Recomputing gallery (committed only at the end)...\n')
 
-    total_added = 0
-    total_skipped = 0
+        total_added = 0
+        total_skipped = 0
 
-    for person_dir in sorted(gallery_root.iterdir()):
-        if not person_dir.is_dir():
-            continue
-
-        # Directory name: {id}_{name}
-        dir_name = person_dir.name
-        parts = dir_name.split('_', 1)
-        if len(parts) < 2 or not parts[0].isdigit():
-            print(f'  Skipping (invalid name format): {dir_name}')
-            continue
-
-        person_id   = int(parts[0])
-        person_name = parts[1].replace('_', ' ')
-
-        # Check that the person exists in the DB
-        row = db.execute('SELECT name FROM persons WHERE id=?', (person_id,)).fetchone()
-        if not row:
-            print(f'  Person id={person_id} not found in DB — skipping {dir_name}')
-            continue
-
-        photos = sorted(list(person_dir.glob('*.jpg')) + list(person_dir.glob('*.png')))
-        print(f'  {dir_name}: {len(photos)} photos', end='', flush=True)
-
-        added = 0
-        skipped = 0
-        now = datetime.now().isoformat()
-
-        for photo_path in photos:
-            emb = get_embedding(app, str(photo_path))
-            if emb is None:
-                skipped += 1
-                print('.', end='', flush=True)
+        for person_dir in sorted(gallery_root.iterdir()):
+            if not person_dir.is_dir():
                 continue
 
-            # Determine the source from the file name
-            source = 'enroll' if 'enroll' in photo_path.name else (
-                     'manual' if 'manual' in photo_path.name else 'auto')
+            # Directory name: {id}_{name}
+            dir_name = person_dir.name
+            parts = dir_name.split('_', 1)
+            if len(parts) < 2 or not parts[0].isdigit():
+                print(f'  Skipping (invalid name format): {dir_name}')
+                continue
 
-            db.execute(
-                'INSERT INTO person_gallery '
-                '(person_id, photo_path, embedding, quality, source, created_at) '
-                'VALUES (?, ?, ?, ?, ?, ?)',
-                (person_id, str(photo_path), emb.tobytes(), 1.0, source, now),
-            )
-            added += 1
-            print('+', end='', flush=True)
+            person_id   = int(parts[0])
+            person_name = parts[1].replace('_', ' ')
 
+            # Check that the person exists in the DB
+            row = db.execute('SELECT name FROM persons WHERE id=?', (person_id,)).fetchone()
+            if not row:
+                print(f'  Person id={person_id} not found in DB — skipping {dir_name}')
+                continue
+
+            photos = sorted(list(person_dir.glob('*.jpg')) + list(person_dir.glob('*.png')))
+            print(f'  {dir_name}: {len(photos)} photos', end='', flush=True)
+
+            added = 0
+            skipped = 0
+            now = datetime.now().isoformat()
+
+            for photo_path in photos:
+                emb = get_embedding(app, str(photo_path))
+                if emb is None:
+                    skipped += 1
+                    print('.', end='', flush=True)
+                    continue
+
+                # Determine the source from the file name
+                source = 'enroll' if 'enroll' in photo_path.name else (
+                         'manual' if 'manual' in photo_path.name else 'auto')
+
+                db.execute(
+                    'INSERT INTO person_gallery '
+                    '(person_id, photo_path, embedding, quality, source, created_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?)',
+                    (person_id, str(photo_path), emb.tobytes(), 1.0, source, now),
+                )
+                added += 1
+                print('+', end='', flush=True)
+
+            total_added   += added
+            total_skipped += skipped
+            print(f'  → {added} added, {skipped} skipped')
         db.commit()
-        total_added   += added
-        total_skipped += skipped
-        print(f'  → {added} added, {skipped} skipped')
-
+    except BaseException:
+        db.rollback()
+        db.close()
+        print('\nInterrupted — rolled back, the old gallery is unchanged.')
+        raise
     db.close()
     print(f'\nDone: {total_added} embeddings added, {total_skipped} photos skipped (no face).')
     print('\nNotify memory_node to reload:')
+    print('  ros2 service call /memory/query inmoov_msgs/srv/MemoryQuery '
+          '"request_json: \'{op: reload_gallery}\'"')
 
 
 

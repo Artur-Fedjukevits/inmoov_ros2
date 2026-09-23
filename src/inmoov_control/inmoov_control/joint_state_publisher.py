@@ -1,14 +1,11 @@
 """
 joint_state_publisher.py — Publishes /joint_states and /face_joint_states.
 
-Reads the current servo positions via an echo channel (the Arduino publishes
-its values only on change, or on request). For debugging and visualisation in
-rviz2 — subscribes to /joint_command and /face_command and re-publishes them
-as /joint_states / /face_joint_states with a proper header.stamp.
-
-NOTE: in the current implementation no echo channel is read — the node only
-re-publishes the last *commanded* positions (see the JointStatePublisher
-class docstring).
+There is no position feedback from the Arduino (no encoders, no echo channel
+in the protocol), so the node re-publishes the last *commanded* positions: it
+subscribes to /joint_command and /face_command and publishes them as
+/joint_states / /face_joint_states with a proper header.stamp. Until a joint is
+commanded it is reported at its rest position (rest_deg of the joint tables).
 
 Usage:
   Run alongside arduino_right_node and arduino_left_node.
@@ -24,19 +21,20 @@ import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from sensor_msgs.msg import JointState
 
+from .arduino_comm_node  import deg_to_rad
 from .arduino_right_node import ArduinoRightNode
 from .arduino_left_node  import ArduinoLeftNode
 
 
-BODY_JOINT_NAMES = (
-    [n for n, _, _ in ArduinoRightNode.BODY_JOINTS] +
-    [n for n, _, _ in ArduinoLeftNode.BODY_JOINTS]
-)
-
-FACE_JOINT_NAMES = (
-    [n for n, _, _ in ArduinoRightNode.FACE_JOINTS] +
-    [n for n, _, _ in ArduinoLeftNode.FACE_JOINTS]
-)
+# joint → rest position in radians (same convention as /joint_command)
+BODY_REST_RAD = {
+    n: deg_to_rad(rest, center)
+    for n, center, rest in ArduinoRightNode.BODY_JOINTS + ArduinoLeftNode.BODY_JOINTS
+}
+FACE_REST_RAD = {
+    n: deg_to_rad(rest, center)
+    for n, center, rest in ArduinoRightNode.FACE_JOINTS + ArduinoLeftNode.FACE_JOINTS
+}
 
 
 class JointStatePublisher(LifecycleNode):
@@ -51,8 +49,9 @@ class JointStatePublisher(LifecycleNode):
 
     def __init__(self):
         super().__init__('joint_state_publisher')
-        self._body     = {n: 0.0 for n in BODY_JOINT_NAMES}
-        self._face     = {n: 0.0 for n in FACE_JOINT_NAMES}
+        self._body     = dict(BODY_REST_RAD)
+        self._face     = dict(FACE_REST_RAD)
+        self._subs     = []
         self._js_pub   = None
         self._face_pub = None
         self._timer    = None
@@ -60,8 +59,10 @@ class JointStatePublisher(LifecycleNode):
     # ── Lifecycle: Phase 2 ─────────────────────────────────────────────────
 
     def on_configure(self, state):
-        self.create_subscription(JointState, '/joint_command', self._body_cb, 10)
-        self.create_subscription(JointState, '/face_command',  self._face_cb, 10)
+        self._subs = [
+            self.create_subscription(JointState, '/joint_command', self._body_cb, 10),
+            self.create_subscription(JointState, '/face_command',  self._face_cb, 10),
+        ]
         self._js_pub   = self.create_lifecycle_publisher(JointState, '/joint_states',      10)
         self._face_pub = self.create_lifecycle_publisher(JointState, '/face_joint_states', 10)
         self.get_logger().info(
@@ -84,6 +85,16 @@ class JointStatePublisher(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
+        # Destroy what on_configure created — a re-configure must not duplicate them
+        for s in self._subs:
+            self.destroy_subscription(s)
+        self._subs = []
+        for p in (self._js_pub, self._face_pub):
+            if p is not None:
+                self.destroy_lifecycle_publisher(p)
+        self._js_pub = self._face_pub = None
+        self._body = dict(BODY_REST_RAD)
+        self._face = dict(FACE_REST_RAD)
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state):

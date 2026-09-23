@@ -16,10 +16,11 @@ Usage as a standalone node:
   ros2 topic pub /face_expression_hold std_msgs/msg/String "data: happy"
 
 Calibration:
-  Run face_expression_calibrator (test/face_expression_calibrator.py) to tune
-  expression positions interactively.  Results are saved to
-  face_expressions_calibration.json in this directory and loaded automatically
-  on import.
+  Run `ros2 run inmoov_control face_expression_calibrator` to tune expression
+  positions interactively. Results are saved to USER_CALIB_FILE
+  ($INMOOV_FACE_CALIBRATION or ~/.config/inmoov/face_expressions_calibration.json),
+  which survives rebuilds and is loaded on import. Without it the
+  face_expressions_calibration.json shipped with the package is used.
 
 IMPORTANT — firmware protocol quirk:
   Sending degree value 0 in /face_command means "go to rest" (not 0°).
@@ -185,8 +186,13 @@ EXPRESSIONS_DATA: dict[str, dict[str, int]] = {
     },
 }
 
-# Load calibration overrides from JSON (written by face_expression_calibrator GUI)
-_CALIB_FILE = os.path.join(os.path.dirname(__file__), 'face_expressions_calibration.json')
+# Load calibration overrides from JSON (written by face_expression_calibrator GUI).
+# The user file wins; otherwise the calibration shipped with the package is used.
+_PKG_CALIB_FILE = os.path.join(os.path.dirname(__file__), 'face_expressions_calibration.json')
+USER_CALIB_FILE = os.environ.get(
+    'INMOOV_FACE_CALIBRATION',
+    os.path.expanduser('~/.config/inmoov/face_expressions_calibration.json'))
+_CALIB_FILE = USER_CALIB_FILE if os.path.exists(USER_CALIB_FILE) else _PKG_CALIB_FILE
 if os.path.exists(_CALIB_FILE):
     with open(_CALIB_FILE, encoding='utf-8') as _f:
         for _expr, _pos in json.load(_f).items():
@@ -207,11 +213,10 @@ class FaceExpressions:
     """
     Publishes face servo commands to /face_command (sensor_msgs/JointState).
 
-    Expression positions are loaded from EXPRESSIONS_DATA (defaults) or from
-    face_expressions_calibration.json if it exists next to this file.
+    Expression positions are loaded from EXPRESSIONS_DATA (defaults) overridden
+    by the calibration JSON (_CALIB_FILE, see the module docstring).
 
-    Use face_expression_calibrator GUI (test/face_expression_calibrator.py) to
-    tune positions interactively.
+    Use the face_expression_calibrator GUI to tune positions interactively.
     """
 
     EXPRESSION_MAP: dict[str, str] = {
@@ -428,7 +433,7 @@ class FaceExpressionsNode(LifecycleNode):
         self.create_subscription(String, '/face_expression_hold', self._cb_hold, 10)
         self.get_logger().info(
             f'face_expressions_node configured | calib: '
-            f'{"loaded" if os.path.exists(_CALIB_FILE) else "defaults"}')
+            f'{_CALIB_FILE if os.path.exists(_CALIB_FILE) else "defaults"}')
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):

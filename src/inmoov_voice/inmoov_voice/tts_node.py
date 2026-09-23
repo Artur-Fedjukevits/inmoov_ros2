@@ -475,8 +475,7 @@ class TTSNode(LifecycleNode):
         # TTFA (Time To First Audio) — from sending the POST to the first
         # received audio byte: connect + server time until it starts emitting
         # the stream. This latency determines the perceived "responsiveness"
-        # of the TTS — see the discussion of the CosyVoice3 → OmniVoice
-        # migration (MIGRATION_NOTES.md).
+        # of the TTS (measured during the CosyVoice3 → OmniVoice migration).
         t_req_start = time.time()
         ttfa_logged = False
 

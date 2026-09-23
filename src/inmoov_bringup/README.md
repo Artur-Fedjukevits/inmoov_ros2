@@ -65,9 +65,18 @@ any custom API from the nodes it manages.
   `WAKE`. Triggered either by the `/lifecycle/command` topic or automatically
   by the latched `/robot_sleep` topic (published elsewhere in the system,
   e.g. by `inmoov_cognition`).
-- **Shutdown**: `DEACTIVATE`s, then `CLEANUP`s, then shuts down every node,
-  tier by tier from the highest tier down to tier 0, stopping the watchdog
-  first.
+- **Shutdown**: stops the watchdog, then takes every node through
+  `DEACTIVATE` → `CLEANUP` → `SHUTDOWN`, tier by tier from the highest tier
+  down to tier 0.
+- **State-aware transitions**: before a `DEACTIVATE` / `CLEANUP` / `SHUTDOWN`
+  the manager reads the node's current state and sends only valid
+  transitions — an invalid one (e.g. `DEACTIVATE` of an already `INACTIVE`
+  node) makes rclpy raise inside the node's `change_state` service and kills
+  the process. Watchdog and cascade recovery respect SLEEP: a SLEEP-set node
+  recovered while the robot is asleep is configured but left `INACTIVE`.
+- **YAML overrides**: `retry_*`, `transition_timeout_sec`,
+  `tier_advance_timeout_sec`, `watchdog_*` and `max_respawn_count` in the
+  `config_file` YAML override the node parameters.
 
 **Parameters**
 
@@ -78,7 +87,7 @@ any custom API from the nodes it manages.
 | `transition_timeout_sec` | double | `30.0` | Timeout waiting for a `change_state`/`get_state` service call. |
 | `tier_advance_timeout_sec` | double | `90.0` | Max time to wait (via `Thread.join`) for all nodes in a tier to finish activating before moving on. |
 | `config_file` | string | `''` | Path to a YAML file (see `config/lifecycle.yaml`) defining `tiers` and overriding the parameters above. If empty, the manager waits for `configure_tiers()` to be called programmatically instead. |
-| `autostart_delay_sec` | double | `5.0` | Delay after startup before automatically activating tier 0. If tiers aren't configured yet, or this is `<= 0`, autostart is skipped. |
+| `autostart_delay_sec` | double | `5.0` | Delay after startup before automatically activating tier 0. If tiers aren't configured yet, or this is `<= 0`, autostart is skipped and the manager waits in `idle` for an `ACTIVATE` command. |
 | `watchdog_interval_sec` | double | `5.0` | Polling interval for the watchdog loop. Set `<= 0` to disable the watchdog entirely. |
 | `watchdog_startup_delay_sec` | double | `15.0` | Grace period after full system activation before the watchdog starts polling (avoids false positives while nodes are still settling). |
 | `max_respawn_count` | int | `5` | Max watchdog-driven recovery attempts per node before it's left permanently `degraded`. |
@@ -88,8 +97,8 @@ any custom API from the nodes it manages.
 
 | Topic | Type | Direction | Notes |
 |---|---|---|---|
-| `/lifecycle/status` | `std_msgs/String` (JSON) | publish, every 2s | `{system, sleep_mode, degraded_nodes[], recovering_nodes[], tiers: [{id, nodes: {name: {critical, degraded, degraded_reason, respawn_count, recovering, attempts}}}]}`. `system` is one of `starting`, `active`, `fault`, `degraded`, `sleep`, `waking`, `shutdown`. |
-| `/lifecycle/command` | `std_msgs/String` | subscribe | Commands: `SHUTDOWN`, `SLEEP`, `WAKE`, `RESTART_TIER <N>`. (`ACTIVATE`/`DEACTIVATE` are described in the module docstring but are not currently implemented as command handlers — activation only happens via autostart or `start_activation()`.) |
+| `/lifecycle/status` | `std_msgs/String` (JSON) | publish, every 2s | `{system, sleep_mode, degraded_nodes[], recovering_nodes[], tiers: [{id, nodes: {name: {critical, degraded, degraded_reason, respawn_count, recovering, attempts}}}]}`. `system` is one of `idle` (no autostart, waiting for `ACTIVATE`), `starting`, `active`, `fault`, `degraded`, `sleep`, `waking`, `deactivated`, `shutdown`. |
+| `/lifecycle/command` | `std_msgs/String` | subscribe | Commands: `ACTIVATE`, `DEACTIVATE`, `SHUTDOWN`, `SLEEP`, `WAKE`, `RESTART_TIER <N>`. `DEACTIVATE` deactivates tiers N..1 top-down (Foundation stays active) and pauses the watchdog and SLEEP/WAKE transitions (the sleep flag is still remembered). `ACTIVATE` after `DEACTIVATE` re-activates tiers 1..N with a fresh retry budget (SLEEP-set nodes stay inactive if the robot is asleep); from `idle` or `fault` it runs the full tier 0..N activation; otherwise it is a no-op. |
 | `/robot_sleep` | `std_msgs/Bool` (latched, `TRANSIENT_LOCAL`/`RELIABLE`, depth 1) | subscribe | Drives the same SLEEP/WAKE logic as the command topic; published elsewhere in the system. |
 
 **Services used (per managed node)**
@@ -99,10 +108,6 @@ any custom API from the nodes it manages.
 
 **Known issues / TODOs (from code comments)**
 
-- The module docstring documents an `ACTIVATE`/`DEACTIVATE` pair of commands
-  on `/lifecycle/command`, but `_command_cb` only handles `SHUTDOWN`, `SLEEP`,
-  `WAKE`, and `RESTART_TIER N` — `ACTIVATE`/`DEACTIVATE` fall through to the
-  "unknown command" branch.
 - `_recover_node`'s comment notes a deliberate 3-second sleep before
   `_cascade_recover` to avoid a race where recovery could run before
   `_cascade_deactivate` has finished marking all affected tiers

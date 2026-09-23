@@ -247,9 +247,18 @@ class SemanticMemory:
     # ------------------------------------------------------------------
 
     def delete_fact(self, subject: str, predicate: str) -> bool:
+        """Deletes the fact from SQLite and its vector from ChromaDB."""
         with self._conn() as conn:
             cur = conn.execute(
                 "DELETE FROM facts WHERE subject=? AND predicate=?",
                 (subject, predicate),
             )
-            return cur.rowcount > 0
+            deleted = cur.rowcount > 0
+        if self._chroma is not None:
+            import hashlib
+            chroma_id = hashlib.md5(f"{subject}::{predicate}".encode()).hexdigest()
+            try:
+                self._chroma.delete(ids=[chroma_id])
+            except Exception as exc:
+                logger.warning("ChromaDB delete failed (%s::%s): %s", subject, predicate, exc)
+        return deleted

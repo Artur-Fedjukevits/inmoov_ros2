@@ -24,12 +24,14 @@ Parameters:
   schema_repeat_sec — schema re-publish interval (default: 10.0)
   ws_ping_interval  — WS ping keepalive interval in seconds (default: 30)
 
-Environment monitoring (→ Telegram push, NOT the reminders DB):
-  Temperature: > 25°C or < 16°C
+Environment monitoring (→ Telegram push, NOT the reminders DB). Thresholds are
+the constants in inmoov_memory/openhab_alerts.py (the single source of truth):
+  Temperature: > 27°C or < 16°C (outdoor sensors excluded)
   Humidity:    > 70%  or < 30%
   CO₂:         > 1200 ppm
   VOC:         > 300 ppb
-  Battery:     < 20%
+  Radon:       > 200 Bq/m³ short-term, > 100 Bq/m³ long-term
+  Battery:     < 10% (*_Battery Number) or *_BatteryLow switch ON
 
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)

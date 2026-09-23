@@ -3,13 +3,13 @@
 diagnose.py — Diagnostics for all components of the InMoov Voice Pipeline.
 
 Usage:
-    python3 src/inmoov_voice/scripts/diagnose.py
-    python3 src/inmoov_voice/scripts/diagnose.py --quick   # without inference tests
+    ros2 run inmoov_voice diagnose
+    ros2 run inmoov_voice diagnose --quick   # without inference tests
 
 Checks:
   - Network services (vLLM, TTS, OpenHAB)
   - Models (whether they are loaded in vLLM, LLM inference)
-  - Filesystem (wake word model)
+  - Filesystem (wake word model, Silero VAD / Parakeet STT caches)
   - Audio devices
   - Python packages
   - ROS2 environment
@@ -175,7 +175,7 @@ def check_llm(quick: bool) -> list[Check]:
 def check_tts(quick: bool) -> list[Check]:
     checks = []
 
-    for label, base_url in [('Primary (RTX 3090)', TTS_PRIMARY),
+    for label, base_url in [('Primary (RTX 5060)', TTS_PRIMARY),
                               ('Local (ROCm)', TTS_LOCAL)]:
         if not base_url:
             continue
@@ -269,26 +269,19 @@ def check_filesystem() -> list[Check]:
             silero_cache
         ))
 
-    # Whisper cache
-    whisper_cache = os.path.expanduser('~/.cache/huggingface')
-    name = 'Whisper model cache'
-    if os.path.isdir(whisper_cache):
-        # look for the medium model
-        found = any(
-            'medium' in root
-            for root, _, _ in os.walk(whisper_cache)
-            if 'faster-whisper' in root
-        )
-        if found:
-            checks.append(Check(name, 'ok', 'faster-whisper medium found'))
-        else:
-            checks.append(Check(
-                name, 'warn',
-                'faster-whisper medium not found — will be downloaded on first run (~1.5GB)',
-                whisper_cache
-            ))
+    # Parakeet STT (onnx-asr downloads it into the Hugging Face hub cache)
+    hf_hub = os.path.join(
+        os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface')), 'hub')
+    name = 'Parakeet STT model cache'
+    found = os.path.isdir(hf_hub) and any('parakeet' in d.lower() for d in os.listdir(hf_hub))
+    if found:
+        checks.append(Check(name, 'ok', 'parakeet-tdt ONNX model found', hf_hub))
     else:
-        checks.append(Check(name, 'warn', 'Hugging Face cache not found'))
+        checks.append(Check(
+            name, 'warn',
+            'Parakeet model not cached — will be downloaded on first run',
+            hf_hub
+        ))
 
     return checks
 
@@ -347,14 +340,14 @@ def check_python_packages() -> list[Check]:
     checks = []
     packages = [
         ('rclpy',         'ROS2 Python client'),
-        ('faster_whisper','Whisper STT'),
+        ('onnx_asr',      'Parakeet STT (onnx-asr)'),
+        ('speechbrain',   'ECAPA speaker verification / voice emotion'),
         ('torch',         'PyTorch (Silero VAD)'),
         ('openwakeword',  'Wake word detector'),
         ('pyaudio',       'Microphone capture'),
         ('sounddevice',   'Audio playback'),
         ('requests',      'HTTP client'),
         ('numpy',         'Audio processing'),
-        ('py_trees',      'Behavior Tree'),
     ]
     for pkg, desc in packages:
         try:
