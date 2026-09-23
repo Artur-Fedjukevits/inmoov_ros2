@@ -9,7 +9,8 @@ Leader/follower logic:
     drives the head (rothead + neck) and publishes eye_lr_L / eye_ud_L.
     EYE_SYNC in arduino_comm_node mirrors the right eye automatically.
 
-  Fallback — the right eye (if the left is unavailable > STALE_SEC):
+  Fallback — the right eye (if the left has sent no track message for
+  _FALLBACK_SEC = 5 s):
     takes over head control and publishes eye_lr_R / eye_ud_R.
     EYE_SYNC mirrors the left eye.
 

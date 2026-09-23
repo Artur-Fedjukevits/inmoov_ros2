@@ -897,7 +897,7 @@ class IdentityManagerNode(LifecycleNode):
             'chat_template_kwargs': {'enable_thinking': False},
         }
         headers = {'Authorization': f'Bearer {self._bearer_token}'} if self._bearer_token else {}
-        for url in [self._llm_url, self._llm_fallback_url]:
+        for url in [u for u in (self._llm_url, self._llm_fallback_url) if u]:
             try:
                 r = requests.post(url, json=payload, headers=headers, timeout=(3.0, 25.0))
                 r.raise_for_status()
@@ -1675,7 +1675,7 @@ class IdentityManagerNode(LifecycleNode):
 
     def on_configure(self, state):
         self._dp('no_face_timeout_sec',          15.0)
-        self._dp('no_human_timeout_sec',         20.0)
+        self._dp('no_human_timeout_sec',         30.0)
         self._dp('max_face_hunt_sec',            90.0)
         self._dp('greet_cooldown_sec',          120.0)
         self._dp('emotion_react_thresh',          0.70)
@@ -1689,7 +1689,7 @@ class IdentityManagerNode(LifecycleNode):
         self._dp('llm_url', 'http://192.168.10.118:18020/v1/chat/completions')
         self._dp('voice_high_threshold',    0.62)
         self._dp('voice_uncertain_threshold', 0.50)
-        self._dp('llm_fallback_url', 'http://localhost:11434/v1/chat/completions')
+        self._dp('llm_fallback_url', '')   # optional backup endpoint; empty = none
         self._dp('bearer_token', '')
         self._dp('name_extract_model', 'qwen3.8-27b')
         self._dp('gaze_yaw_threshold',  0.30)

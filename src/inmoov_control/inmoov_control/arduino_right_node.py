@@ -57,13 +57,13 @@ class ArduinoRightNode(ArduinoCommNode):
     # (joint_name, center_deg, rest_deg)
     # ORDER MUST MATCH InMoovRight.ino ServoIndex enum / packet byte offsets.
     BODY_JOINTS = [
-        ('thumb_R',     90,   0),   # [0]  pin 2,  rest=0,   min=0,   max=180
-        ('index_R',     90,   0),   # [1]  pin 3,  rest=0,   min=0,   max=180
-        ('middle_R',    90,   0),   # [2]  pin 4,  rest=0,   min=0,   max=180
-        ('ring_R',      90,   0),   # [3]  pin 5,  rest=0,   min=0,   max=180
-        ('pinky_R',     90,   0),   # [4]  pin 6,  rest=0,   min=0,   max=180
-        ('wrist_R',     90,   0),   # [5]  pin 7,  rest=0,   min=0,   max=180
-        ('bicep_R',     90,   0),   # [6]  pin 8,  rest=0,   min=0,   max=90
+        ('thumb_R',     90,  60),   # [0]  pin 2,  rest=60,  min=0,   max=140
+        ('index_R',     90,  40),   # [1]  pin 3,  rest=40,  min=0,   max=160
+        ('middle_R',    90,  40),   # [2]  pin 4,  rest=40,  min=0,   max=160
+        ('ring_R',      90,  30),   # [3]  pin 5,  rest=30,  min=0,   max=150
+        ('pinky_R',     90,  40),   # [4]  pin 6,  rest=40,  min=0,   max=170
+        ('wrist_R',     90,  90),   # [5]  pin 7,  rest=90,  min=0,   max=180
+        ('bicep_R',     90,   0),   # [6]  pin 8,  rest=0,   min=0,   max=80
         ('rotate_R',    90,  90),   # [7]  pin 9,  rest=90,  min=40,  max=180
         ('shoulder_R',  90,  30),   # [8]  pin 10, rest=30,  min=0,   max=180
         ('omoplate_R',  90,  10),   # [9]  pin 11, rest=10,  min=10,  max=80

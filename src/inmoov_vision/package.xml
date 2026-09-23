@@ -12,6 +12,14 @@
   <depend>sensor_msgs</depend>
   <depend>inmoov_msgs</depend>
 
+  <!-- Python runtime deps resolvable via rosdep (`rosdep install --from-paths src`) -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-onnxruntime-pip</exec_depend>
+  <exec_depend>python3-insightface-pip</exec_depend>
+  <!-- No rosdep keys: depthai (v3 Python API, oak_node) and hsemotion-onnx
+       (emotion_recognition_node) — install them from requirements.txt -->
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

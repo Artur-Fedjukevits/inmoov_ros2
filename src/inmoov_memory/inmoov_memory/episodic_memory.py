@@ -2,8 +2,10 @@
 EpisodicMemory — episodic memory layer
 ========================================
 Stores short-term events and dialogues in SQLite.
-Sliding window: 7 days / 200 records.
-Important episodes migrate into semantic memory.
+Sliding window: low-importance episodes (<= 0.5) older than 7 days are purged
+by memory_node's periodic cleanup(); important episodes are kept.
+Facts from important episodes are extracted into semantic memory
+(the episode is then marked migrated=1).
 
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
@@ -162,11 +164,15 @@ class EpisodicMemory:
     # ------------------------------------------------------------------
 
     def cleanup(self, older_than_days: int = 7, max_importance: float = 0.5) -> int:
-        """Deletes old, low-importance episodes. Returns the number deleted."""
+        """Deletes old, low-importance episodes. Returns the number deleted.
+
+        Not restricted to migrated=1: low-importance episodes are below the fact
+        extraction threshold, so they never get migrated and would never be purged.
+        """
         cutoff = (datetime.now() - timedelta(days=older_than_days)).strftime("%Y-%m-%d")
         with self._conn() as conn:
             cur = conn.execute(
-                "DELETE FROM episodes WHERE date < ? AND importance <= ? AND migrated = 1",
+                "DELETE FROM episodes WHERE date < ? AND importance <= ?",
                 (cutoff, max_importance),
             )
             return cur.rowcount

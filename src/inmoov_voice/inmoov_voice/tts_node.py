@@ -107,7 +107,9 @@ class TTSNode(LifecycleNode):
 
     def on_configure(self, state):
         self._dp('tts_server_url',       'http://192.168.10.118:8000')
-        self._dp('tts_fallback_url',     'http://localhost:8000')
+        # Optional backup TTS server; empty = no fallback. (The local CosyVoice3 on the
+        # NUC's ROCm iGPU was removed — too slow for live dialogue.)
+        self._dp('tts_fallback_url',     '')
         self._dp('chunk_size',           4096)
         self._dp('connect_timeout_sec',  5.0)
         self._dp('timeout_sec',          30.0)
@@ -163,7 +165,7 @@ class TTSNode(LifecycleNode):
         self._output_device = self._find_output_device(
             self.get_parameter('output_device_name').value)
 
-        # Check the servers — WARN if unavailable, but not FAILURE (a fallback exists)
+        # Check the servers — WARN if unavailable, but not FAILURE (the server may come up later)
         self._check_servers()
 
         if not self._stall_watchdog_ready:
@@ -260,12 +262,14 @@ class TTSNode(LifecycleNode):
         if self._probe_server(self.primary_url):
             self._active_url = self.primary_url
             self.get_logger().info(f'TTS: primary server is reachable ({self.primary_url})')
-        elif self._probe_server(self.fallback_url):
+        elif self.fallback_url and self._probe_server(self.fallback_url):
             self._active_url = self.fallback_url
             self.get_logger().warn(
                 f'Primary TTS unavailable! Fallback: {self.fallback_url}')
         else:
-            self.get_logger().error('Both TTS servers are unavailable!')
+            self.get_logger().error(
+                'TTS server(s) unavailable!'
+                + ('' if self.fallback_url else ' (no fallback configured)'))
 
     def _probe_server(self, url: str) -> bool:
         try:
@@ -380,7 +384,7 @@ class TTSNode(LifecycleNode):
         # ── URL selection with fallback ────────────────────────────────────
         urls = [self._active_url]
         other = self.fallback_url if self._active_url == self.primary_url else self.primary_url
-        if other != self._active_url:
+        if other and other != self._active_url:
             urls.append(other)
 
         success   = False

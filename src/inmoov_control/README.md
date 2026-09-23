@@ -348,12 +348,12 @@ Columns `rest / min / max` are from the **firmware** servo table
 
 | Byte | Joint | Pin | Firmware rest / min / max | Python rest |
 |---|---|---|---|---|
-| 0 | `thumb_R` | 2 | 60 / 0 / 140 | 0 |
-| 1 | `index_R` | 3 | 40 / 0 / 160 | 0 |
-| 2 | `middle_R` | 4 | 40 / 0 / 160 | 0 |
-| 3 | `ring_R` | 5 | 30 / 0 / 150 | 0 |
-| 4 | `pinky_R` | 6 | 40 / 0 / 170 | 0 |
-| 5 | `wrist_R` | 7 | 90 / 0 / 180 | 0 |
+| 0 | `thumb_R` | 2 | 60 / 0 / 140 | 60 |
+| 1 | `index_R` | 3 | 40 / 0 / 160 | 40 |
+| 2 | `middle_R` | 4 | 40 / 0 / 160 | 40 |
+| 3 | `ring_R` | 5 | 30 / 0 / 150 | 30 |
+| 4 | `pinky_R` | 6 | 40 / 0 / 170 | 40 |
+| 5 | `wrist_R` | 7 | 90 / 0 / 180 | 90 |
 | 6 | `bicep_R` | 8 | 0 / 0 / 80 | 0 |
 | 7 | `rotate_R` | 9 | 90 / 40 / 180 | 90 |
 | 8 | `shoulder_R` | 10 | 30 / 0 / 180 | 30 |
@@ -370,15 +370,15 @@ fingers on A0–A4 (`thumb, index, middle, ring, pinky`).
 
 | Byte | Joint | Driver / pin | Firmware rest / min / max | Python rest |
 |---|---|---|---|---|
-| 0 | `thumb_L` | GPIO 2 | 40 / 0 / 150 | 0 |
-| 1 | `index_L` | GPIO 3 | 40 / 0 / 150 | 0 |
-| 2 | `majeure_L` | GPIO 4 | 40 / 0 / 150 | 0 |
-| 3 | `ring_L` | GPIO 5 | 40 / 0 / 150 | 0 |
-| 4 | `pinky_L` | GPIO 6 | 40 / 0 / 150 | 0 |
-| 5 | `wrist_L` | GPIO 7 | 150 / 0 / 300 | 0 |
+| 0 | `thumb_L` | GPIO 2 | 50 / 0 / 145 | 50 |
+| 1 | `index_L` | GPIO 3 | 0 / 0 / 150 | 0 |
+| 2 | `majeure_L` | GPIO 4 | 0 / 0 / 150 | 0 |
+| 3 | `ring_L` | GPIO 5 | 0 / 0 / 140 | 0 |
+| 4 | `pinky_L` | GPIO 6 | 0 / 0 / 150 | 0 |
+| 5 | `wrist_L` | GPIO 7 | 150 / 0 / 300 | 150 |
 | 6 | `bicep_L` | GPIO 8 | 0 / 0 / 90 | 0 |
 | 7 | `rotate_L` | GPIO 9 | 90 / 40 / 180 | 90 |
-| 8 | `shoulder_L` | GPIO 10 | 30 / 0 / 180 | 30 |
+| 8 | `shoulder_L` | GPIO 10 | 20 / 0 / 180 | 20 |
 | 9 | `omoplate_L` | GPIO 11 | 25 / 25 / 90 | 25 |
 | 10 | `neck` | GPIO 12 | 40 / 0 / 100 | 40 |
 | 11 | `rothead` | GPIO 13 | 90 / 30 / 140 | 90 |
@@ -404,12 +404,12 @@ I2C clock 400 kHz; `INV` channels are written as `180 - angle`. The left board
 has only an ultrasonic sensor (TRIG 64 / ECHO 63) and Hall fingers (A0–A4,
 middle/pinky swapped); no PIR.
 
-Discrepancies between the Python trailing comments and the firmware tables
-(firmware wins): finger servos rest/max (Python comments say `rest=0`,
-`max=180`; firmware has the values above), `bicep_R` max (Python comment 90,
-firmware 80), `wrist_L` max (firmware 300 — larger than 180, effectively
-limited by the servo library), `jaw` max (Python comment in `arduino_left_node`
-says 25, firmware and `face_expressions_node` use 90).
+The Python `rest_deg` values and trailing min/max comments in
+`arduino_{left,right}_node.py` (and the slider table in
+`test/servo_calibration_gui.py`) mirror the firmware tables above — the
+firmware is the source of truth, so change it there first and then sync the
+Python side. Note `wrist_L` max is 300 in the firmware, but a SET_SERVOS byte
+is 0–180 and `Servo.write` caps at 180, so the effective max is 180.
 
 ## Launch
 

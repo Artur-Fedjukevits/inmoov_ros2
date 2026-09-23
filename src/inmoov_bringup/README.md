@@ -82,6 +82,7 @@ any custom API from the nodes it manages.
 | `watchdog_interval_sec` | double | `5.0` | Polling interval for the watchdog loop. Set `<= 0` to disable the watchdog entirely. |
 | `watchdog_startup_delay_sec` | double | `15.0` | Grace period after full system activation before the watchdog starts polling (avoids false positives while nodes are still settling). |
 | `max_respawn_count` | int | `5` | Max watchdog-driven recovery attempts per node before it's left permanently `degraded`. |
+| `disabled_nodes` | string | `''` | Comma-separated node names dropped from the tiers (not managed at all). The launch file fills it with the vision nodes when `vision:=false` and with `telegram_bridge_node` when `telegram:=false`, so activation doesn't wait out retries for nodes that were never started. |
 
 **Topics**
 
@@ -118,7 +119,8 @@ ros2 launch inmoov_bringup inmoov.launch.py
 
 The launch file ([`launch/inmoov.launch.py`](launch/inmoov.launch.py)) starts
 `lifecycle_manager` as a plain `Node` (pointed at `config/lifecycle.yaml` via
-the `config_file` parameter) plus every managed node as a `LifecycleNode`,
+the `config_file` parameter, with `disabled_nodes` computed from the `vision`/
+`telegram` arguments) plus every managed node as a `LifecycleNode`,
 all starting `Unconfigured` — the manager alone drives every transition.
 Every managed node is launched with `respawn=True`, `respawn_delay=2.0` so
 `ros2 launch` restarts a crashed process and the watchdog can then reactivate
@@ -133,21 +135,25 @@ Nodes launched, by tier: `memory_node` (0); `audio_source_node`,
 `face_gallery_node`, `emotion_recognition_node`, `vision_head_tracker_node`,
 `human_detection_node`, `scene_manager_node`, `llm_node`,
 `openhab_bridge_node` (4); `identity_manager_node`, `behavior_manager_node`
-(5); `telegram_bridge_node` (6, only if `telegram:=true`).
+(5); `telegram_bridge_node` (6, only if `telegram:=true`). All camera/face/OAK
+nodes (`face_capture_node`, `oak_node`, `face_detection_node_*`,
+`face_tracker_node_*`, `face_recognition_node`, `face_gallery_node`,
+`emotion_recognition_node`, `vision_head_tracker_node`, `human_detection_node`,
+`scene_manager_node`) are started only if `vision:=true`.
 
 ### Launch arguments
 
 Servers / LLM:
 - `llm_url` (default `http://192.168.10.118:18020/v1/chat/completions`) — OpenAI-compatible chat.completions endpoint (vLLM), shared by `llm_node` and `identity_manager_node` (name extraction).
-- `llm_fallback_url` (default `http://localhost:11434/v1/chat/completions`) — backup endpoint.
+- `llm_fallback_url` (default `''`) — optional OpenAI-compatible backup endpoint; empty = no fallback.
 - `llm_bearer_token` (default from env `VLLM_BEARER_TOKEN`)
 - `llm_model` (default `qwen3.8-27b`), `llm_temperature` (`0.1`), `llm_max_tokens` (`512`)
-- `tts_server_url` (default `http://192.168.10.118:8000`), `tts_fallback_url` (default `http://localhost:8000`)
+- `tts_server_url` (default `http://192.168.10.118:8000`), `tts_fallback_url` (default `''` — no fallback)
 - `openhab_url` (default `http://192.168.10.118:8080`)
 
 Wake word:
 - `wakeword_model` (default `/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx`)
-- `wakeword_threshold` (default `0.3`)
+- `wakeword_threshold` (default `0.2`)
 
 Audio:
 - `audio_device_index` (default `-1`), `audio_device_name` (default `pulse`), `output_device_name` (default `''`)
@@ -155,8 +161,8 @@ Audio:
 - `pa_source_check` (default `Jabra`, empty string disables the check)
 
 VAD / speaker verification:
-- `vad_threshold` (`0.5`), `silence_duration_sec` (`2.5`), `pipeline_timeout_sec` (`45.0`)
-- `speaker_verification` (`true`), `sv_threshold` (`0.45`), `sv_segment_sec` (`3.0`)
+- `vad_threshold` (`0.4`), `silence_duration_sec` (`2.5`), `pipeline_timeout_sec` (`45.0`)
+- `speaker_verification` (`true`), `sv_threshold` (`0.55`), `sv_segment_sec` (`1.0`)
 
 Tavily:
 - `tavily_api_key` (default from env `TAVILY_API_KEY`)
@@ -169,7 +175,7 @@ Memory:
 - `memory_db_path` (default `/home/artur/inmoov_memory.db`)
 
 Vision:
-- `vision` (default `true`) — declared but not currently wired to any `IfCondition` in the launch file
+- `vision` (default `true`) — gates all camera/face/OAK nodes via `IfCondition`; with `false` they are neither started nor managed by `lifecycle_manager`
 - `cam_left` (default `/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0`)
 - `cam_right` (default `/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0`)
 - `fps` (`15`), `detection_hz` (`5.0`), `det_thresh` (`0.5`), `analysis_hz` (`2.0`)

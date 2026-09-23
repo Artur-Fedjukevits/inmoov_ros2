@@ -94,6 +94,9 @@ Declared in `on_configure` (safe against re-declaration on re-configure):
 | `telegram_reminder_person_id` | int | `5` | `persons.id` whose due reminders are pushed to Telegram; `<= 0` disables the timer. The default is specific to the author's database. |
 | `telegram_reminder_check_sec` | double | `60.0` | Period (s) of the Telegram-reminder check. |
 | `reminder_default_time` | string | `07:00` | Time of day used for reminders that have a date but no `trigger_time`. |
+| `episodic_retention_days` | int | `7` | Episodic sliding window: episodes older than this with low importance are purged. |
+| `episodic_cleanup_max_importance` | double | `0.5` | Only episodes with `importance <=` this are purged; more important ones are kept. |
+| `episodic_cleanup_interval_sec` | double | `21600.0` | Period (s) of the episodic cleanup timer (also run once on activation); `<= 0` disables it. |
 
 The full-robot launch files only override `db_path`, `similarity_threshold`,
 `llm_url`, `llm_model` and `bearer_token`.
@@ -108,7 +111,7 @@ quality filter `0.40`; photo gallery limit on merge `30`.
 |---|---|---|---|
 | `/social_context` | `std_msgs/String` (JSON) | subscribe (depth 10) | From `identity_manager`. Reads `person_present`, `name`, `state` (`IDLE`→`idle`, `INTERACTING`/`INTRODUCING`→`conversation`, anything else → `idle`) and updates working memory (people nearby, facing, mode). `emotion` is read but unused. |
 | `/conversation_end` | `std_msgs/String` (JSON) | subscribe (depth 10) | Payload `{"transcript": "<text>", "participants": ["<name>", ...]}`. An empty transcript is ignored. Otherwise a background thread runs `MemoryManager.after_conversation` (summary → episode → optional fact extraction), republishes `/memory/context`, and starts reminder extraction. |
-| `/robot_sleep` | `std_msgs/Bool` | subscribe (`RELIABLE`, `TRANSIENT_LOCAL`, depth 1) | Sets working-memory mode to `idle`; on `True` also clears people nearby and facing. |
+| `/robot_sleep` | `std_msgs/Bool` | subscribe (`RELIABLE`, `TRANSIENT_LOCAL`, depth 1) | Sets working-memory mode to `sleep` on `True` (also clears people nearby and facing) and back to `idle` on `False`. While asleep, `/social_context` does not overwrite the mode. |
 | `/memory/context` | `std_msgs/String` | publish (lifecycle publisher, depth 10) | Plain text: `== Текущий момент ==` + working memory, and `== Последние события ==` + the last 5 episodes if any. Published every `context_publish_rate` seconds, right after activation and after each processed dialogue. |
 | `/telegram_push` | `std_msgs/String` (JSON) | publish (lifecycle publisher, depth 10) | `{"text": "⏰ <b>Напоминание:</b> ...", "parse_mode": "HTML"}` for due reminders of `telegram_reminder_person_id` (consumed by `telegram_bridge_node`). |
 
@@ -223,8 +226,6 @@ it may be read back to the user by the LLM.
 - All ops run on the service callback of the node's default (single-threaded)
   executor; LLM-based work is moved to background threads, but a slow
   `merge_persons` or ChromaDB query blocks other requests.
-- `_robot_sleep_cb` computes `mode = 'idle' if msg.data else 'idle'`, i.e. the
-  mode is always `idle` (no distinct "sleep" mode exists).
 - Code fences returned by the LLM are stripped with `str.lstrip('```json')`,
   which strips a *character set*, not a prefix; it works for normal answers but
   can eat leading `j`, `s`, `o`, `n` characters of a raw JSON answer (JSON
@@ -270,7 +271,7 @@ given the semantic facts share the episodic DB file.
 **`WorkingMemory`** — RAM dict, recomputed time block on every `to_text()`.
 Fields: `time` (timestamp, time of day, weekday, season, ... in English and
 Russian), `location` (`room`, `coordinates`, `landmark`), `robot_state`
-(`mode`: `idle | conversation | navigation | task`, `battery`,
+(`mode`: `idle | conversation | sleep | navigation | task`, `battery`,
 `current_task`, `facing`), `environment` (`people_present`, `ambient_noise`,
 `lighting`). `to_text()` renders a Russian multi-line block for the LLM. Only
 `mode`, `people_present`, `facing` are updated by ROS topics; `location`,
@@ -287,11 +288,13 @@ importance REAL DEFAULT 0.3, migrated INTEGER DEFAULT 0
 ```
 
 Indexes `idx_ep_date(date)` and `idx_ep_importance(importance)`. The module
-docstring describes a sliding window of 7 days / 200 records and migration of
-important episodes into semantic memory; `cleanup()` (deletes rows older than
-N days with `importance <= max` **and** `migrated = 1`),
-`get_unmigrated_important()` and `mark_migrated()` exist, but nothing calls
-them (see [Known issues to verify](#known-issues-to-verify)).
+sliding window is enforced by `memory_node`: every
+`episodic_cleanup_interval_sec` (and once on activation) `cleanup()` deletes
+episodes older than `episodic_retention_days` with
+`importance <= episodic_cleanup_max_importance`. Important episodes are kept;
+when `after_conversation` extracts facts from an episode (importance `>= 0.6`)
+the episode is marked `migrated = 1`. `get_unmigrated_important()` is
+currently unused.
 
 **`SemanticMemory`** — table `facts`:
 
@@ -503,13 +506,6 @@ ros2 lifecycle set /memory_node activate
 
 ## Known issues to verify
 
-- Episodic clean-up and migration are never invoked: nothing calls
-  `EpisodicMemory.cleanup`, `get_unmigrated_important` or `mark_migrated`
-  (nor `MemoryManager.wipe_episodic`), and `migrated` is never set, so the
-  documented "7 days / 200 records" sliding window is not enforced and the
-  `episodes` table grows without bound. Also, `cleanup()` only deletes rows that
-  are already `migrated = 1`. Semantic facts are extracted directly from
-  dialogues, not by migrating episodes.
 - `merge_persons` uses hardcoded `/home/artur/...` paths (photo directory,
   episodic DB) instead of the configured parameters.
 - `/memory/context` (node) and `MemoryManager.build_system_prompt` use different
@@ -523,7 +519,6 @@ ros2 lifecycle set /memory_node activate
   (temperature `> 25 °C`, battery `< 20 %`) than the constants in
   `openhab_alerts.py` (`> 27 °C`, `< 10 %`); the constants in this package are
   what the code uses.
-- `_robot_sleep_cb` always sets mode `idle`.
 - `SemanticMemory.delete_fact` does not remove the ChromaDB entry.
 - Shipped defaults contain author-specific values: `/home/artur/...` paths, the
   LAN address `192.168.10.118:18020` for `llm_url`, `telegram_reminder_person_id=5`

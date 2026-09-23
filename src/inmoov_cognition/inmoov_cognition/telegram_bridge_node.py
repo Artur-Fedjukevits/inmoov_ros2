@@ -21,7 +21,6 @@ Commands:
   /ask <text>      — through llm_node → full pipeline
   /wake            — /robot_sleep False
   /sleep           — /robot_sleep True (instant transition to SLEEP, no LLM)
-  /restart_tts     — restarts the local cosyvoice_api Docker container
   <any text>       — same as /ask
 
 Topics:
@@ -46,7 +45,6 @@ import os
 import queue
 import re
 import sqlite3
-import subprocess
 import threading
 import time
 import urllib.request
@@ -598,28 +596,6 @@ class TelegramBridgeNode(LifecycleNode):
         except Exception as e:
             return False, (time.time() - t0) * 1000, str(e)[:80]
 
-    async def _cmd_restart_tts(self, update: Update, context):
-        if not self._auth(update.effective_chat.id):
-            return
-        await update.message.reply_text('🔄 Перезапускаю cosyvoice_api...')
-        loop = asyncio.get_event_loop()
-        try:
-            result = await loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    ['docker', 'restart', 'cosyvoice_api'],
-                    capture_output=True, text=True, timeout=30,
-                ),
-            )
-            if result.returncode == 0:
-                await update.message.reply_text(
-                    '✅ cosyvoice_api перезапущен. Готов примерно через 30с.')
-            else:
-                await update.message.reply_text(
-                    f'❌ docker restart вернул ошибку:\n{result.stderr[:300]}')
-        except Exception as e:
-            await update.message.reply_text(f'❌ Исключение: {e}')
-
     async def _cmd_status(self, update: Update, context):
         if not self._auth(update.effective_chat.id):
             return
@@ -673,11 +649,9 @@ class TelegramBridgeNode(LifecycleNode):
         uptime_str = f'{uptime_h}ч {uptime_m}м'
 
         # TTS / LLM health (parallel, 3s timeout each)
-        tts_primary_res, tts_local_res, llm_res = await asyncio.gather(
+        tts_primary_res, llm_res = await asyncio.gather(
             loop.run_in_executor(
                 None, self._http_check, 'http://192.168.10.118:8000/health', 3.0),
-            loop.run_in_executor(
-                None, self._http_check, 'http://localhost:8000/health', 3.0),
             loop.run_in_executor(
                 None, self._http_check, 'http://192.168.10.118:18020/health', 3.0),
         )
@@ -707,7 +681,6 @@ class TelegramBridgeNode(LifecycleNode):
             '',
             '🖥️ *Серверы*',
             _srv('TTS RTX 3090', *tts_primary_res),
-            _srv('TTS ROCm лок', *tts_local_res),
             _srv('LLM vLLM',     *llm_res),
             '',
         ] + ros_lines
@@ -896,7 +869,6 @@ class TelegramBridgeNode(LifecycleNode):
         app.add_handler(CommandHandler('wake',        self._cmd_wake))
         app.add_handler(CommandHandler('sleep',       self._cmd_sleep))
         app.add_handler(CommandHandler('where',       self._cmd_where))
-        app.add_handler(CommandHandler('restart_tts', self._cmd_restart_tts))
         app.add_handler(MessageHandler(filters.PHOTO, self._photo_handler))
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._msg_handler))

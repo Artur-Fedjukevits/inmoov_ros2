@@ -41,15 +41,15 @@ class ArduinoLeftNode(ArduinoCommNode):
 
     # ORDER MUST MATCH InMoovLeft.ino ServoIndex enum / packet byte offsets.
     BODY_JOINTS = [
-        ('thumb_L',     90,   0),   # [0]  pin 2,  rest=0,   min=0,   max=180
-        ('index_L',     90,   0),   # [1]  pin 3,  rest=0,   min=0,   max=180
-        ('majeure_L',   90,   0),   # [2]  pin 4,  rest=0,   min=0,   max=180
-        ('ring_L',      90,   0),   # [3]  pin 5,  rest=0,   min=0,   max=180
-        ('pinky_L',     90,   0),   # [4]  pin 6,  rest=0,   min=0,   max=180
-        ('wrist_L',     90,   0),   # [5]  pin 7,  rest=0,   min=0,   max=180
+        ('thumb_L',     90,  50),   # [0]  pin 2,  rest=50,  min=0,   max=145
+        ('index_L',     90,   0),   # [1]  pin 3,  rest=0,   min=0,   max=150
+        ('majeure_L',   90,   0),   # [2]  pin 4,  rest=0,   min=0,   max=150
+        ('ring_L',      90,   0),   # [3]  pin 5,  rest=0,   min=0,   max=140
+        ('pinky_L',     90,   0),   # [4]  pin 6,  rest=0,   min=0,   max=150
+        ('wrist_L',     90, 150),   # [5]  pin 7,  rest=150, min=0,   max=300 (firmware; Servo.write caps at 180)
         ('bicep_L',     90,   0),   # [6]  pin 8,  rest=0,   min=0,   max=90
         ('rotate_L',    90,  90),   # [7]  pin 9,  rest=90,  min=40,  max=180
-        ('shoulder_L',  90,  30),   # [8]  pin 10, rest=30,  min=0,   max=180
+        ('shoulder_L',  90,  20),   # [8]  pin 10, rest=20,  min=0,   max=180
         ('omoplate_L',  90,  25),   # [9]  pin 11, rest=25,  min=25,  max=90
         ('neck',        90,  40),   # [10] pin 12, rest=40,  min=0,   max=100
         ('rothead',     90,  90),   # [11] pin 13, rest=90,  min=30,  max=140
@@ -62,7 +62,7 @@ class ArduinoLeftNode(ArduinoCommNode):
     FACE_JOINTS = [
         ('eye_lr_L',        90,  90),   # [15] pin 22, rest=90,  min=80,  max=100
         ('eye_ud_L',        90, 100),   # [16] pin 24, rest=100, min=80,  max=110
-        ('jaw',             90,  10),   # [17] pin 26, rest=10,  min=10,  max=25
+        ('jaw',             90,  10),   # [17] pin 26, rest=10,  min=10,  max=90
         ('eyelid_L_Upper',  90,  85),   # [18] ch 6,  rest=85, min=70,  max=95
         ('eyelid_L_Lower',  90,  85),   # [19] ch 7,  rest=85, min=75,  max=95
         ('eyelid_R_Upper',  90,  85),   # [20] ch 8,  rest=85, min=65,  max=100

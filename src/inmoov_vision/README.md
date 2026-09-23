@@ -550,9 +550,13 @@ tracker nodes stay idle until they are `True`.
   `colcon build --packages-select inmoov_vision` (no `--symlink-install` is
   used in this workspace). Depends on `rclpy`, `std_msgs`, `sensor_msgs` and
   `inmoov_msgs` (for `MemoryQuery.srv`), per [`package.xml`](package.xml).
-- **Python dependencies are not declared in `package.xml`/`setup.py`** and
-  must be installed separately (versions in use on the author's machine in
-  parentheses):
+- **Python dependencies**: `numpy`, `opencv`, `onnxruntime` and `insightface`
+  are declared in `package.xml` as rosdep keys
+  (`rosdep install --from-paths src --ignore-src -y`); `depthai` (v3) and
+  `hsemotion-onnx` have no rosdep keys. Everything is listed in
+  [`requirements.txt`](requirements.txt)
+  (`pip install -r src/inmoov_vision/requirements.txt`). Versions in use on
+  the author's machine in parentheses:
   - `numpy` (2.4.4), `opencv-python` / `cv2` (4.13) - all camera/image nodes;
   - `onnxruntime` (1.24.3) and `insightface` (0.7.3) - `face_detection_node`;
   - `hsemotion-onnx` (0.3.1) - `emotion_recognition_node`;
@@ -590,12 +594,6 @@ tracker nodes stay idle until they are `True`.
 
 ## Known issues to verify
 
-- **Head-tracker fallback timing differs from its docstring.** The module
-  docstring says the right eye takes over "if the left is unavailable >
-  STALE_SEC" (2 s), but the code only uses the right eye after the left camera
-  has sent *no* track message for `_FALLBACK_SEC` = 5 s. Recognition, emotion
-  and `face_detection_node_right` switch after ~1.5-2 s, so the head tracker
-  reacts later than the rest of the pipeline.
 - **Right-eye data may never be produced in normal operation.** With the
   shipped launch configuration `face_detection_node_right` is a standby
   (`fallback_for` set) and only detects when the left eye is silent, so

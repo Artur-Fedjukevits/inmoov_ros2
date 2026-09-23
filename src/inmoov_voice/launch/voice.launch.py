@@ -8,6 +8,7 @@ Startup order:
   voice_detector_node → audio_to_whisper
   parakeet_stt_node  → voice_command
   tts_node           (action server /speak)
+  sound_localization_node → sound_direction (separate stereo mic pair)
   llm_node           (intent generator — from the behavior_manager_node package)
 
 Usage:
@@ -44,11 +45,11 @@ def generate_launch_description():
         DeclareLaunchArgument('llm_url',
             default_value='http://192.168.10.118:18020/v1/chat/completions'),
         DeclareLaunchArgument('llm_fallback_url',
-            default_value='http://localhost:11434/v1/chat/completions'),
+            default_value=''),
         DeclareLaunchArgument('llm_bearer_token',
             default_value=os.environ.get('VLLM_BEARER_TOKEN', '')),
         DeclareLaunchArgument('tts_server_url',      default_value='http://192.168.10.118:8000'),
-        DeclareLaunchArgument('tts_fallback_url',    default_value='http://localhost:8000'),
+        DeclareLaunchArgument('tts_fallback_url',    default_value=''),
         DeclareLaunchArgument('openhab_url',         default_value='http://192.168.10.118:8080'),
 
         # LLM model
@@ -58,7 +59,7 @@ def generate_launch_description():
 
         # Wake word
         DeclareLaunchArgument('wakeword_model',      default_value='/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'),
-        DeclareLaunchArgument('wakeword_threshold',  default_value='0.3'),
+        DeclareLaunchArgument('wakeword_threshold',  default_value='0.2'),
 
         # Audio
         DeclareLaunchArgument('audio_device_index',  default_value='-1'),   # -1 = system default
@@ -67,14 +68,14 @@ def generate_launch_description():
         DeclareLaunchArgument('sample_rate',         default_value='16000'),
 
         # VAD
-        DeclareLaunchArgument('vad_threshold',          default_value='0.5'),
+        DeclareLaunchArgument('vad_threshold',          default_value='0.4'),
         DeclareLaunchArgument('silence_duration_sec',   default_value='2.5'),
         DeclareLaunchArgument('pipeline_timeout_sec',   default_value='45.0'),
 
         # Speaker Verification
         DeclareLaunchArgument('speaker_verification',   default_value='true'),
-        DeclareLaunchArgument('sv_threshold',           default_value='0.45'),
-        DeclareLaunchArgument('sv_segment_sec',         default_value='3.0'),
+        DeclareLaunchArgument('sv_threshold',           default_value='0.55'),
+        DeclareLaunchArgument('sv_segment_sec',         default_value='1.0'),
     ]
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
@@ -127,6 +128,14 @@ def generate_launch_description():
             'sv_threshold':          LaunchConfiguration('sv_threshold'),
             'sv_segment_sec':        LaunchConfiguration('sv_segment_sec'),
         }],
+    )
+
+    # 3b. Sound localization — separate stereo mic pair (raw ALSA), TDOA → sound_direction
+    sound_localization = Node(
+        package='inmoov_voice',
+        executable='sound_localization_node',
+        name='sound_localization_node',
+        output='screen',
     )
 
     # 4. Voice emotion — reads audio_to_whisper (after VAD), loads SpeechBrain wav2vec2
@@ -206,6 +215,7 @@ def generate_launch_description():
         audio_source,
         wakeword,
         voice_detector,
+        sound_localization,
         voice_emotion,
         tts,
         parakeet,

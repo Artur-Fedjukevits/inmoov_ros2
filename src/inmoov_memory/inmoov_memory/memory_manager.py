@@ -242,7 +242,7 @@ class MemoryManager:
         importance = self._score_importance(dialogue_text, summary)
 
         # 2. Save to episodic memory
-        self.episodic.save(
+        episode_id = self.episodic.save(
             summary=summary,
             raw_text=dialogue_text,
             participants=participants,
@@ -262,6 +262,7 @@ class MemoryManager:
                 except Exception as exc:
                     logger.warning("save_fact skipped (%s): %s", fact, exc)
             logger.info("Extracted %d facts, saved %d", len(facts), saved)
+            self.episodic.mark_migrated(episode_id)
 
     # ------------------------------------------------------------------
     # Helper LLM calls (OpenAI chat.completions API — vLLM)

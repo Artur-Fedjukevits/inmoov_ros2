@@ -103,6 +103,10 @@ class InmoovLifecycleManager(Node):
         self.declare_parameter('watchdog_interval_sec',      5.0)
         self.declare_parameter('watchdog_startup_delay_sec', 15.0)
         self.declare_parameter('max_respawn_count',          5)
+        # Comma-separated node names that the launch file didn't start (e.g. vision:=false,
+        # telegram:=false). They are dropped from the tiers so activation doesn't sit
+        # through retry/timeout waits for services that will never appear.
+        self.declare_parameter('disabled_nodes',             '')
 
         self._retry_count             = self.get_parameter('retry_count').value
         self._retry_interval          = self.get_parameter('retry_interval_sec').value
@@ -112,6 +116,10 @@ class InmoovLifecycleManager(Node):
         self._watchdog_startup_delay  = self.get_parameter('watchdog_startup_delay_sec').value
         self._max_respawn_count       = self.get_parameter('max_respawn_count').value
         autostart_delay               = self.get_parameter('autostart_delay_sec').value
+        self._disabled_nodes = {
+            n.strip() for n in self.get_parameter('disabled_nodes').value.split(',')
+            if n.strip()
+        }
 
         # Status publishing
         self._status_pub = self.create_publisher(String, '/lifecycle/status', 10)
@@ -190,6 +198,8 @@ class InmoovLifecycleManager(Node):
             tier_nodes = []
             critical_set = set(tier_cfg.get('critical', []))
             for node_name in tier_cfg['nodes']:
+                if node_name in self._disabled_nodes:
+                    continue
                 mn = ManagedNode(node_name, critical=(node_name in critical_set))
                 self._all_nodes[node_name] = mn
                 tier_nodes.append(mn)
@@ -202,6 +212,9 @@ class InmoovLifecycleManager(Node):
 
         self.get_logger().info(
             f'Tier configuration: {len(self._tiers)} tiers, {len(self._all_nodes)} nodes')
+        if self._disabled_nodes:
+            self.get_logger().info(
+                f'Disabled by launch (not managed): {sorted(self._disabled_nodes)}')
 
     def start_activation(self):
         threading.Thread(target=self._activate_all, daemon=True).start()

@@ -63,10 +63,10 @@ class Check:
 
 PRIMARY_HOST    = '192.168.10.118'
 LLM_PRIMARY     = f'http://{PRIMARY_HOST}:18020'   # vLLM, OpenAI-compatible API
-LLM_LOCAL       = 'http://localhost:18020'
+LLM_LOCAL       = ''   # local fallback removed (empty = not checked)
 LLM_BEARER      = os.environ.get('VLLM_BEARER_TOKEN', '')
 TTS_PRIMARY     = f'http://{PRIMARY_HOST}:8000'
-TTS_LOCAL       = 'http://localhost:8000'
+TTS_LOCAL       = ''   # local CosyVoice fallback removed (empty = not checked)
 OPENHAB_URL     = f'http://{PRIMARY_HOST}:8080'
 LLM_MODEL       = 'qwen3.8-27b'
 WAKEWORD_MODEL  = '/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'
@@ -119,6 +119,8 @@ def check_llm(quick: bool) -> list[Check]:
 
     for label, base_url in [('Primary (vLLM, RTX 3090)', LLM_PRIMARY),
                               ('Local (NUC)', LLM_LOCAL)]:
+        if not base_url:
+            continue
         name = f'LLM {label}'
         if not _probe(f'{base_url}/health'):
             checks.append(Check(name, 'fail', f'Unreachable ({base_url})'))
@@ -175,6 +177,8 @@ def check_tts(quick: bool) -> list[Check]:
 
     for label, base_url in [('Primary (RTX 3090)', TTS_PRIMARY),
                               ('Local (ROCm)', TTS_LOCAL)]:
+        if not base_url:
+            continue
         name = f'TTS {label}'
         health = _tts_health(base_url)
         if health is None:

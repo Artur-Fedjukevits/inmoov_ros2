@@ -55,8 +55,7 @@ pipeline that turns raw perception into dialogue and physical behavior.
 - **Telegram bridge** (`telegram_bridge_node`) is an optional remote-control
   channel: it reuses the exact same `llm_node` pipeline (tool calls, memory,
   smart home) via `/telegram_ask` / `/telegram_response`, plus a few direct
-  commands (`/photo`, `/say`, `/status`, `/where`, `/sleep`, `/wake`,
-  `/restart_tts`).
+  commands (`/photo`, `/say`, `/status`, `/where`, `/sleep`, `/wake`).
 
 All five nodes are ROS 2 **managed-lifecycle nodes**
 (`rclpy.lifecycle.LifecycleNode`) and stay `Unconfigured` until driven through
@@ -121,7 +120,7 @@ as a tiebreaker (`VOICE_ACCEPT = 0.52`) or the person is asked directly;
 | Name | Type | Default | Meaning |
 |---|---|---|---|
 | `no_face_timeout_sec` | double | `15.0` | No face seen for this long (×4 while `INTRODUCING`) starts the "face lost" countdown. |
-| `no_human_timeout_sec` | double | `20.0` (`30.0` in `behavior_manager.launch.py`) | No OAK-D body signal for this long ⇒ OakD veto ⇒ back to `IDLE`. |
+| `no_human_timeout_sec` | double | `30.0` | No OAK-D body signal for this long ⇒ OakD veto ⇒ back to `IDLE`. |
 | `max_face_hunt_sec` | double | `90.0` | Once a body is present but the face is lost, how long to keep waiting before giving up and resetting to `IDLE`. |
 | `greet_cooldown_sec` | double | `120.0` | Minimum time between greetings for the same name. |
 | `emotion_react_thresh` | double | `0.70` | Minimum confidence for a face/voice emotion to be considered for fusion. |
@@ -132,7 +131,7 @@ as a tiebreaker (`VOICE_ACCEPT = 0.52`) or the person is asked directly;
 | `track_eye_fallback_sec` | double | `2.0` | Silence from the left-eye track topic before falling back to the right eye. |
 | `post_goodbye_ignore_sec` | double | `1800.0` | After an explicit `say_goodbye`, ignore that name for this long (or until the wake word). |
 | `post_goodbye_track_block_sec` | double | `30.0` | Block face-track processing entirely for this long right after a goodbye (breaks a re-greet loop). |
-| `llm_url` / `llm_fallback_url` | string | `http://192.168.10.118:18020/v1/chat/completions` / `http://localhost:11434/v1/chat/completions` | OpenAI-compatible endpoint used *only* for name extraction from a free-form voice reply (`_extract_name`'s LLM fallback). **Private-LAN default — override for your setup.** |
+| `llm_url` / `llm_fallback_url` | string | `http://192.168.10.118:18020/v1/chat/completions` / `''` (no fallback) | OpenAI-compatible endpoint used *only* for name extraction from a free-form voice reply (`_extract_name`'s LLM fallback). **Private-LAN default — override for your setup.** |
 | `bearer_token` | string | `''` | Bearer token for `llm_url`. |
 | `name_extract_model` | string | `qwen3.8-27b` | Model used for name extraction. |
 | `voice_high_threshold` | double | `0.62` | Voice-similarity threshold for a confident identification. |
@@ -224,7 +223,7 @@ re-configure is safe):
 | Name | Default | Meaning |
 |---|---|---|
 | `llm_url` | `http://192.168.10.118:18020/v1/chat/completions` | Primary OpenAI-compatible endpoint (vLLM). **Private-LAN default — override.** |
-| `llm_fallback_url` | `http://localhost:11434/v1/chat/completions` | Fallback endpoint (currently not a working OpenAI-compatible server — see code comment). |
+| `llm_fallback_url` | `''` | Optional OpenAI-compatible fallback endpoint; empty = no fallback (requests fail fast when `llm_url` is down). The former local Ollama `qwen2.5:7b` fallback on the NUC was removed: CPU prefill of the ~8.7k-token prompt took ~375 s and Ollama's default 4096 context truncated it. |
 | `bearer_token` | `''` | Bearer token for `llm_url`. Set via the `llm_bearer_token` launch arg, which defaults to the `VLLM_BEARER_TOKEN` env var — **never hardcode a real token**. |
 | `bearer_token_fallback` | `''` | Bearer token for `llm_fallback_url`. |
 | `model` / `model_fallback` | `qwen3.8-27b` / `qwen2.5:7b` | Model names for the two backends. |
@@ -237,7 +236,7 @@ re-configure is safe):
 | `keep_history` | `True` | Whether multi-turn history is sent (vs. only the latest user turn). |
 | `history_max_turns` | `8` | History is trimmed by counting `user`-role turns, not raw message count. |
 | `openhab_url` | `http://192.168.10.118:8080` | Used by the `items_control`/etc. tools. |
-| `tts_server_url` / `tts_fallback_url` | `http://192.168.10.118:8000` / `http://localhost:8000` | Declared but the actual TTS calls go through the `Speak` action client, not a direct HTTP call from here. |
+| `tts_server_url` / `tts_fallback_url` | `http://192.168.10.118:8000` / `''` | Declared but the actual TTS calls go through the `Speak` action client, not a direct HTTP call from here. |
 | `cast_volume` | `80` | Default Chromecast volume for `broadcast_message`. |
 | `cast_to_file_url` | `http://192.168.10.118:8000/tts/to_file` | TTS-to-WAV-file endpoint used by `broadcast_message`. |
 
@@ -294,9 +293,6 @@ geocoding non-default weather locations.
 
 **Known issues / TODOs (from code comments)**
 
-- `llm_fallback_url` defaults to a local Ollama-style endpoint that is
-  explicitly noted as "not currently OpenAI-compatible" — it's a placeholder
-  for a future local fallback, not a working failover today.
 - The Qwen3-served model sometimes emits tool calls as inline text
   (`ᐈ{...}`, `<tool_call>...</tool_call>`, or a `<tools>` block) instead of
   through the proper `tool_calls` API field — `_extract_text_tool_calls` is a
@@ -505,7 +501,6 @@ environment variable and is never hardcoded.
 | `/where <name>` | Sends a family member's live location (OwnTracks via an OpenHAB `Location` item), with fuzzy/transliterated name matching. A bare "where is X" message (no `/where`) is also intercepted automatically before falling through to the LLM. |
 | `/wake` | Publishes `/robot_sleep False`. |
 | `/sleep` | Publishes `/robot_sleep True` — an instant transition, no LLM involved. |
-| `/restart_tts` | Runs `docker restart cosyvoice_api` (the local ROCm TTS fallback container). |
 | *any other text / a photo with caption* | Same as `/ask` (a photo is base64-encoded and sent to the LLM's vision path). |
 
 **Parameters** (also settable via [`config/telegram_params.yaml`](config/telegram_params.yaml))
@@ -543,8 +538,8 @@ from the `TELEGRAM_BOT_TOKEN` environment variable at process start.
 **External dependencies**: `python-telegram-bot` (`telegram` package), a
 Telegram bot token (`TELEGRAM_BOT_TOKEN` env var) and an allowed chat id
 (`TELEGRAM_ALLOWED_CHAT_ID` env var, used as the launch argument default);
-`opencv-python` (`cv2`) for `/photo`; `psutil` for `/status`; `docker` CLI on
-`PATH` for `/restart_tts`; `inmoov_memory`'s SQLite DB for identification.
+`opencv-python` (`cv2`) for `/photo`; `psutil` for `/status`;
+`inmoov_memory`'s SQLite DB for identification.
 
 ---
 
@@ -615,8 +610,6 @@ External services / infrastructure this package expects to reach:
   (`behavior_manager_node` parameter) / `TAVILY_API_KEY` env var.
 - A Telegram bot (optional) — token via `TELEGRAM_BOT_TOKEN` env var, chat id
   via `TELEGRAM_ALLOWED_CHAT_ID` env var / `allowed_chat_id` parameter.
-- `docker` CLI reachable on `PATH`, with a `cosyvoice_api` container, for
-  `telegram_bridge_node`'s `/restart_tts`.
 
 Sibling packages that must be built in the same workspace: `inmoov_memory`
 (`memory_node`, `MemoryQuery` service, `openhab_alerts` module),
@@ -635,18 +628,10 @@ they are called out individually in the parameter tables above.
   bug fixes culminated in a fix for the head drifting to its hardware limit;
   per code/project-memory comments the final round was committed but not
   re-verified with a live test.
-- **`llm_fallback_url`** points at a local endpoint explicitly marked "not
-  yet OpenAI-compatible" in a code comment — treat the LLM fallback path as
-  non-functional until that's addressed.
 - **Dialogue-vs-search race** (documented in project memory, referenced from
   code): an introduction flow starting while a `web_search` is in flight can
   make the search time out because the Behavior Manager is busy with the
   introduction.
-- **OAK-D veto tuning**: `no_human_timeout_sec` differs between
-  `identity_manager_node`'s own default (`20.0`) and the value
-  `behavior_manager.launch.py` actually passes (`30.0`) — worth confirming
-  which is intended before relying on the parameter table above in a fresh
-  deployment.
 - Several torso/head-motion races in `behavior_manager_node` (PIR
   self-triggering, competing scans, rothead/midstom sign conventions) were
   each fixed after being found live; the fixes are in place but are the kind

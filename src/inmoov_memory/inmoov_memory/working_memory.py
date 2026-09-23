@@ -53,7 +53,7 @@ class WorkingMemory:
                 "landmark": "",
             },
             "robot_state": {
-                "mode": "idle",          # idle | conversation | navigation | task
+                "mode": "idle",          # idle | conversation | sleep | navigation | task
                 "battery": 100,
                 "current_task": None,
                 "facing": None,          # name of the person the robot is looking at

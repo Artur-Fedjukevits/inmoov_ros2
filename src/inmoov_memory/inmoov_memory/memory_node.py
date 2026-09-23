@@ -87,6 +87,7 @@ class MemoryNode(LifecycleNode):
         self.uncertain_threshold = 0.40
         self._tg_reminder_person_id = 5
         self._reminder_default_time = '07:00'
+        self._sleeping        = False   # /robot_sleep latched state
 
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
@@ -111,6 +112,9 @@ class MemoryNode(LifecycleNode):
         self._dp('telegram_reminder_person_id', 5)
         self._dp('telegram_reminder_check_sec', 60.0)
         self._dp('reminder_default_time',      '07:00')
+        self._dp('episodic_retention_days',    7)
+        self._dp('episodic_cleanup_max_importance', 0.5)
+        self._dp('episodic_cleanup_interval_sec',   21600.0)
 
         db_path      = self.get_parameter('db_path').value
         episodic_db  = self.get_parameter('episodic_db_path').value
@@ -176,11 +180,15 @@ class MemoryNode(LifecycleNode):
 
         ctx_rate     = self.get_parameter('context_publish_rate').value
         tg_check_sec = self.get_parameter('telegram_reminder_check_sec').value
+        cleanup_sec  = self.get_parameter('episodic_cleanup_interval_sec').value
 
         self._timers.append(self.create_timer(ctx_rate, self._publish_memory_context))
         if self._tg_reminder_person_id > 0:
             self._timers.append(
                 self.create_timer(tg_check_sec, self._send_due_reminders_to_telegram))
+        if cleanup_sec > 0:
+            self._timers.append(self.create_timer(cleanup_sec, self._cleanup_episodic))
+            self._cleanup_episodic()
 
         # Publish context immediately the first time
         self._publish_memory_context()
@@ -402,6 +410,8 @@ class MemoryNode(LifecycleNode):
                 'INTRODUCING':  'conversation',
             }
             mode = mode_map.get(str(state_raw), 'idle')
+            if self._sleeping:
+                mode = 'sleep'   # social_context keeps coming while asleep — don't overwrite
             self._mm.working.update_robot_state(mode=mode)
 
         except Exception as e:
@@ -520,11 +530,25 @@ class MemoryNode(LifecycleNode):
             self.get_logger().warn(f'_extract_reminders: {e}')
 
     def _robot_sleep_cb(self, msg: Bool):
-        mode = 'idle' if msg.data else 'idle'
+        self._sleeping = bool(msg.data)
+        mode = 'sleep' if msg.data else 'idle'
         self._mm.working.update_robot_state(mode=mode)
         if msg.data:
             self._mm.working.update_environment(people=[])
             self._mm.working.update_robot_state(facing=None)
+
+    def _cleanup_episodic(self):
+        """Timer: purges old low-importance episodes (the episodic sliding window)."""
+        days    = self.get_parameter('episodic_retention_days').value
+        max_imp = self.get_parameter('episodic_cleanup_max_importance').value
+        try:
+            deleted = self._mm.episodic.cleanup(older_than_days=days, max_importance=max_imp)
+            if deleted:
+                self.get_logger().info(
+                    f'Episodic cleanup: deleted {deleted} episodes '
+                    f'older than {days}d with importance <= {max_imp}')
+        except Exception as e:
+            self.get_logger().warn(f'_cleanup_episodic: {e}')
 
     # ── /memory/context publisher ──────────────────────────────────────
 

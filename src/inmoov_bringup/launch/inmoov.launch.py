@@ -34,6 +34,46 @@ _AUDIO_ENV = {
 }
 
 
+# Nodes started only with vision:=true (must match the names in config/lifecycle.yaml)
+_VISION_NODES = [
+    'face_capture_node', 'oak_node',
+    'face_detection_node_left', 'face_detection_node_right',
+    'face_tracker_node_left', 'face_tracker_node_right',
+    'face_recognition_node', 'face_gallery_node', 'emotion_recognition_node',
+    'vision_head_tracker_node', 'human_detection_node', 'scene_manager_node',
+]
+_TELEGRAM_NODES = ['telegram_bridge_node']
+
+
+def _is_true(context, arg: str) -> bool:
+    return LaunchConfiguration(arg).perform(context).strip().lower() in ('true', '1', 'yes')
+
+
+def _make_lifecycle_manager(context, config_path):
+    # Nodes switched off by launch arguments are passed to the manager as
+    # disabled_nodes — otherwise it would wait out retries/timeouts on every tier.
+    disabled = []
+    if not _is_true(context, 'vision'):
+        disabled += _VISION_NODES
+    if not _is_true(context, 'telegram'):
+        disabled += _TELEGRAM_NODES
+    return [Node(
+        package='inmoov_bringup',
+        executable='lifecycle_manager',
+        name='lifecycle_manager',
+        output='screen',
+        parameters=[{
+            'config_file':              config_path,
+            'retry_count':              3,
+            'retry_interval_sec':       10.0,
+            'transition_timeout_sec':   30.0,
+            'tier_advance_timeout_sec': 90.0,
+            'autostart_delay_sec':      5.0,
+            'disabled_nodes':           ','.join(disabled),
+        }],
+    )]
+
+
 def generate_launch_description():
 
     # ── Arguments ────────────────────────────────────────────────────────────
@@ -41,17 +81,18 @@ def generate_launch_description():
         # Servers
         # llm_url — OpenAI-compatible chat.completions endpoint (currently vLLM), shared
         # by llm_node and identity_manager_node (name extraction). llm_fallback_url —
-        # the backup (currently the local NUC — will become OpenAI-compatible later).
+        # optional backup endpoint; empty = no fallback. (The local Ollama qwen2.5:7b on the
+        # NUC was dropped: ~375 s CPU prefill for the ~8.7k-token prompt + 4096 ctx truncation.)
         DeclareLaunchArgument('llm_url',
             default_value='http://192.168.10.118:18020/v1/chat/completions'),
         DeclareLaunchArgument('llm_fallback_url',
-            default_value='http://localhost:11434/v1/chat/completions'),
+            default_value=''),
         DeclareLaunchArgument('llm_bearer_token',
             default_value=os.environ.get('VLLM_BEARER_TOKEN', '')),
         DeclareLaunchArgument('tts_server_url',
             default_value='http://192.168.10.118:8000'),
         DeclareLaunchArgument('tts_fallback_url',
-            default_value='http://localhost:8000'),
+            default_value=''),
         DeclareLaunchArgument('openhab_url',
             default_value='http://192.168.10.118:8080'),
 
@@ -64,7 +105,7 @@ def generate_launch_description():
         # Wake word
         DeclareLaunchArgument('wakeword_model',
             default_value='/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'),
-        DeclareLaunchArgument('wakeword_threshold', default_value='0.3'),
+        DeclareLaunchArgument('wakeword_threshold', default_value='0.2'),
 
         # Audio
         DeclareLaunchArgument('audio_device_index', default_value='-1'),
@@ -74,12 +115,12 @@ def generate_launch_description():
         DeclareLaunchArgument('pa_source_check',    default_value='Jabra'),  # '' = don't check
 
         # VAD / SV
-        DeclareLaunchArgument('vad_threshold',          default_value='0.5'),
+        DeclareLaunchArgument('vad_threshold',          default_value='0.4'),
         DeclareLaunchArgument('silence_duration_sec',   default_value='2.5'),
         DeclareLaunchArgument('pipeline_timeout_sec',   default_value='45.0'),
         DeclareLaunchArgument('speaker_verification',   default_value='true'),
-        DeclareLaunchArgument('sv_threshold',           default_value='0.45'),
-        DeclareLaunchArgument('sv_segment_sec',         default_value='3.0'),
+        DeclareLaunchArgument('sv_threshold',           default_value='0.55'),
+        DeclareLaunchArgument('sv_segment_sec',         default_value='1.0'),
 
         # Tavily
         DeclareLaunchArgument('tavily_api_key',
@@ -130,20 +171,8 @@ def generate_launch_description():
     lifecycle_config_path = PathJoinSubstitution([
         FindPackageShare('inmoov_bringup'), 'config', 'lifecycle.yaml'
     ])
-    lifecycle_manager = Node(
-        package='inmoov_bringup',
-        executable='lifecycle_manager',
-        name='lifecycle_manager',
-        output='screen',
-        parameters=[{
-            'config_file':              lifecycle_config_path,
-            'retry_count':              3,
-            'retry_interval_sec':       10.0,
-            'transition_timeout_sec':   30.0,
-            'tier_advance_timeout_sec': 90.0,
-            'autostart_delay_sec':      5.0,
-        }],
-    )
+    lifecycle_manager = OpaqueFunction(
+        function=_make_lifecycle_manager, args=[lifecycle_config_path])
 
     # ── Tier 0: memory_node ──────────────────────────────────────────────────
     memory_node = LifecycleNode(
@@ -630,6 +659,25 @@ def generate_launch_description():
         ],
     )
 
+    # vision:=false — none of the camera/face/OAK nodes are started
+    vision_group = GroupAction(
+        condition=IfCondition(LaunchConfiguration('vision')),
+        actions=[
+            face_capture,
+            oak_node,
+            face_detection_left,
+            face_detection_right,
+            face_tracker_left,
+            face_tracker_right,
+            face_recognition,
+            face_gallery,
+            emotion_recognition,
+            head_tracker,
+            human_detection,
+            scene_manager,
+        ],
+    )
+
     return LaunchDescription(args + [
         # lifecycle_manager starts first — it will bring up the rest
         lifecycle_manager,
@@ -638,26 +686,15 @@ def generate_launch_description():
         audio_source,
         arduino_right,
         arduino_left,
-        face_capture,
-        oak_node,
         sound_localization,
         wakeword,
         voice_detector,
         tts_node,
         joint_state_publisher,
         face_expressions,
-        face_detection_left,
-        face_detection_right,
-        face_tracker_left,
-        face_tracker_right,
         voice_emotion,
         parakeet_stt,
-        face_recognition,
-        face_gallery,
-        emotion_recognition,
-        head_tracker,
-        human_detection,
-        scene_manager,
+        vision_group,
         llm_node,
         openhab_bridge,
         identity_manager,

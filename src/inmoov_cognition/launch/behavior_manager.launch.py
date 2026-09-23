@@ -33,7 +33,7 @@ def generate_launch_description():
         DeclareLaunchArgument('llm_url',
             default_value='http://192.168.10.118:18020/v1/chat/completions'),
         DeclareLaunchArgument('llm_fallback_url',
-            default_value='http://localhost:11434/v1/chat/completions'),
+            default_value=''),
         DeclareLaunchArgument('llm_bearer_token',
             default_value=os.environ.get('VLLM_BEARER_TOKEN', '')),
         DeclareLaunchArgument('name_extract_model',  default_value='qwen3.8-27b'),

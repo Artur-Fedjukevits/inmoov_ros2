@@ -1202,8 +1202,8 @@ class LLMNode(LifecycleNode):
     def _check_servers(self):
         """Checks both servers and sets the active one."""
         primary_ok  = self._probe_llm(self.llm_url,  self.model_primary, self.bearer_token)
-        fallback_ok = self._probe_llm(self.llm_fallback_url, self.model_fallback,
-                                       self.bearer_token_fallback)
+        fallback_ok = bool(self.llm_fallback_url) and self._probe_llm(
+            self.llm_fallback_url, self.model_fallback, self.bearer_token_fallback)
 
         if primary_ok:
             self._active_url = self.llm_url
@@ -1213,7 +1213,7 @@ class LLMNode(LifecycleNode):
             self.get_logger().warn(
                 f'Primary LLM server unavailable! Using fallback: {self.llm_fallback_url}')
         else:
-            self.get_logger().error('Both LLM servers unavailable!')
+            self.get_logger().error('LLM server(s) unavailable!' + ('' if self.llm_fallback_url else ' (no fallback configured)'))
 
     def _probe_llm(self, chat_url: str, model: str, bearer: str) -> bool:
         """Checks LLM server availability via GET /v1/models. Returns True if OK."""
@@ -1319,7 +1319,7 @@ class LLMNode(LifecycleNode):
         urls = [self._active_url]
         other = self.llm_fallback_url if self._active_url == self.llm_url \
                 else self.llm_url
-        if other != self._active_url:
+        if other and other != self._active_url:
             urls.append(other)
 
         _DBG_LAST  = '/tmp/llm_last_payload.json'
@@ -1405,7 +1405,7 @@ class LLMNode(LifecycleNode):
                         pass
                     raise
         raise requests.exceptions.ConnectionError(
-            'Both LLM servers unavailable') from last_exc
+            'LLM server(s) unavailable') from last_exc
 
     def _send_tts_chunk(self, text: str, voice_style: str = '') -> None:
         """Sends a block of text (one or two sentences, see _TTS_CHUNK_*)
@@ -2970,10 +2970,11 @@ class LLMNode(LifecycleNode):
 
     def on_configure(self, state):
         # llm_url — the primary backend, an OpenAI-compatible chat.completions endpoint
-        # (currently vLLM). bearer_token is required for it. llm_fallback_url — the fallback
-        # (currently the local NUC — will become OpenAI-compatible later, not working yet).
+        # (currently vLLM). bearer_token is required for it. llm_fallback_url — optional
+        # OpenAI-compatible backup; empty = no fallback. (The local Ollama qwen2.5:7b on the
+        # NUC was dropped: ~375 s CPU prefill for the ~8.7k-token prompt + 4096 ctx truncation.)
         self._dp('llm_url',             'http://192.168.10.118:18020/v1/chat/completions')
-        self._dp('llm_fallback_url',    'http://localhost:11434/v1/chat/completions')
+        self._dp('llm_fallback_url',    '')
         self._dp('bearer_token',          '')  # for llm_url (vLLM)
         self._dp('bearer_token_fallback', '')  # for llm_fallback_url, if ever needed
         self._dp('model',               'qwen3.8-27b')
@@ -2986,7 +2987,7 @@ class LLMNode(LifecycleNode):
         self._dp('history_max_turns',   8)
         self._dp('openhab_url',         'http://192.168.10.118:8080')
         self._dp('tts_server_url',      'http://192.168.10.118:8000')
-        self._dp('tts_fallback_url',    'http://localhost:8000')
+        self._dp('tts_fallback_url',    '')
         self._dp('cast_volume',         80)
         self._dp('cast_to_file_url',    'http://192.168.10.118:8000/tts/to_file')
 

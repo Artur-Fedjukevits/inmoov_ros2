@@ -153,7 +153,7 @@ the first model key returned is used as the score.
 | Name | Type | Default | Meaning |
 |---|---|---|---|
 | `model_path` | string | `/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx` | Path to the custom `.onnx` model. **Machine-specific default — override it.** |
-| `threshold` | double | `0.2` | Activation score threshold. (The launch files in this workspace pass `0.3`.) |
+| `threshold` | double | `0.2` | Activation score threshold (launch default `wakeword_threshold` is the same). |
 | `debounce_sec` | double | `1.5` | Minimum time between two activations. |
 
 **Topics**
@@ -232,7 +232,7 @@ embeddings, RMS-normalised to 0.05 before embedding).
 | Name | Type | Default | Meaning |
 |---|---|---|---|
 | `sample_rate` | int | `16000` | Sample rate used for the VAD and durations. |
-| `vad_threshold` | double | `0.4` | Silero speech probability threshold. (Launch files pass `0.5`.) |
+| `vad_threshold` | double | `0.4` | Silero speech probability threshold. |
 | `silence_duration_sec` | double | `2.5` | Silence that ends a phrase. |
 | `min_phrase_sec` | double | `0.3` | Minimum buffer length (chunks) for a phrase to be sent. |
 | `min_speech_sec` | double | `1.0` | Minimum accepted speech length for a phrase to be sent. |
@@ -241,8 +241,8 @@ embeddings, RMS-normalised to 0.05 before embedding).
 | `no_speech_timeout_sec` | double | `8.0` | Give up if no speech starts within this time after activation. |
 | `pipeline_timeout_sec` | double | `90.0` | Clears the "waiting for STT" state after this long. |
 | `speaker_verification` | bool | `True` | Enable ECAPA-TDNN filtering; disabled automatically if the model fails to load. |
-| `sv_threshold` | double | `0.55` | Cosine-similarity threshold for a full segment. (Launch passes `0.45`.) |
-| `sv_segment_sec` | double | `1.0` | Length of the segments that are verified. (Launch passes `3.0`.) |
+| `sv_threshold` | double | `0.55` | Cosine-similarity threshold for a full segment. |
+| `sv_segment_sec` | double | `1.0` | Length of the segments that are verified. |
 
 **Topics**
 
@@ -327,10 +327,13 @@ it. Runs on a `MultiThreadedExecutor` (4 threads) with a
   gone. A client-side cancel also stops playback.
 - Servers: the primary (`tts_server_url`) is probed at activation via
   `GET /health` (expects JSON with optional `gpu`, `vram_used_mb`,
-  `vram_total_mb`, `sample_rate`); if it is down the fallback
-  (`tts_fallback_url`) is used. If both are down only an error is logged and
-  the node still activates. Each goal tries the active URL first and, on a
-  `ConnectionError`, the other one.
+  `vram_total_mb`, `sample_rate`); if it is down and `tts_fallback_url` is
+  set, the fallback is used. If no server is reachable only an error is logged
+  and the node still activates. Each goal tries the active URL first and, on a
+  `ConnectionError`, the other one (if configured). `tts_fallback_url` is empty
+  by default: the former local CosyVoice3 fallback on the NUC (ROCm iGPU) was
+  removed as too slow; a lightweight local engine (e.g. Pocket TTS / Kokoro)
+  may be added later.
 - Synthesis: `POST {url}/tts/stream` with JSON `{"text": ..., "emotion": ...}`
   (`emotion` only if non-empty), streamed response of **raw 16-bit mono PCM**.
   Sample rate comes from a `rate=` parameter of the `Content-Type` header,
@@ -359,7 +362,7 @@ it. Runs on a `MultiThreadedExecutor` (4 threads) with a
 | Name | Type | Default | Meaning |
 |---|---|---|---|
 | `tts_server_url` | string | `http://192.168.10.118:8000` | Primary TTS server. **Private LAN address of the author's server — override it.** |
-| `tts_fallback_url` | string | `http://localhost:8000` | Fallback TTS server. |
+| `tts_fallback_url` | string | `''` | Optional fallback TTS server; empty = no fallback. |
 | `chunk_size` | int | `4096` | Bytes per `iter_content` chunk. |
 | `connect_timeout_sec` | double | `5.0` | HTTP connect timeout (also used for the health probe). |
 | `timeout_sec` | double | `30.0` | HTTP read timeout. |
@@ -493,7 +496,7 @@ ros2 topic echo /sound_direction
 
 | Service | Used by | Details |
 |---|---|---|
-| **TTS HTTP server** | `tts_node` | `tts_server_url` / `tts_fallback_url` (defaults: `http://192.168.10.118:8000` and `http://localhost:8000`). Endpoints used: `GET /health`, `POST /tts/stream` (see above). The code comments refer to an "OmniVoice / audio.cpp" server with `server.json -> voice_presets` (`neutral`, `happy`, `sad`, `surprise`), after a migration from CosyVoice3. **The server is not part of this repository**; any server implementing these two endpoints works. The `192.168.10.118` default is a private LAN address and must be overridden. |
+| **TTS HTTP server** | `tts_node` | `tts_server_url` / `tts_fallback_url` (defaults: `http://192.168.10.118:8000` and `''` — no fallback). Endpoints used: `GET /health`, `POST /tts/stream` (see above). The code comments refer to an "OmniVoice / audio.cpp" server with `server.json -> voice_presets` (`neutral`, `happy`, `sad`, `surprise`), after a migration from CosyVoice3. **The server is not part of this repository**; any server implementing these two endpoints works. The `192.168.10.118` default is a private LAN address and must be overridden. |
 | **STT** | `parakeet_stt_node` | No server: the model runs in-process (`onnx-asr`, CPU). |
 | **Model downloads** | `voice_detector_node`, `voice_emotion_node` | Silero VAD via `torch.hub` (GitHub, cached in `~/.cache/torch/hub`), SpeechBrain models via Hugging Face. |
 | **LLM** | (not this package) | `voice_command` is consumed by `llm_node` in `inmoov_cognition`. |
@@ -509,7 +512,7 @@ ros2 launch inmoov_voice voice.launch.py llm_url:=http://localhost:18020/v1/chat
 ```
 
 It starts `audio_source_node`, `wakeword_node`, `voice_detector_node`,
-`voice_emotion_node` (delayed 5 s), `tts_node`, `parakeet_stt_node` (delayed
+`sound_localization_node`, `voice_emotion_node` (delayed 5 s), `tts_node`, `parakeet_stt_node` (delayed
 2 s) and `inmoov_cognition`'s `llm_node` (delayed 3 s), with `PULSE_SERVER`
 (`unix:/run/user/<uid>/pulse/native`) and `DBUS_SESSION_BUS_ADDRESS` set for
 the audio nodes.
@@ -520,27 +523,26 @@ forwarded to `llm_node`):
 | Argument | Default |
 |---|---|
 | `llm_url` | `http://192.168.10.118:18020/v1/chat/completions` |
-| `llm_fallback_url` | `http://localhost:11434/v1/chat/completions` |
+| `llm_fallback_url` | `''` (no fallback) |
 | `llm_bearer_token` | env `VLLM_BEARER_TOKEN`, else empty |
 | `tts_server_url` | `http://192.168.10.118:8000` |
-| `tts_fallback_url` | `http://localhost:8000` |
+| `tts_fallback_url` | `''` (no fallback) |
 | `openhab_url` | `http://192.168.10.118:8080` |
 | `llm_model`, `llm_temperature`, `llm_max_tokens` | `qwen3.8-27b`, `0.1`, `512` |
 | `wakeword_model` | `/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx` |
-| `wakeword_threshold` | `0.3` |
+| `wakeword_threshold` | `0.2` |
 | `audio_device_index`, `audio_device_name` | `-1`, `pulse` |
 | `output_device_name` | `''` |
 | `sample_rate` | `16000` |
-| `vad_threshold` | `0.5` |
+| `vad_threshold` | `0.4` |
 | `silence_duration_sec` | `2.5` |
 | `pipeline_timeout_sec` | `45.0` |
-| `speaker_verification`, `sv_threshold`, `sv_segment_sec` | `true`, `0.45`, `3.0` |
+| `speaker_verification`, `sv_threshold`, `sv_segment_sec` | `true`, `0.55`, `1.0` |
 
 **Important:** this launch file starts plain `Node` actions, but every node in
 this package is a *lifecycle* node, so with this launch file alone they stay
 `Unconfigured` and do nothing until they are configured/activated manually
-(`ros2 lifecycle set /<node> configure` then `activate`). It also does not
-start `sound_localization_node`. The launch file used on the robot is
+(`ros2 lifecycle set /<node> configure` then `activate`). The launch file used on the robot is
 [`inmoov_bringup/launch/inmoov.launch.py`](../inmoov_bringup/launch/inmoov.launch.py)
 (lifecycle nodes, `respawn=True`, tiered activation); prefer that one.
 
@@ -656,12 +658,10 @@ From code comments and cross-checks:
   `mic_distance_m` is unused; no runtime parameter updates.
 - `voice_detector_node`: the ECAPA `savedir` is hard-coded; the pipeline
   timeout only clears an internal flag (it does not cancel anything downstream).
-  Its `sv_threshold` / `vad_threshold` / `sv_segment_sec` code defaults differ
-  from the values the launch files use.
 - `wakeword_node`: subscribes to `raw_audio` from `on_configure`, so it runs
   inference even before `activate` (publishers are gated, the model is not).
 - `voice.launch.py` starts lifecycle nodes as plain `Node`s (they stay
-  `Unconfigured`), does not start `sound_localization_node`, and its docstring
+  `Unconfigured`), and its docstring
   mentions a `tavily_api_key` launch argument that is not declared. The
   comments in the nodes refer to `respawn=True` "in the launch file", which is
   only true for the `inmoov_bringup` launch file.
@@ -670,10 +670,6 @@ From code comments and cross-checks:
   file directly. The script itself still checks for `faster_whisper` and a
   Whisper cache (no longer used) and `py_trees`, and does not check for
   `onnx_asr` or `speechbrain`.
-- The tests in [`test/`](test/) (`test_units.py`, `test_nodes.py`, ...) import
-  modules from `inmoov_cognition` and refer to attributes that no longer exist
-  in the current nodes (e.g. `_pending_speech`); they have not been validated
-  against the current code.
 - Comments in the source refer to project notes files
   (`project_sound_localization_gcc_phat.md`, `project_stt_parakeet_eval.md`,
   `MIGRATION_NOTES.md`) that are not part of the repository.

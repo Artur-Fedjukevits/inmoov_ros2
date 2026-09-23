@@ -1,0 +1,10 @@
+# Python runtime dependencies of inmoov_vision (pip).
+# numpy / opencv / onnxruntime / insightface are also declared in package.xml
+# as rosdep keys; depthai and hsemotion-onnx have no rosdep keys.
+# Versions: what is in use on the author's machine.
+numpy>=2.0            # 2.4.4
+opencv-python>=4.8    # 4.13
+onnxruntime>=1.17     # 1.24.3  — face_detection_node
+insightface==0.7.3    #         — face_detection_node (buffalo_l)
+hsemotion-onnx>=0.3   # 0.3.1   — emotion_recognition_node
+depthai>=3.0,<4       # 3.6.1   — oak_node (v3 API only)
