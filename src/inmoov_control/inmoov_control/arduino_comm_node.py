@@ -9,6 +9,15 @@ Replaces xicro for servo control. Handles:
 Subclasses define which joints belong to which Arduino and which topics
 to publish for sensor data.
 
+Link robustness:
+  - A serial error (unplugged board, USB reset) closes the port; the RX thread
+    then reopens it with a growing back-off (_RECONNECT_MIN_SEC → _RECONNECT_MAX_SEC)
+    while the node stays active.
+  - The sleep flag and the speed table are re-sent after every (re)connect and
+    every _STATE_RESEND_SEC — an Arduino that reset on its own (firmware
+    defaults: awake, table speeds) is resynchronised without a USB drop.
+    Both commands are idempotent in the firmware (speed 0 = keep).
+
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
@@ -30,6 +39,10 @@ from .protocol import (
     FrameParser, build_set_servos, build_set_speeds, build_sleep, deg_per_sec_to_step,
     CMD_ULTRASONIC, CMD_PIR, CMD_HALL, CMD_ACK
 )
+
+_RECONNECT_MIN_SEC = 2.0    # first reopen attempt after a serial error
+_RECONNECT_MAX_SEC = 30.0   # back-off cap
+_STATE_RESEND_SEC  = 2.0    # periodic re-send of sleep flag + speeds
 
 
 def deg_to_rad(deg: float, center: float = 90.0) -> float:
@@ -106,6 +119,7 @@ class ArduinoCommNode(LifecycleNode):
         self._running    = False   # RX thread stop flag
         self._rx_thread  = None
         self._tx_timer   = None
+        self._last_state_resend = 0.0
 
         # Subscription/publisher handles (set in on_configure, destroyed in on_cleanup)
         self._subs           = []
@@ -255,33 +269,69 @@ class ArduinoCommNode(LifecycleNode):
     # Serial connection
     # -----------------------------------------------------------------------
 
-    def _connect_serial(self) -> None:
+    def _connect_serial(self, log_errors: bool = True) -> None:
         try:
-            self._ser = serial.Serial(
-                self._serial_port, self._baudrate, timeout=0.1
-            )
-            self.get_logger().info(f'Serial connected: {self._serial_port}')
+            ser = serial.Serial(self._serial_port, self._baudrate, timeout=0.1)
             time.sleep(2.0)           # wait for Arduino bootloader
             # No reset_input_buffer — FrameParser discards bootloader garbage via SOF check
-        except serial.SerialException as e:
-            self.get_logger().error(f'Serial open failed: {e}')
+            self._parser = FrameParser()
+            with self._lock:
+                # A fresh Arduino boots awake with table speeds — resend both
+                self._sleep_dirty  = True
+                self._speeds_dirty = True
+            self._ser = ser
+            self.get_logger().info(f'Serial connected: {self._serial_port}')
+        except (serial.SerialException, OSError) as e:
+            if log_errors:
+                self.get_logger().error(f'Serial open failed: {e}')
             self._ser = None
+
+    def _link_lost(self, reason: str) -> None:
+        """Serial error: close the handle; the RX thread reconnects."""
+        if self._ser is None:
+            return
+        self.get_logger().error(
+            f'Serial link lost ({reason}) — reconnecting in the background')
+        self._close_serial()
+
+    def _reconnect_step(self, attempt: int) -> int:
+        """One reconnect attempt from the RX thread; returns the next attempt number."""
+        delay = min(_RECONNECT_MIN_SEC * (2 ** attempt), _RECONNECT_MAX_SEC)
+        deadline = time.monotonic() + delay
+        while self._running and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not self._running:
+            return attempt
+        if not os.path.exists(self._serial_port):
+            if attempt == 0:
+                self.get_logger().warn(f'Serial port {self._serial_port} is gone — waiting')
+            return attempt + 1
+        self._connect_serial(log_errors=(attempt == 0))
+        if not self._running:          # deactivated during the 2 s bootloader wait
+            self._close_serial()
+            return attempt
+        if self._ser is not None:
+            self.get_logger().info(f'Serial link restored after {attempt + 1} attempt(s)')
+            return 0
+        return attempt + 1
 
     # -----------------------------------------------------------------------
     # RX loop (sensor data from Arduino)
     # -----------------------------------------------------------------------
 
     def _rx_loop(self) -> None:
+        attempt = 0
         try:
             while self._running:
-                if self._ser is None or not self._ser.is_open:
-                    time.sleep(0.1)
+                ser = self._ser
+                if ser is None or not ser.is_open:
+                    attempt = self._reconnect_step(attempt)
                     continue
                 try:
-                    chunk = self._ser.read(64)
-                except serial.SerialException as e:
-                    self.get_logger().error(f'Serial read error: {e}')
-                    self._ser = None
+                    chunk = ser.read(64)
+                except (serial.SerialException, OSError, TypeError) as e:
+                    # TypeError: pyserial on a handle closed by another thread
+                    self._link_lost(f'read: {e}')
                     continue
 
                 if not chunk:
@@ -369,10 +419,17 @@ class ArduinoCommNode(LifecycleNode):
     # -----------------------------------------------------------------------
 
     def _send_servos(self) -> None:
-        if self._ser is None or not self._ser.is_open:
+        ser = self._ser
+        if ser is None or not ser.is_open:
             return
 
+        now = time.monotonic()
         with self._lock:
+            if now - self._last_state_resend >= _STATE_RESEND_SEC:
+                # Periodic resync (see module docstring) — idempotent in firmware
+                self._last_state_resend = now
+                self._sleep_dirty  = True
+                self._speeds_dirty = True
             body = list(self._body_degs)
             face = list(self._face_degs)
             dirty = self._speeds_dirty
@@ -385,19 +442,18 @@ class ArduinoCommNode(LifecycleNode):
             self._sleep_dirty = False
 
         try:
-            # Send sleep-state change first (only when something changed)
+            # Send sleep state first (on change / reconnect / periodic resync)
             if sleep_dirty:
-                self._ser.write(build_sleep(sleeping))
-            # Send speed update (only when something changed)
+                ser.write(build_sleep(sleeping))
+            # Send speed table (on change / reconnect / periodic resync)
             if dirty:
                 spd_frame = build_set_speeds(body_spd + face_spd)
-                self._ser.write(spd_frame)
+                ser.write(spd_frame)
             # Send servo positions
             frame = build_set_servos(body + face)
-            self._ser.write(frame)
-            self._ser.flush()
-        except serial.SerialException as e:
-            self.get_logger().error(f'Serial write error: {e}')
-            self._ser = None
+            ser.write(frame)
+            ser.flush()
+        except (serial.SerialException, OSError, TypeError) as e:
+            self._link_lost(f'write: {e}')
 
     # destroy_node replaced by on_shutdown / on_deactivate (lifecycle)

@@ -29,6 +29,7 @@ Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
+import collections
 import json
 import threading
 import time
@@ -43,6 +44,11 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, String
 
 _STALE_SEC = 2.0  # unavailability threshold (s)
+# Frames are buffered (still JPEG-compressed) so that the face is cropped from
+# the SAME frame the tracks bbox was computed on (tracks carry that frame's
+# 'stamp'), not from the newest frame. ~1.3 s at 15 fps covers detection lag.
+_FRAME_BUF_LEN   = 20
+_STAMP_MATCH_SEC = 0.02   # a frame within this of the tracks stamp is "the" frame
 
 _LABEL_MAP = {
     'Anger':    'angry',
@@ -63,8 +69,11 @@ class EmotionRecognitionNode(LifecycleNode):
         self._timer        = None
         self._frame_lock   = threading.Lock()
         self._tracks_lock  = threading.Lock()
-        self._left_frame   = self._right_frame = None
+        # deque of (stamp, jpeg bytes), newest last
+        self._left_frames  = collections.deque(maxlen=_FRAME_BUF_LEN)
+        self._right_frames = collections.deque(maxlen=_FRAME_BUF_LEN)
         self._left_tracks  = self._right_tracks = []
+        self._left_stamp   = self._right_stamp  = 0.0
         self._last_left_t  = self._last_right_t = 0.0
         self._sleeping     = False
         self._busy         = False
@@ -132,26 +141,33 @@ class EmotionRecognitionNode(LifecycleNode):
     def _left_frame_cb(self, msg: CompressedImage):
         if self._sleeping:
             return
-        frame = self._decode(msg)
-        if frame is not None:
-            with self._frame_lock:
-                self._left_frame = frame
+        with self._frame_lock:
+            self._left_frames.append((self._msg_stamp(msg), bytes(msg.data)))
 
     def _right_frame_cb(self, msg: CompressedImage):
         if self._sleeping:
             return
-        frame = self._decode(msg)
-        if frame is not None:
-            with self._frame_lock:
-                self._right_frame = frame
+        with self._frame_lock:
+            self._right_frames.append((self._msg_stamp(msg), bytes(msg.data)))
 
     @staticmethod
-    def _decode(msg: CompressedImage) -> np.ndarray | None:
+    def _msg_stamp(msg: CompressedImage) -> float:
+        return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+    @staticmethod
+    def _decode(data: bytes) -> np.ndarray | None:
         try:
-            buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-            return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
         except Exception:
             return None
+
+    @staticmethod
+    def _frame_for_stamp(frames, stamp: float) -> bytes | None:
+        """The buffered JPEG whose stamp matches the tracks stamp, or None."""
+        best = min(frames, key=lambda f: abs(f[0] - stamp), default=None)
+        if best is None or abs(best[0] - stamp) > _STAMP_MATCH_SEC:
+            return None
+        return best[1]
 
     # ── Track callbacks ───────────────────────────────────────────────────
 
@@ -162,6 +178,7 @@ class EmotionRecognitionNode(LifecycleNode):
             data = json.loads(msg.data)
             with self._tracks_lock:
                 self._left_tracks  = data.get('tracks', [])
+                self._left_stamp   = float(data.get('stamp', 0.0))
                 self._last_left_t  = time.time()
         except Exception:
             pass
@@ -173,6 +190,7 @@ class EmotionRecognitionNode(LifecycleNode):
             data = json.loads(msg.data)
             with self._tracks_lock:
                 self._right_tracks  = data.get('tracks', [])
+                self._right_stamp   = float(data.get('stamp', 0.0))
                 self._last_right_t  = time.time()
         except Exception:
             pass
@@ -189,21 +207,27 @@ class EmotionRecognitionNode(LifecycleNode):
             right_fresh = (now - self._last_right_t) < _STALE_SEC
             left_tracks  = list(self._left_tracks)
             right_tracks = list(self._right_tracks)
-
-        with self._frame_lock:
-            left_frame  = self._left_frame
-            right_frame = self._right_frame
+            left_stamp   = self._left_stamp
+            right_stamp  = self._right_stamp
 
         # Choose the active source: left has priority.
         # Fall back to the right only if the left camera is dead (not sending
         # messages at all), not simply when there are no faces in the frame.
         if left_fresh:
-            if not left_tracks or left_frame is None:
+            if not left_tracks:
                 return  # left is alive but no faces — don't switch to the right
-            frame, tracks, side = left_frame, left_tracks, 'left'
-        elif right_fresh and right_tracks and right_frame is not None:
-            frame, tracks, side = right_frame, right_tracks, 'right'
+            tracks, side, stamp, frames = left_tracks, 'left', left_stamp, self._left_frames
+        elif right_fresh and right_tracks:
+            tracks, side, stamp, frames = right_tracks, 'right', right_stamp, self._right_frames
         else:
+            return
+
+        with self._frame_lock:
+            jpeg = self._frame_for_stamp(frames, stamp)
+        if jpeg is None:
+            return  # the bbox's frame is not buffered (yet / any more) — skip this tick
+        frame = self._decode(jpeg)
+        if frame is None:
             return
 
         if side != self._active_side:

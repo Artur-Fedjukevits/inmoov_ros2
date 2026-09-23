@@ -249,7 +249,10 @@ EfficientNet-B0 trained on AffectNet, 8 classes, CPU ONNX Runtime). Works from
 the left eye; switches to the right eye only if the left eye has sent no
 tracks message for 2.0 s (`_STALE_SEC`) - i.e. the camera pipeline is dead -
 not merely when there are no faces in the left frame (in that case it does
-nothing). It crops each track's bbox from the latest frame of the active eye,
+nothing). It keeps the last ~20 frames of each eye (still JPEG-compressed)
+and crops each track's bbox from the frame whose stamp matches the tracks
+message's `stamp` (the frame the bbox was computed on; the tick is skipped if
+that frame is not buffered),
 skips faces smaller than `min_face_size` px, and publishes one message per
 analyzed face. Class names are lower-cased (`Anger`→`angry`,
 `Happiness`→`happy`, `Sadness`→`sad`, ...). Runs one analysis at a time.
@@ -409,7 +412,10 @@ Depth is limited to 100-8000 mm; the NN input queue is non-blocking. Labels
 come from the model (`labelName`), falling back to a built-in COCO-80 list.
 Messages are published only for frames that contain at least one detection.
 If `depthai` cannot be imported, `on_activate` returns `FAILURE` (node
-degraded).
+degraded). The OAK thread is a supervisor: if pipeline creation fails, the
+pipeline stops or the device disconnects, it rebuilds the pipeline after a
+growing back-off (5 s → 60 s; reset after a 60 s stable run) while the node is
+active.
 
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
@@ -452,6 +458,7 @@ resets its state and publishes a single `False`.
 | `/robot_sleep` | `std_msgs/Bool` | sub | Latched. |
 | `/human_detected` | `std_msgs/Bool` | pub | Consumed by `identity_manager_node` and `behavior_manager_node`. |
 | `/human_angle_deg` | `std_msgs/Float32` | pub | Only while a person is detected; consumed by `behavior_manager_node` (aiming the head before face detection sees the person). |
+| `/human_distance_m` | `std_msgs/Float32` | pub | Only while a person is detected: ultrasonic distance if fresh (nearer of the two sensors), else the YOLO z. No consumer yet; presence itself uses YOLO only. |
 
 ### `scene_manager_node`
 
@@ -593,11 +600,6 @@ tracker nodes stay idle until they are `True`.
 - **`face_gallery_node` needs the left eye.** A capture is skipped if there is
   no left bbox/embedding, so it does not work during a left-eye failover even
   if the right eye is detecting.
-- **Ultrasonic distance is not used for any output.** `human_detection_node`
-  computes `_best_distance_m()` (ultrasonic if fresh, else YOLO z), but the
-  result is only used in a log line; `/human_detected` and the
-  `max_distance_m` filter depend on the YOLO `z_mm` only, contrary to the
-  module docstring ("ultrasonic validates the distance").
 - `/human_angle_deg` sign convention is not validated physically (noted in the
   code).
 - Live-bug history in the code comments (2026-08-24 ... 2026-09-01): the head
@@ -611,11 +613,8 @@ tracker nodes stay idle until they are `True`.
   image under the failed eye's topic, so downstream nodes cannot tell that
   left and right are identical.
 - `oak_node` only publishes when a frame has detections (silence means "nothing
-  seen"), and an error inside the OAK thread (pipeline creation/runtime) ends
-  the thread while the node stays `active`; `human_detection_node` then simply
-  times out to `False`.
-- `emotion_recognition_node` crops the newest frame of the active eye using
-  the latest tracks bbox, not the frame the bbox was computed on.
+  seen"). Its pipeline restart supervisor was tested with a failing fake
+  `depthai` only — verify with a real disconnect of the OAK-D.
 - Several defaults in the code differ from the values `inmoov_bringup`
   passes (see the tables above); the launch values are the ones used on the
   robot.

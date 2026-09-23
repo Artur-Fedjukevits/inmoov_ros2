@@ -4,9 +4,10 @@ human_detection_node.py
 =======================
 Human presence: YOLO (object type) + ultrasonic (precise distance).
 
-YOLO confirms that the object is a person.
-Ultrasonic validates the distance (more accurate than stereo depth).
-Final distance = ultrasonic if available, otherwise z from YOLO.
+Presence (/human_detected) and the max_distance_m filter use YOLO only:
+YOLO confirms that the object is a person and gives its z.
+The published distance (/human_distance_m) = ultrasonic if fresh (more
+accurate than stereo depth at close range), otherwise z from YOLO.
 
 Topics:
   /objects/detections        (String JSON)  <- oak_node
@@ -22,6 +23,9 @@ Topics:
                               validated physically, like the other sign
                               conventions in the project; check by hand on
                               first use)
+  /human_distance_m          (Float32, m)   -> distance to the nearest person
+                              (ultrasonic if fresh, else YOLO z); published
+                              only while a person is detected
 
 Parameters:
   max_distance_m      — max range (default 4.0 m)
@@ -57,6 +61,7 @@ class HumanDetectionNode(LifecycleNode):
         self._yolo_z_m     = 0.0
         self._angle_deg    = 0.0
         self._angle_pub    = None
+        self._dist_pub     = None
         self._was_detected = False
         self._sleeping     = False
         self._us_left_m    = self._us_right_m  = 0.0
@@ -95,6 +100,7 @@ class HumanDetectionNode(LifecycleNode):
 
         self._pub       = self.create_lifecycle_publisher(Bool, '/human_detected', 10)
         self._angle_pub = self.create_lifecycle_publisher(Float32, '/human_angle_deg', 10)
+        self._dist_pub  = self.create_lifecycle_publisher(Float32, '/human_distance_m', 10)
         self.get_logger().info(
             f'HumanDetection configured. '
             f'Range: {self._max_z_mm/1000:.1f} m, confidence: {self._min_conf}')
@@ -103,6 +109,7 @@ class HumanDetectionNode(LifecycleNode):
     def on_activate(self, state):
         self._pub.on_activate(state)
         self._angle_pub.on_activate(state)
+        self._dist_pub.on_activate(state)
         self._timer = self.create_timer(1.0 / self._rate_hz, self._publish_state)
         return TransitionCallbackReturn.SUCCESS
 
@@ -112,6 +119,7 @@ class HumanDetectionNode(LifecycleNode):
             self._timer = None
         self._pub.on_deactivate(state)
         self._angle_pub.on_deactivate(state)
+        self._dist_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
@@ -189,10 +197,10 @@ class HumanDetectionNode(LifecycleNode):
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
-    def _best_distance_m(self) -> float:
-        """Best distance estimate: ultrasonic if fresh, otherwise YOLO."""
+    def _best_distance_m(self) -> tuple[float, str]:
+        """Best distance estimate and its source: ultrasonic if fresh, otherwise YOLO."""
         if not self._use_us:
-            return self._yolo_z_m
+            return self._yolo_z_m, 'YOLO'
 
         now = time.time()
         candidates = []
@@ -202,15 +210,15 @@ class HumanDetectionNode(LifecycleNode):
             candidates.append(self._us_right_m)
 
         if candidates:
-            return min(candidates)   # the nearer of the two sensors
-        return self._yolo_z_m
+            return min(candidates), 'US'   # the nearer of the two sensors
+        return self._yolo_z_m, 'YOLO'
 
     def _publish_state(self):
         with self._lock:
             if self._sleeping:
                 return
             detected  = (time.time() - self._last_seen) < self._lost_timeout
-            dist_m    = self._best_distance_m()
+            dist_m, src = self._best_distance_m()
             angle_deg = self._angle_deg
 
         msg = Bool()
@@ -221,10 +229,10 @@ class HumanDetectionNode(LifecycleNode):
             angle_msg = Float32()
             angle_msg.data = float(angle_deg)
             self._angle_pub.publish(angle_msg)
+            self._dist_pub.publish(Float32(data=float(dist_m)))
 
         if detected != self._was_detected:
             if detected:
-                src = 'US' if self._use_us else 'YOLO'
                 self.get_logger().info(
                     f'Person detected (body) at {dist_m:.1f} m [{src}]')
             else:

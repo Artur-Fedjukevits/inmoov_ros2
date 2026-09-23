@@ -449,7 +449,8 @@ its *sign* correlate reliably with the real direction (6/6 blind test, 0.2-2 m).
 | `bandpass_high_hz` | double | `6000.0` | Band-pass upper edge. |
 | `mic_distance_m` | double | `0.145` | Reference only; **not used** in `angle_deg` (and not in the search window either). |
 | `search_window_sec` | double | `0.005` | GCC-PHAT peak search window (+/-), deliberately wider than the physical limit. |
-| `vote_window_sec` | double | `3.0` | Sliding vote window; longer = more reliable but slower. |
+| `vote_window_sec` | double | `3.0` | Sliding vote window; votes older than this expire. Longer = more reliable but slower. |
+| `silence_reset_sec` | double | `2.0` | A silence longer than this clears the vote window, so a new speaker after a pause is not outvoted by the previous one. |
 | `rms_gate_dbfs` | double | `-24.0` | Blocks quieter than this are treated as silence. Tuned for 60 % card gain at 1-3 m. |
 | `publish_silence` | bool | `False` | Also publish messages (`voiced=False`) for silent blocks. |
 | `swap_channels` | bool | `True` | Raw channel 0 is the physically **right** capsule, channel 1 the left; `True` swaps them. Verify by hand after any rewiring. |
@@ -614,10 +615,9 @@ From code comments and cross-checks:
 - `tts_node`: the `rate` field of the `Speak` goal is ignored. `result.message`
   strings are diagnostic only.
 - `voice_emotion_node`: `min_confidence` is declared but unused.
-- `sound_localization_node`: during a long silence the vote window is not reset,
-  so the previous direction "sticks" for up to `vote_window_sec` after a speaker
-  on the other side starts; short utterances (< 1-2 s) may not reach a confident
-  result; speech beyond ~1 m is noisier than hiss; front/back ambiguity;
+- `sound_localization_node`: after a pause (`silence_reset_sec`) the vote
+  rests on the new utterance only, so short utterances (< 1-2 s) may not reach
+  a confident result; speech beyond ~1 m is noisier than hiss; front/back ambiguity;
   `mic_distance_m` is unused; no runtime parameter updates.
 - `voice_detector_node`: the pipeline
   timeout only clears an internal flag (it does not cancel anything downstream).

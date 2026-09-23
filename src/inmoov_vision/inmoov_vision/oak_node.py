@@ -14,6 +14,10 @@ Parameters:
   conf_threshold  — confidence threshold (default 0.5)
   fps             — FPS of all cameras (default 15)
 
+Robustness: the OAK thread is a supervisor — if pipeline creation fails, the
+pipeline stops or the device disconnects, it rebuilds the pipeline with a
+growing back-off (_RESTART_MIN_SEC → _RESTART_MAX_SEC) while the node is active.
+
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
@@ -50,6 +54,11 @@ COCO_LABELS = [
     'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase',
     'scissors', 'teddy bear', 'hair drier', 'toothbrush',
 ]
+
+
+_RESTART_MIN_SEC = 5.0    # first pipeline rebuild after an OAK failure
+_RESTART_MAX_SEC = 60.0   # back-off cap
+_STABLE_RUN_SEC  = 60.0   # a run this long resets the back-off
 
 
 class OakNode(LifecycleNode):
@@ -115,6 +124,25 @@ class OakNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def _run_oak(self):
+        """Supervisor: (re)builds the pipeline until the node is deactivated."""
+        attempt = 0
+        while self._running:
+            t_start = time.monotonic()
+            self._run_pipeline_once()
+            if not self._running:
+                break
+            if time.monotonic() - t_start >= _STABLE_RUN_SEC:
+                attempt = 0
+            delay = min(_RESTART_MIN_SEC * (2 ** attempt), _RESTART_MAX_SEC)
+            attempt += 1
+            self.get_logger().warn(
+                f'OAK pipeline stopped — rebuilding in {delay:.0f}s (attempt {attempt})')
+            deadline = time.monotonic() + delay
+            while self._running and time.monotonic() < deadline:
+                time.sleep(0.1)
+
+    def _run_pipeline_once(self):
+        """Builds and runs the pipeline; returns when it stops or fails."""
         # Official pattern: https://docs.luxonis.com/software-v3/depthai/examples/
         # spatial_detection_network/spatial_detection/
         size = (640, 400)
@@ -165,6 +193,8 @@ class OakNode(LifecycleNode):
                         time.sleep(0.01)
                         continue
                     self._process(packet.detections)
+                if self._running:
+                    self.get_logger().error('OAK pipeline is no longer running')
 
         except Exception as e:
             self.get_logger().error(f'OAK error: {e}')

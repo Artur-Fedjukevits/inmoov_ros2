@@ -100,8 +100,10 @@ matching `Serial.begin(115200)` in both sketches). Read timeout is 0.1 s.
   Arduino bootloader (opening the port resets the board), starts a 50 Hz TX
   timer (`0.02 s`) and an RX thread that reads 64-byte chunks and feeds them
   into `FrameParser`.
-- TX (every 20 ms): sends, in order, a `CMD_SLEEP` frame (only if the sleep
-  state changed), a `CMD_SET_SPEEDS` frame (only if any speed changed), then
+- TX (every 20 ms): sends, in order, a `CMD_SLEEP` frame and a
+  `CMD_SET_SPEEDS` frame (when the sleep state / a speed changed, after every
+  (re)connect and every 2 s as a resync — both are idempotent in the firmware,
+  so a board that reset on its own gets its sleep flag and speeds back), then
   always a `CMD_SET_SERVOS` frame with all body + face angles. The initial
   targets are the `rest_deg` values from the joint tables, so activating the
   node immediately drives the servos to those rests.
@@ -117,6 +119,10 @@ matching `Serial.begin(115200)` in both sketches). Read timeout is 0.1 s.
 - `on_deactivate` / `on_shutdown`: send one `CMD_SET_SERVOS` frame with the rest
   positions (then wait 150 ms), stop the RX thread (2 s join), destroy the TX
   timer and close the port.
+- Link loss: a serial read/write error (board unplugged, USB reset) closes the
+  port and the RX thread reopens it in the background with a growing back-off
+  (2 s → 30 s); the node stays `active` and logs `Serial link lost` /
+  `Serial link restored`.
 - RX: `CMD_ULTRASONIC` (uint16 big-endian, cm), `CMD_PIR` (1 byte),
   `CMD_HALL` (5 × uint16 big-endian) are decoded and published.
   `CMD_ACK` / `CMD_DIAG_RESP` are defined in the protocol but not handled by
@@ -128,16 +134,9 @@ the full lists.
 
 **Known issues / TODOs (from code and cross-checks)**
 
-- Serial errors are not recovered: on a `SerialException` in the RX loop or in
-  the TX path the node sets its serial handle to `None` and silently stops
-  sending/receiving; it stays `active` and only reopens the port after a
-  deactivate/activate cycle (or a process respawn by `ros2 launch`).
 - The Python joint tables mirror the firmware tables (see
   [Protocol](#protocol)); the firmware is the authority for limits. A value of
   `0` in `SET_SERVOS` means "go to the firmware rest angle".
-- The sleep flag is only sent when it changes; if the Arduino resets while the
-  robot is asleep it wakes up (firmware default is awake) and the node does not
-  resend the flag.
 
 ### `joint_state_publisher`
 
@@ -451,8 +450,8 @@ Some of these scripts still have Russian docstrings/GUI text.
 
 ## Known issues to verify
 
-- Serial-error recovery (see `arduino_*_node`): unplugging a board while the node
-  is active silently stops all traffic; the node does not go to an error state.
+- Serial reconnect and the 2 s sleep/speed resync were tested with an emulated
+  board (pty); verify on the robot by unplugging a board while it is active.
 - `joint_state_publisher` reports commanded, not measured, state.
 - The firmware defines `CMD_ACK` in `protocol.py`, but neither sketch sends it;
   the nodes therefore have no delivery confirmation for commands.

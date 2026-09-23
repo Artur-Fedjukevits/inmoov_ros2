@@ -94,10 +94,11 @@ Known limitations:
     are worse for PHAT than broadband noise) — the voting window
     smooths this out, but short utterances (<1-2s) may not accumulate a
     confident result in time.
-  - During a long silence the voting window does not reset itself — the
-    old direction "sticks" until the next votes come in. If someone
-    starts speaking from a different side after a pause, the first
-    ~vote_window_sec may still show the previous direction.
+  - Votes are time-stamped: votes older than vote_window_sec expire, and a
+    silence longer than silence_reset_sec clears the window, so a new
+    speaker after a pause starts from a clean vote (the old direction does
+    not "stick"). The price: right after a pause the vote rests on the few
+    blocks of the new utterance only.
   - No on_set_parameters_callback — `ros2 param set` at runtime has no
     effect, only a restart with -p.
 
@@ -125,6 +126,7 @@ import os
 import queue
 import statistics
 import threading
+import time
 from collections import deque
 
 # Limit BLAS/numpy internal multithreading BEFORE importing numpy/scipy —
@@ -176,6 +178,7 @@ class SoundLocalizationNode(LifecycleNode):
         self._dp('vote_window_sec', 3.0)    # sliding sign-vote window; larger = more reliable but slower to react
         self._dp('rms_gate_dbfs', -24.0)    # tuned for 60% gain and a real distance of 1-3 m (see the note in the module docstring)
         self._dp('publish_silence', False)
+        self._dp('silence_reset_sec', 2.0)  # silence longer than this clears the vote window
         self._dp('swap_channels', True)     # raw ch0 = physically right, ch1 = physically left — see the module docstring
         self._dp('watchdog_sec', 3.0)
 
@@ -189,11 +192,13 @@ class SoundLocalizationNode(LifecycleNode):
         self._vote_window_sec    = self.get_parameter('vote_window_sec').value
         self._rms_gate_dbfs      = self.get_parameter('rms_gate_dbfs').value
         self._publish_silence    = self.get_parameter('publish_silence').value
+        self._silence_reset_sec  = self.get_parameter('silence_reset_sec').value
         self._swap_channels      = self.get_parameter('swap_channels').value
         self._watchdog_sec       = self.get_parameter('watchdog_sec').value
 
         self._vote_window_blocks = max(1, int(self._vote_window_sec * self.rate / self.block_size))
-        self._vote_window = deque(maxlen=self._vote_window_blocks)
+        self._vote_window = deque(maxlen=self._vote_window_blocks)   # (monotonic t, tdoa_us)
+        self._last_voiced_t = 0.0
 
         self._sos = butter(4, [self._bandpass_low, self._bandpass_high],
                             btype='band', fs=self.rate, output='sos')
@@ -364,16 +369,26 @@ class SoundLocalizationNode(LifecycleNode):
             return
 
         if voiced:
-            tdoa_us = self._gcc_phat_tdoa_us(left, right)
-            self._vote_window.append(tdoa_us)
+            now = time.monotonic()
+            # A pause longer than silence_reset_sec starts a new vote (new
+            # speaker / new utterance); older votes also expire by age.
+            if now - self._last_voiced_t > self._silence_reset_sec:
+                self._vote_window.clear()
+            self._last_voiced_t = now
+            while self._vote_window and now - self._vote_window[0][0] > self._vote_window_sec:
+                self._vote_window.popleft()
 
-            total = len(self._vote_window)
-            pos = sum(1 for x in self._vote_window if x > 0)
-            neg = sum(1 for x in self._vote_window if x < 0)
+            tdoa_us = self._gcc_phat_tdoa_us(left, right)
+            self._vote_window.append((now, tdoa_us))
+
+            delays = [d for _, d in self._vote_window]
+            total = len(delays)
+            pos = sum(1 for x in delays if x > 0)
+            neg = sum(1 for x in delays if x < 0)
             score = (pos - neg) / total if total > 0 else 0.0
             angle_deg = score * 90.0
             confidence = abs(score)
-            tdoa_us_median = statistics.median(self._vote_window)
+            tdoa_us_median = statistics.median(delays)
         else:
             tdoa_us_median, angle_deg, confidence = 0.0, 0.0, 0.0
 
