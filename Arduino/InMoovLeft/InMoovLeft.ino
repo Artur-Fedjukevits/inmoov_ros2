@@ -14,10 +14,14 @@
  * ROS2 → Arduino:
  *   CMD=0x01  SET_SERVOS: DATA = SERVO_TOTAL_COUNT bytes, degrees 0-180
  *   CMD=0x03  SLEEP:      DATA = 1 byte, 0=awake, 1=sleeping.
- *             While sleeping, ULTRASONIC telemetry stops.
+ *             While sleeping, ULTRASONIC/HALL telemetry stops.
  *
  * Arduino → ROS2:
  *   CMD=0x10  ULTRASONIC: DATA = uint16 big-endian, distance in cm
+ *   CMD=0x12  HALL:       DATA = 5 x uint16 big-endian, raw analogRead (0-1023)
+ *             order: [thumb, index, middle, ring, pinky] — same semantic order
+ *             as the right arm, but MIDDLE/PINKY physical pins are swapped
+ *             (A4/A2) to match this arm's hall sensor wiring.
  *
  * Packet order (28 bytes):
  *   Body GPIO (15) — ACT imitation learning joints:
@@ -46,9 +50,18 @@
 #define SMOOTH_INTERVAL_MS      60
 #define ULTRASONIC_INTERVAL_MS  250
 #define ULTRASONIC_TIMEOUT_US   25000   // ~4m
+#define HALL_INTERVAL_MS        100
 
 #define ULTRASONIC_TRIG_PIN     64
 #define ULTRASONIC_ECHO_PIN     63
+
+// Hall finger sensors — same semantic order as right arm [thumb, index,
+// middle, ring, pinky], but MIDDLE/PINKY pins swapped for this arm's wiring.
+#define THUMB_HALL_PIN          A0
+#define INDEX_HALL_PIN          A1
+#define PINKY_HALL_PIN          A2
+#define RING_HALL_PIN           A3
+#define MIDDLE_HALL_PIN         A4
 
 // PCA9685
 #define PCA9685_ADDR  0x40
@@ -65,8 +78,9 @@
 #define CMD_DIAG_REQ    0x20
 #define CMD_DIAG_RESP   0x21
 #define CMD_ULTRASONIC  0x10
+#define CMD_HALL        0x12
 
-bool sleeping = false;   // set via CMD_SLEEP; gates ultrasonic telemetry
+bool sleeping = false;   // set via CMD_SLEEP; gates ultrasonic/hall telemetry
 
 void sendFrame(uint8_t cmd, uint8_t* data, uint8_t len) {
   uint8_t crc = cmd ^ len;
@@ -80,19 +94,19 @@ void sendFrame(uint8_t cmd, uint8_t* data, uint8_t len) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Servo table (parameters identical to Xicro_subsys_left_ID_2.ino)
+// Servo table 
 // ─────────────────────────────────────────────────────────────────────────────
 //                               rest  min   max  step          drv             pin  ch   inv
 SmoothServo servos[SERVO_TOTAL_COUNT] = {
-  /* THUMB_L     pin 2  */ {0,0,    0,   0, 180,  2, 0, DRIVER_GPIO, Servo(),  2,  0, false},
-  /* INDEX_L     pin 3  */ {0,0,    0,   0, 180,  2, 0, DRIVER_GPIO, Servo(),  3,  0, false},
-  /* MAJEURE_L   pin 4  */ {0,0,    0,   0, 180,  2, 0, DRIVER_GPIO, Servo(),  4,  0, false},
-  /* RING_L      pin 5  */ {0,0,    0,   0, 180,  2, 0, DRIVER_GPIO, Servo(),  5,  0, false},
-  /* PINKY_L     pin 6  */ {0,0,    0,   0, 180,  2, 0, DRIVER_GPIO, Servo(),  6,  0, false},
-  /* WRIST_L     pin 7  */ {0,0,   90,   0, 180,  2, 0, DRIVER_GPIO, Servo(),  7,  0, false},
+  /* THUMB_L     pin 2  */ {0,0,   50,   0, 145,  2, 0, DRIVER_GPIO, Servo(),  2,  0, false},
+  /* INDEX_L     pin 3  */ {0,0,    0,   0, 150,  2, 0, DRIVER_GPIO, Servo(),  3,  0, false},
+  /* MAJEURE_L   pin 4  */ {0,0,    0,   0, 150,  2, 0, DRIVER_GPIO, Servo(),  4,  0, false},
+  /* RING_L      pin 5  */ {0,0,    0,   0, 140,  2, 0, DRIVER_GPIO, Servo(),  5,  0, false},
+  /* PINKY_L     pin 6  */ {0,0,    0,   0, 150,  2, 0, DRIVER_GPIO, Servo(),  6,  0, false},
+  /* WRIST_L     pin 7  */ {0,0,  150,   0, 300,  2, 0, DRIVER_GPIO, Servo(),  7,  0, false},
   /* BICEP_L     pin 8  */ {0,0,    0,   0,  90,  1, 0, DRIVER_GPIO, Servo(),  8,  0, false},
   /* ROTATE_L    pin 9  */ {0,0,   90,  40, 180,  2, 0, DRIVER_GPIO, Servo(),  9,  0, false},
-  /* SHOULDER_L  pin 10 */ {0,0,   30,   0, 180,  2, 0, DRIVER_GPIO, Servo(), 10,  0, false},
+  /* SHOULDER_L  pin 10 */ {0,0,   20,   0, 180,  2, 0, DRIVER_GPIO, Servo(), 10,  0, false},
   /* OMOPLATE_L  pin 11 */ {0,0,   25,  25,  90,  2, 0, DRIVER_GPIO, Servo(), 11,  0, false},
   /* NECK        pin 12 */ {0,0,   40,   0, 100,  2, 0, DRIVER_GPIO, Servo(), 12,  0, false},
   /* ROTHEAD     pin 13 */ {0,0,   90,  30, 140,  1, 0, DRIVER_GPIO, Servo(), 13,  0, false},
@@ -225,6 +239,7 @@ void feedByte(uint8_t b) {
 // Sensor state
 // ─────────────────────────────────────────────────────────────────────────────
 unsigned long ultrasonic_last = 0;
+unsigned long hall_last       = 0;
 
 int readUltrasonicCM() {
   digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
@@ -266,6 +281,12 @@ void setup() {
 
   pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
   pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+
+  pinMode(THUMB_HALL_PIN, INPUT);
+  pinMode(INDEX_HALL_PIN, INPUT);
+  pinMode(MIDDLE_HALL_PIN, INPUT);
+  pinMode(RING_HALL_PIN, INPUT);
+  pinMode(PINKY_HALL_PIN, INPUT);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,5 +339,23 @@ void loop() {
       uint8_t buf[2] = { (uint8_t)(dist >> 8), (uint8_t)(dist & 0xFF) };
       sendFrame(CMD_ULTRASONIC, buf, 2);
     }
+  }
+
+  // 5. Hall finger sensors — auto at HALL_INTERVAL_MS (paused while sleeping)
+  if (!sleeping && (now - hall_last >= HALL_INTERVAL_MS)) {
+    hall_last = now;
+    uint16_t h[5] = {
+      (uint16_t)analogRead(THUMB_HALL_PIN),
+      (uint16_t)analogRead(INDEX_HALL_PIN),
+      (uint16_t)analogRead(MIDDLE_HALL_PIN),
+      (uint16_t)analogRead(RING_HALL_PIN),
+      (uint16_t)analogRead(PINKY_HALL_PIN),
+    };
+    uint8_t buf[10];
+    for (uint8_t i = 0; i < 5; i++) {
+      buf[i * 2]     = (uint8_t)(h[i] >> 8);
+      buf[i * 2 + 1] = (uint8_t)(h[i] & 0xFF);
+    }
+    sendFrame(CMD_HALL, buf, 10);
   }
 }

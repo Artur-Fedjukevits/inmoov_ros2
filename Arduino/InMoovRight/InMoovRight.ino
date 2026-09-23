@@ -75,7 +75,7 @@ void sendFrame(uint8_t cmd, uint8_t* data, uint8_t len) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Servo table (identical parameters to Xicro_subsys_right_ID_1.ino)
+// Servo table
 // ─────────────────────────────────────────────────────────────────────────────
 //                              rest  min   max  step  pin
 SmoothServo servos[SERVO_TOTAL_COUNT] = {
