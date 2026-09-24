@@ -12,7 +12,7 @@
   <depend>sensor_msgs</depend>
   <depend>inmoov_msgs</depend>
 
-  <!-- Python runtime deps resolvable via rosdep (`rosdep install --from-paths src`) -->
+  <!-- Python runtime deps resolvable via rosdep (rosdep install, from-paths src) -->
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-onnxruntime-pip</exec_depend>
