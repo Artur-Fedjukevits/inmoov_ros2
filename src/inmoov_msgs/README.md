@@ -5,6 +5,17 @@ packages. Pure interface definitions — no nodes, no logic.
 
 ## Interfaces
 
+### `msg/JointCommand.msg`
+
+A servo command with arbitration metadata, published on `/joint_cmd` and
+resolved per joint by `inmoov_control`'s Arduino nodes: `source`, `priority`
+(constants `PRIORITY_*` — calibration 90, remote 80, BT command 70, BT scan 60,
+TTS jaw 50, head tracker 40, expression 30, blink 20, legacy 0), `lease_sec`
+(hold the joints this long; 0 = write only), `release` (drop this source's
+ownership) and `cmd` (`sensor_msgs/JointState`, radians around each joint's
+90° center; empty velocity = default speed). See the `inmoov_control` README,
+*Joint arbitration*.
+
 ### `msg/SoundDirection.msg`
 
 Direction to a sound source from a stereo microphone pair, produced by

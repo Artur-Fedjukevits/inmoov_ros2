@@ -3,8 +3,9 @@
 InMoov Servo Calibration GUI — новый протокол.
 
 Публикует sensor_msgs/JointState на:
-  /joint_command  — все серво тела (26 joints)
-  /face_command   — серво лица (13 joints)
+  /joint_cmd (inmoov_msgs/JointCommand, source 'calibration', priority 90) —
+  все серво тела и лица; перебивает трекер/BT/выражения, пока двигаете слайдер
+  (аренда 2 с), работает и при запущенном, и при остановленном стеке.
 
 Значения слайдеров в градусах (как в firmware).
 Конвертация: rad = (deg - 90) * pi / 180  (center_deg=90 для всех серво).
@@ -18,6 +19,7 @@ from tkinter import ttk
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from inmoov_msgs.msg import JointCommand
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Определения серво: (joint_name, min_deg, max_deg, rest_deg)
@@ -127,8 +129,14 @@ def deg_to_rad(deg: float) -> float:
 class ServoCalibNode(Node):
     def __init__(self):
         super().__init__("servo_calib_gui_node")
-        self._joint_pub = self.create_publisher(JointState, "/joint_command", 10)
-        self._face_pub  = self.create_publisher(JointState, "/face_command",  10)
+        self._cmd_pub = self.create_publisher(JointCommand, "/joint_cmd", 10)
+
+    def _publish(self, msg: JointState):
+        # Highest priority with a short lease: calibration overrides the running
+        # stack while you move a slider, and releases it 2 s after you stop.
+        self._cmd_pub.publish(JointCommand(
+            source="calibration", priority=JointCommand.PRIORITY_CALIBRATION,
+            lease_sec=2.0, cmd=msg))
 
     def send(self, joint_name: str, deg: int):
         """Send a single joint command, syncing paired joints if needed."""
@@ -146,9 +154,9 @@ class ServoCalibNode(Node):
         msg.position = [deg_to_rad(float(d)) for d in degs]
 
         if joint_name in FACE_JOINTS:
-            self._face_pub.publish(msg)
+            self._publish(msg)
         else:
-            self._joint_pub.publish(msg)
+            self._publish(msg)
 
     def send_all(self, values: dict[str, int]):
         """Send all joints in two batched messages, expanding sync partners."""
@@ -177,14 +185,14 @@ class ServoCalibNode(Node):
             msg.header.stamp = now
             msg.name     = body_names
             msg.position = body_pos
-            self._joint_pub.publish(msg)
+            self._publish(msg)
 
         if face_names:
             msg = JointState()
             msg.header.stamp = now
             msg.name     = face_names
             msg.position = face_pos
-            self._face_pub.publish(msg)
+            self._publish(msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,7 +203,7 @@ class CalibGUI:
     def __init__(self, root: tk.Tk, node: ServoCalibNode):
         self.root = root
         self.node = node
-        root.title("InMoov Servo Calibration  (/joint_command · /face_command)")
+        root.title("InMoov Servo Calibration  (/joint_cmd · priority 90)")
         root.resizable(True, True)
 
         # ── Toolbar ──────────────────────────────────────────────────────────
@@ -210,7 +218,7 @@ class CalibGUI:
                    command=root.destroy).pack(side="right", padx=2)
 
         # Topic indicators
-        ttk.Label(toolbar, text="▶ /joint_command  |  ▶ /face_command",
+        ttk.Label(toolbar, text="▶ /joint_cmd (calibration, priority 90)",
                   foreground="#555").pack(side="right", padx=10)
 
         # ── Notebook ─────────────────────────────────────────────────────────
@@ -252,7 +260,7 @@ class CalibGUI:
             var = tk.IntVar(value=rest)
             self._vars[name] = var
 
-            topic_lbl = "/face_command" if name in FACE_JOINTS else "/joint_command"
+            topic_lbl = "face" if name in FACE_JOINTS else "body"
             color     = "#7a3" if name in FACE_JOINTS else "#38a"
 
             ttk.Label(inner, text=name, width=18, anchor="w").grid(

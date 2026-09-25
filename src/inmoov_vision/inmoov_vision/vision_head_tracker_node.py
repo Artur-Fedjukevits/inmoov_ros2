@@ -17,9 +17,14 @@ Leader/follower logic:
   Both sets must not be published at the same time — EYE_SYNC creates a race
   (the last joint in the packet overwrites the mirror of the previous one).
 
-Publishes:
-  /joint_command  (JointState) — rothead, neck
-  /face_command   (JointState) — eye_lr_L + eye_ud_L  | eye_lr_R + eye_ud_R
+Publishes (inmoov_msgs/JointCommand on /joint_cmd, source 'head_tracker',
+priority 40 — see JointCommand.msg):
+  rothead, neck; eye_lr_L + eye_ud_L | eye_lr_R + eye_ud_R
+  Tracking commands hold a short lease (_TRACK_LEASE_SEC), refreshed every tick,
+  so higher-priority commands (BT look_direction, scans) win while they hold the
+  head, and expressions can't move the eyes while we track. The REST pose sent
+  on disable takes no lease: it is dropped if a higher-priority source holds the
+  head (this replaced the BT's 200 ms "publish after the tracker's REST" delay).
   /head_tracker/face_locked (Bool) — whether there is a fresh bbox RIGHT NOW
     (not stale, see _STALE_SEC). Not latched — False is published explicitly
     on disable. The single source of truth for "face caught" for the
@@ -45,6 +50,10 @@ from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String, Bool
+from inmoov_msgs.msg import JointCommand
+
+_SOURCE          = 'head_tracker'
+_TRACK_LEASE_SEC = 0.5   # refreshed at track_hz while we command the head
 
 _STALE_SEC    = 2.0  # bbox goes stale (s) — the camera has not delivered a face
 _FALLBACK_SEC = 5.0  # the right camera drives the head only if the left has been absent for 5+ s
@@ -200,9 +209,10 @@ class VisionHeadTrackerNode(LifecycleNode):
         # stale (90°/40° from the last _return_to_rest), and the first step of
         # the P controller is computed from a wrong base, jerking the head
         # back towards the centre before it catches the real track. Found 2026-08-24.
-        self.create_subscription(JointState, '/joint_command', self._external_joint_cb, 10)
-        self._head_pub   = self.create_lifecycle_publisher(JointState, '/joint_command', 10)
-        self._face_pub   = self.create_lifecycle_publisher(JointState, '/face_command',  10)
+        # /joint_commanded = what the Arduino nodes actually ACCEPTED (after arbitration)
+        self.create_subscription(JointState, '/joint_commanded', self._external_joint_cb, 10)
+        self._head_pub   = self.create_lifecycle_publisher(JointCommand, '/joint_cmd', 10)
+        self._face_pub   = self._head_pub   # one topic for head and eyes
         # /head_tracker/face_locked — the single source of truth for "is a face
         # actually caught right now" (there is a fresh, non-stale bbox). Used
         # by behavior_manager_node to decide whether a repeated
@@ -215,7 +225,6 @@ class VisionHeadTrackerNode(LifecycleNode):
 
     def on_activate(self, state):
         self._head_pub.on_activate(state)
-        self._face_pub.on_activate(state)
         self._locked_pub.on_activate(state)
         self._timer = self.create_timer(1.0 / self._hz, self._tick)
         return TransitionCallbackReturn.SUCCESS
@@ -225,7 +234,6 @@ class VisionHeadTrackerNode(LifecycleNode):
             self.destroy_timer(self._timer)
             self._timer = None
         self._head_pub.on_deactivate(state)
-        self._face_pub.on_deactivate(state)
         self._locked_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
@@ -255,14 +263,14 @@ class VisionHeadTrackerNode(LifecycleNode):
                 self._last_left_msg_t = now
                 self._at_rest      = False
         if not msg.data:
-            self._return_to_rest()
+            self._return_to_rest(lease_sec=0.0)   # dropped if e.g. the BT holds the head
             self._locked_pub.publish(Bool(data=False))
             self.get_logger().info('HeadTracker: disabled -> rest')
         else:
             self.get_logger().info('HeadTracker: enabled')
 
     def _external_joint_cb(self, msg: JointState):
-        """Picks up rothead/neck from ANY source on /joint_command
+        """Picks up rothead/neck from ANY accepted command on /joint_commanded
         (including our own _publish_head() — harmless, same value) —
         keeps the internal state in sync with the real position so that the
         P controller does not compute a step from a stale base after someone
@@ -541,7 +549,7 @@ class VisionHeadTrackerNode(LifecycleNode):
 
     # ── Rest ──────────────────────────────────────────────────────────────
 
-    def _return_to_rest(self):
+    def _return_to_rest(self, lease_sec: float = _TRACK_LEASE_SEC):
         self._rothead = self.get_parameter('rest_rothead').value
         self._neck    = self.get_parameter('rest_neck').value
         self._eye_lr  = self.get_parameter('rest_eye_lr').value
@@ -554,13 +562,17 @@ class VisionHeadTrackerNode(LifecycleNode):
             self._at_rest          = True
             self._runaway_streak   = 0
             self._streak_ref_mag   = None
-        self._publish_head()
+        self._publish_head(lease_sec)
         # At rest we publish the left — EYE_SYNC mirrors the right
-        self._publish_eyes('left')
+        self._publish_eyes('left', lease_sec)
 
     # ── Publishers ────────────────────────────────────────────────────────
 
-    def _publish_head(self):
+    def _command(self, js: JointState, lease_sec: float) -> JointCommand:
+        return JointCommand(source=_SOURCE, priority=JointCommand.PRIORITY_HEAD_TRACKER,
+                            lease_sec=lease_sec, cmd=js)
+
+    def _publish_head(self, lease_sec: float = _TRACK_LEASE_SEC):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name     = ['rothead', 'neck']
@@ -568,9 +580,9 @@ class VisionHeadTrackerNode(LifecycleNode):
             _deg_to_rad(self._rothead, center=90.0),
             _deg_to_rad(self._neck,    center=90.0),
         ]
-        self._head_pub.publish(msg)
+        self._head_pub.publish(self._command(msg, lease_sec))
 
-    def _publish_eyes(self, side: str):
+    def _publish_eyes(self, side: str, lease_sec: float = _TRACK_LEASE_SEC):
         """Publishes only one eye — EYE_SYNC in arduino_comm_node mirrors the other."""
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -582,7 +594,7 @@ class VisionHeadTrackerNode(LifecycleNode):
             _deg_to_rad(self._eye_lr, center=90.0),
             _deg_to_rad(self._eye_ud, center=90.0),
         ]
-        self._face_pub.publish(msg)
+        self._face_pub.publish(self._command(msg, lease_sec))
 
 
 

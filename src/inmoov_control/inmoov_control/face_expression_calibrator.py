@@ -32,6 +32,7 @@ from tkinter import messagebox, ttk
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from inmoov_msgs.msg import JointCommand
 
 from inmoov_control import face_expressions_node as _fen
 
@@ -254,14 +255,20 @@ def _r(deg: float) -> float:
 class FaceCalibNode(Node):
     def __init__(self):
         super().__init__('face_expression_calibrator')
-        self._pub = self.create_publisher(JointState, '/face_command', 10)
+        self._cmd_pub = self.create_publisher(JointCommand, '/joint_cmd', 10)
+
+    def _publish(self, msg: JointState) -> None:
+        # Calibration priority: overrides tracker/expressions while tuning (2 s lease)
+        self._cmd_pub.publish(JointCommand(
+            source='calibration', priority=JointCommand.PRIORITY_CALIBRATION,
+            lease_sec=2.0, cmd=msg))
 
     def send_single(self, name: str, deg: int) -> None:
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = [name]
         msg.position = [_r(float(deg))]
-        self._pub.publish(msg)
+        self._publish(msg)
 
     def send_batch(self, positions: dict[str, int]) -> None:
         if not positions:
@@ -270,7 +277,7 @@ class FaceCalibNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = list(positions.keys())
         msg.position = [_r(float(v)) for v in positions.values()]
-        self._pub.publish(msg)
+        self._publish(msg)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GUI

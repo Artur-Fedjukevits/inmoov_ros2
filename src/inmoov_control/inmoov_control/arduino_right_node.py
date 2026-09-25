@@ -76,6 +76,10 @@ class ArduinoRightNode(ArduinoCommNode):
         ('upperLip',    90,  90),   # [13] pin 26, rest=90,  min=90,  max=105
     ]
 
+    # Firmware table step (deg per 60 ms tick) — default speed, same order
+    DEFAULT_STEPS = [2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 2,   # body
+                     2, 2, 2]                           # eye_lr, eye_ud, upperLip
+
     HAS_ULTRASONIC   = True
     HAS_PIR          = True
     HAS_HALL         = True

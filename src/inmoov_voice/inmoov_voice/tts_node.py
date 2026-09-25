@@ -39,6 +39,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
 
 from inmoov_msgs.action import Speak
+from inmoov_msgs.msg import JointCommand
 
 
 class TTSNode(LifecycleNode):
@@ -138,7 +139,9 @@ class TTSNode(LifecycleNode):
 
         self.create_subscription(Bool,   '/tts_cancel_queue',  self._cancel_queue_cb, 10)
         self._speaking_pub = self.create_lifecycle_publisher(Bool, 'tts_speaking', 10)
-        self._jaw_pub      = self.create_lifecycle_publisher(JointState, '/face_command', 10)
+        # Arbitrated (inmoov_msgs/JointCommand): priority 50 with a short lease refreshed
+        # per audio chunk — a held expression can't move the jaw while we speak
+        self._jaw_pub      = self.create_lifecycle_publisher(JointCommand, '/joint_cmd', 10)
         # Held facial expression for the duration of speech (see _execute_speak) —
         # separate from the animated one-shot /face_expression (greet/farewell/BT).
         self._face_expr_pub = self.create_lifecycle_publisher(
@@ -588,7 +591,8 @@ class TTSNode(LifecycleNode):
         msg.name     = ['jaw']
         msg.position = [(float(position) - 90.0) * math.pi / 180.0]
         msg.velocity = [self._jaw_speed_rad_s]
-        self._jaw_pub.publish(msg)
+        self._jaw_pub.publish(JointCommand(
+            source='tts_jaw', priority=JointCommand.PRIORITY_TTS_JAW, lease_sec=0.5, cmd=msg))
 
     def _publish_speaking(self, speaking: bool):
         msg = Bool()

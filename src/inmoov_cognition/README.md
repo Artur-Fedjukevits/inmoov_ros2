@@ -40,7 +40,7 @@ pipeline that turns raw perception into dialogue and physical behavior.
   and turns tool calls into either `/robot_events` (physical actions handled
   by the Behavior Tree) or its own side effects (OpenHAB control, memory
   writes, weather, web search, Telegram broadcast). It never touches
-  `/joint_command` or the TTS action client for *robot commands* — those go
+  `/joint_cmd` or the TTS action client for *robot commands* — those go
   through the Behavior Tree.
 - **Behavior Tree** (`behavior_manager_node`) is the single orchestrator. A
   `py_trees` "eternal tree" (a no-memory `Selector` re-evaluated from the top
@@ -384,9 +384,10 @@ dialogue has started.
 (latched, both toggled solely by the BT — it is the single orchestrator of
 vision enable/disable), `/go_idle`, `/behavior/face_search_status` (latched
 JSON status consumed by `llm_node` for the "ask where you are" prompt block),
-`/joint_command` (head/torso/aim commands), `/face_expression`,
-`cmd_vel`, `arm_command`, `status_request`, `search_result`, `/face_command`
-(eye blink).
+`/joint_cmd` (`inmoov_msgs/JointCommand`: head/torso commands as source
+`bt_command` priority 70, scans / face search / aim as `bt_scan` priority 60,
+eye blink as `blink` priority 20), `/face_expression`, `cmd_vel`,
+`arm_command`, `status_request`, `search_result`.
 
 **Actions**: `Speak` (`inmoov_msgs/action/Speak`) client, with cancellation
 support via `terminate()` for the interrupt buffer.

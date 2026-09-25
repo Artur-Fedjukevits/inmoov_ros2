@@ -35,7 +35,7 @@ flowchart LR
     LLM -- "/speak (action)" --> TTS[tts_node]
     TTS -- "HTTP /tts/stream" --> SRV[("TTS server")]
     TTS -- tts_speaking --> VD
-    TTS -- "/face_command (jaw)<br/>/face_expression_hold" --> FACE["inmoov_control<br/>(face)"]
+    TTS -- "/joint_cmd (jaw)<br/>/face_expression_hold" --> FACE["inmoov_control<br/>(face)"]
     VD -- "/voice_embedding" --> ID["identity_manager<br/>(inmoov_cognition)"]
     ID -- /voice_anchor --> VD
     STEREO[/"stereo mic pair<br/>CM6206 (raw ALSA)"/] --> SL[sound_localization_node]
@@ -340,7 +340,8 @@ it. Runs on a `MultiThreadedExecutor` (4 threads) with a
   `RawOutputStream`. The time to first audio byte is logged as `TTFA`.
 - Jaw sync: the RMS of every PCM chunk is mapped linearly from
   `[jaw_rms_threshold, jaw_rms_max]` to `[jaw_closed, jaw_open]` degrees and
-  published on `/face_command` as joint `jaw` (radians relative to 90 degrees)
+  published on `/joint_cmd` (`inmoov_msgs/JointCommand`, source `tts_jaw`,
+  priority 50, 0.5 s lease) as joint `jaw` (radians relative to 90 degrees)
   together with a velocity of `jaw_speed_deg_per_sec`. The jaw is closed at
   the end or on abort.
 - Face expression: when `voice` is one of `neutral`/`happy`/`sad`/`surprise`
@@ -378,7 +379,7 @@ it. Runs on a `MultiThreadedExecutor` (4 threads) with a
 |---|---|---|---|
 | `/tts_cancel_queue` | `std_msgs/Bool` | subscribe (10) | See above. |
 | `tts_speaking` | `std_msgs/Bool` | publish (lifecycle, 10) | Consumed by `voice_detector_node`. |
-| `/face_command` | `sensor_msgs/JointState` | publish (lifecycle, 10) | Jaw only. |
+| `/joint_cmd` | `inmoov_msgs/JointCommand` | publish (lifecycle, 10) | Jaw only (priority 50). |
 | `/face_expression_hold` | `std_msgs/String` | publish (lifecycle, 10) | Held expression, consumed by `face_expressions_node`. |
 
 ### `voice_emotion_node`

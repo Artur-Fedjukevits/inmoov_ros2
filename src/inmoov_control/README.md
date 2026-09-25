@@ -7,13 +7,48 @@ using a small **batch binary protocol**: one frame carries the target angle of
 [xicro](https://github.com/ROBOTIS-GIT/xicro)-style setup, where every servo
 and every sensor had its own ROS topic, with:
 
-- two aggregated command topics, `/joint_command` (body) and `/face_command`
-  (face), both `sensor_msgs/JointState`;
+- one arbitrated command topic, `/joint_cmd` (`inmoov_msgs/JointCommand`: a
+  `JointState` plus source / priority / lease), resolved **per joint** by the
+  Arduino nodes (see *Joint arbitration* below); the older `/joint_command`
+  and `/face_command` (`JointState`) still work as the lowest-priority source;
 - two aggregated state topics, `/joint_states` and `/face_joint_states`,
   re-published by `joint_state_publisher` (note: these reflect the *commanded*
   state, there is no position feedback from the servos);
 - individual sensor topics (ultrasonic, PIR, Hall finger sensors) decoded from
   the frames the firmware sends back.
+
+## Joint arbitration
+
+Several nodes move the same servos (head tracker, behavior-tree commands and
+scans, TTS lip sync, face expressions, blinking, calibration tools). Each
+command on `/joint_cmd` carries a `source`, a `priority` and a `lease_sec`;
+[`joint_arbiter.py`](inmoov_control/joint_arbiter.py) decides per joint:
+
+- applied if the joint is free, its lease expired, it's the same source, or
+  the priority is strictly higher than the owner's (equal priority: the
+  owner keeps it until its lease ends);
+- `lease_sec > 0` makes the sender the owner for that long; `0` is a plain
+  write that holds nothing; `release=true` drops the sender's ownership;
+- a lease on one eye (`eye_lr_*` / `eye_ud_*`) covers the mirrored eye.
+
+| Priority | Source | Joints | Lease |
+|---|---|---|---|
+| 90 | `calibration` (servo_calibration_gui, face_expression_calibrator) | any | 2 s, refreshed while moving |
+| 80 | `remote` — reserved for an external control app (e.g. Android via rosbridge) | any | — |
+| 70 | `bt_command` (look_direction / robot_control head) | head, torso | whole override, then released |
+| 60 | `bt_scan` (PIR / sound scan, face search, aim at human) | head / torso | scan phase, released at the end |
+| 50 | `tts_jaw` | jaw | 0.5 s per audio chunk |
+| 40 | `head_tracker` | head, eyes | 0.5 s per tick |
+| 30 | `expression` | expression joints | 1 s while animating; static holds none |
+| 20 | `blink` | eyelids | none |
+| 0 | `legacy` (`/joint_command`, `/face_command`) | any | none |
+
+A command without `velocity` (or 0) moves the joint at its **default speed**
+(the firmware table step, `DEFAULT_STEPS` in `arduino_{left,right}_node.py`,
+checked against the sketches by `test/test_servo_tables.py`) — speed is not
+inherited from the previous sender. Accepted commands are echoed on
+`/joint_commanded` (what nodes tracking the current pose should use); live
+owners and the rejected count are on `/arduino_{left,right}/joint_owners`.
 
 The package also contains the face expression library / node
 (`face_expressions_node`) and a Tk-based expression calibrator.
@@ -83,8 +118,11 @@ matching `Serial.begin(115200)` in both sketches). Read timeout is 0.1 s.
 
 | Topic | Type | Direction | Notes |
 |---|---|---|---|
-| `/joint_command` | `sensor_msgs/JointState` | subscribe (depth 10) | Body joints. `name[i]` selects the joint, `position[i]` is radians relative to the joint centre (90° for every joint): `deg = rad*180/π + 90`, rounded and clamped to 0–180. Names not belonging to this board are ignored, so both nodes can receive the same message. Optional `velocity[i]` (rad/s) sets the per-servo speed, see below. |
-| `/face_command` | `sensor_msgs/JointState` | subscribe (depth 10) | Face joints, same encoding. Subscribed only if the board has `FACE_JOINTS` (true for both boards). |
+| `/joint_cmd` | `inmoov_msgs/JointCommand` | subscribe (depth 20) | Arbitrated per joint (see *Joint arbitration*). `cmd.name[i]` selects the joint, `cmd.position[i]` is radians relative to the joint centre (90° for every joint): `deg = rad*180/π + 90`, rounded and clamped to 0–180. Names not belonging to this board (or its mirrored eye) are ignored, so both nodes can receive the same message. Optional `cmd.velocity[i]` (rad/s) sets the per-servo speed, otherwise the default speed. |
+| `/joint_command`, `/face_command` | `sensor_msgs/JointState` | subscribe (depth 10) | Legacy: same encoding, handled as source `legacy`, priority 0, no lease. |
+| `/joint_commanded` | `sensor_msgs/JointState` | publish (lifecycle) | The commands this board accepted after arbitration. |
+| `~/joint_owners` | `std_msgs/String` (JSON) | publish (lifecycle, 1 Hz) | `{owners: {joint: {source, priority, remaining_sec}}, rejected_total}`. |
+| `~/failsafe` | `std_msgs/Bool` | publish (lifecycle, latched) | Firmware host-loss failsafe entered / left. |
 | `/robot_sleep` | `std_msgs/Bool` | subscribe (`TRANSIENT_LOCAL`, depth 1) | Latched. On change it is forwarded as a `CMD_SLEEP` frame; while asleep the firmware stops ultrasonic / PIR / Hall telemetry. |
 | `ultrasonic_{left,right}_distance` | `std_msgs/Int16` | publish (lifecycle publisher, depth 10) | Distance in cm. Published by the topic name relative to the node namespace (i.e. `/ultrasonic_left_distance` with the default empty namespace). |
 | `pir_state` | `std_msgs/Bool` | publish (right only) | PIR motion state. |
@@ -157,8 +195,7 @@ It tracks the joints of both Arduino classes (joint lists are imported from
 
 | Topic | Type | Direction | Notes |
 |---|---|---|---|
-| `/joint_command` | `sensor_msgs/JointState` | subscribe (depth 10) | Positions (rad) stored per joint name; unknown names ignored; `velocity` is ignored. |
-| `/face_command` | `sensor_msgs/JointState` | subscribe (depth 10) | Same, for face joints. |
+| `/joint_commanded` | `sensor_msgs/JointState` | subscribe (depth 20) | Accepted commands from both boards; positions (rad) stored per joint name (eyes mirrored); unknown names ignored. |
 | `/joint_states` | `sensor_msgs/JointState` | publish (lifecycle, depth 10, 50 Hz) | `frame_id = base_link`; names/positions of all body joints. |
 | `/face_joint_states` | `sensor_msgs/JointState` | publish (lifecycle, depth 10, 50 Hz) | `frame_id = head_link`; names/positions of all face joints. |
 
@@ -180,7 +217,8 @@ it. Expressions were ported from MRL InMoov2 (`gestures/faceExpressions.py`,
 `EyebrowMovements.py`, `EyelidMovements.py`, `CheekMovements.py`,
 `EyeMovements.py`). Each expression is a `{joint_name: degrees}` dict; joints
 not listed keep their current position. Face commands are published on
-`/face_command` (`JointState`, radians relative to 90°).
+`/joint_cmd` (source `expression`, priority 30 — the head tracker keeps the
+eyes and TTS keeps the jaw while they hold them).
 
 Available expressions: `neutral`, `angry`, `wink`, `disgust`, `fear`, `happy`,
 `smile`, `sad`, `sigh`, `sorry`, `suspicious`, `thinking`, `unamused`,
@@ -214,7 +252,7 @@ never block the ROS executor.
 |---|---|---|---|
 | `/face_expression` | `std_msgs/String` | subscribe (depth 10) | Name (stripped, lower-cased); unknown names log a warning. |
 | `/face_expression_hold` | `std_msgs/String` | subscribe (depth 10) | Name from `EXPRESSIONS_DATA` only. |
-| `/face_command` | `sensor_msgs/JointState` | publish (regular publisher, depth 10) | Consumed by `arduino_left_node` / `arduino_right_node`. |
+| `/joint_cmd` | `inmoov_msgs/JointCommand` | publish (regular publisher, depth 10) | Consumed by `arduino_left_node` / `arduino_right_node`. |
 
 Example:
 
@@ -234,21 +272,15 @@ The repository ships a JSON with all 15 expressions. The node logs
 `calib: <path>` or `calib: defaults` on configure. To make a user calibration
 the shipped default, copy it over `inmoov_control/face_expressions_calibration.json`.
 
-**Firmware quirk.** A `/face_command` position of exactly `0°` means "go to the
-rest angle" in the firmware (`val == 0 → rest_angle`, otherwise clamp to
-`[min, max]`). Never send `0`; use the firmware minimum instead.
-
 **Known issues**
 
-- The module docstring says minimum-position commands use `1°`; the code
-  actually uses the firmware minimum values from its `_MN` table (which are all
-  > 0), so the intent (never send `0`) is met by different means.
 - Actions are not gated on the lifecycle state: the subscriptions and the
   publisher are plain (not lifecycle) entities created in `on_configure`, so
   expressions execute as soon as the node is *configured*, even before
   `activate`.
-- Mouth/jaw lip-sync is not done here (`tts_node` publishes the jaw directly on
-  `/face_command`); this node only sets the jaw for `happy`/`smile`/`surprise`.
+- Mouth/jaw lip-sync is not done here (`tts_node` publishes the jaw on
+  `/joint_cmd` at a higher priority); this node only sets the jaw for
+  `happy`/`smile`/`surprise`.
 
 ### `face_expression_calibrator`
 
@@ -258,7 +290,8 @@ Interactive Tk GUI (not a lifecycle node; requires a display and `tkinter`) to
 tune the face expressions on the real robot. Left: list of expressions. Right:
 one slider per face servo (16), grouped (eyelids, eyebrows, cheeks, forehead,
 eyes, mouth), with a checkbox saying whether the servo is part of the current
-expression. Moving a slider publishes that servo on `/face_command` in real time
+expression. Moving a slider publishes that servo on `/joint_cmd` (source
+`calibration`, priority 90 — overrides the running stack) in real time
 ("auto send" toggle); *Save* writes only the checked servos of the current
 expression into the user calibration file (see above); *Reset* restores the
 built-in (MRL) defaults for the expression. The GUI labels are in Russian.
@@ -271,7 +304,7 @@ cd ~/ros2_ws && source install/setup.bash
 ros2 run inmoov_control face_expression_calibrator
 ```
 
-**Parameters:** none. **Topic:** publishes `/face_command` (`JointState`).
+**Parameters:** none. **Topic:** publishes `/joint_cmd` (`inmoov_msgs/JointCommand`, priority 90).
 Servo limits/rests are imported from `face_expressions_node` (`_MN`, `_MX`,
 `FACE_REST`), so they are defined in one place.
 
@@ -407,9 +440,10 @@ Testing without the robot / servo power (the Arduino only needs USB power):
 
 ```bash
 python3 -m pytest src/inmoov_control/test/test_protocol.py -v      # no hardware
+python3 -m pytest src/inmoov_control/test/test_joint_arbiter.py -v # no hardware
 python3 src/inmoov_control/test/serial_loopback_test.py --port /dev/ttyACM0 [--left]
 python3 src/inmoov_control/test/test_i2c_pca9685.py --port <left-board-port>
-python3 src/inmoov_control/test/servo_calibration_gui.py            # publishes /joint_command + /face_command
+python3 src/inmoov_control/test/servo_calibration_gui.py            # publishes /joint_cmd (priority 90)
 ```
 
 Helper scripts in [`test/`](test/): `serial_loopback_test.py` (sends

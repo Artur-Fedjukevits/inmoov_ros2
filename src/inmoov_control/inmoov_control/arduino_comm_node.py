@@ -2,9 +2,17 @@
 arduino_comm_node.py — Base class for InMoov Arduino communication nodes.
 
 Replaces xicro for servo control. Handles:
-  TX: /joint_command  (JointState) → batch servo packet over serial
-      /face_command   (JointState) → batch face servo packet (Left Arduino only)
+  TX: /joint_cmd      (inmoov_msgs/JointCommand) → arbitrated per joint (JointArbiter:
+                      priority + lease, see JointCommand.msg) → batch servo packet
+      /joint_command, /face_command (JointState) — legacy, priority 0, no lease
   RX: sensor data from Arduino   → individual ROS topics
+  /joint_commanded (JointState) — the commands actually ACCEPTED by the arbiter
+      (for nodes that track the current pose: head tracker, BT, joint_state_publisher)
+  ~/joint_owners   (String JSON, 1 Hz) — live leases, for debugging
+
+A command without velocity (or 0) moves the joint at its default speed (the
+firmware table step, DEFAULT_STEPS) — speed is no longer inherited from
+whatever the previous sender set.
 
 Subclasses define which joints belong to which Arduino and which topics
 to publish for sensor data.
@@ -26,6 +34,7 @@ Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
+import json
 import math
 import os
 import threading
@@ -35,8 +44,11 @@ import serial
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from std_msgs.msg import Int16, Int16MultiArray, Bool
+from std_msgs.msg import Int16, Int16MultiArray, Bool, String
 from sensor_msgs.msg import JointState
+from inmoov_msgs.msg import JointCommand
+
+from .joint_arbiter import JointArbiter
 
 from .protocol import (
     FrameParser, build_set_servos, build_set_speeds, build_sleep, deg_per_sec_to_step,
@@ -77,6 +89,8 @@ class ArduinoCommNode(LifecycleNode):
 
     BODY_JOINTS:     list[tuple[str, float, int]] = []   # (joint_name, center_deg, rest_deg)
     FACE_JOINTS:     list[tuple[str, float, int]] = []
+    # Firmware table step per servo, BODY_JOINTS + FACE_JOINTS order (test_servo_tables)
+    DEFAULT_STEPS:   list[int] = []
     HAS_ULTRASONIC:  bool = False
     HAS_PIR:         bool = False
     HAS_HALL:        bool = False
@@ -92,6 +106,9 @@ class ArduinoCommNode(LifecycleNode):
         'eye_ud_L': 'eye_ud_R',
         'eye_ud_R': 'eye_ud_L',
     }
+    # A lease on one eye covers its mirror
+    _ARBITER_GROUPS = {'eye_lr_L': 'eye_lr', 'eye_lr_R': 'eye_lr',
+                       'eye_ud_L': 'eye_ud', 'eye_ud_R': 'eye_ud'}
 
     def __init__(self, node_name: str, serial_port: str, baudrate: int = 115200):
         super().__init__(node_name)
@@ -102,9 +119,14 @@ class ArduinoCommNode(LifecycleNode):
         # Servo state — initialised to rest positions
         self._body_degs    = [rest for _, _, rest in self.BODY_JOINTS]
         self._face_degs    = [rest for _, _, rest in self.FACE_JOINTS]
-        self._body_speeds  = [0] * len(self.BODY_JOINTS)
-        self._face_speeds  = [0] * len(self.FACE_JOINTS)
+        n_body = len(self.BODY_JOINTS)
+        steps  = self.DEFAULT_STEPS or [0] * (n_body + len(self.FACE_JOINTS))
+        self._default_body_steps = list(steps[:n_body])
+        self._default_face_steps = list(steps[n_body:])
+        self._body_speeds  = list(self._default_body_steps)
+        self._face_speeds  = list(self._default_face_steps)
         self._speeds_dirty = False
+        self._arbiter      = JointArbiter(self._ARBITER_GROUPS)
 
         # Sleep state — forwarded to Arduino as CMD_SLEEP on change
         self._sleeping     = False
@@ -130,15 +152,19 @@ class ArduinoCommNode(LifecycleNode):
         self._pir_pub        = None
         self._hall_pub       = None
         self._failsafe_pub   = None
+        self._commanded_pub  = None
+        self._owners_pub     = None
+        self._owners_timer   = None
 
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
     def on_configure(self, state):
         self._subs = [
-            self.create_subscription(JointState, '/joint_command', self._joint_cmd_cb, 10)]
+            self.create_subscription(JointCommand, '/joint_cmd', self._arb_cmd_cb, 20),
+            self.create_subscription(JointState, '/joint_command', self._legacy_cmd_cb, 10)]
         if self.FACE_JOINTS:
             self._subs.append(
-                self.create_subscription(JointState, '/face_command', self._face_cmd_cb, 10))
+                self.create_subscription(JointState, '/face_command', self._legacy_cmd_cb, 10))
 
         # /robot_sleep is latched (TRANSIENT_LOCAL) — forward to Arduino as CMD_SLEEP
         sleep_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -156,6 +182,8 @@ class ArduinoCommNode(LifecycleNode):
         self._failsafe_pub = self.create_lifecycle_publisher(
             Bool, '~/failsafe',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._commanded_pub = self.create_lifecycle_publisher(JointState, '/joint_commanded', 20)
+        self._owners_pub    = self.create_lifecycle_publisher(String, '~/joint_owners', 1)
 
         node_name = self.get_name()
         body_names = [n for n, _, _ in self.BODY_JOINTS]
@@ -166,7 +194,8 @@ class ArduinoCommNode(LifecycleNode):
 
     def _lifecycle_pubs(self):
         return [p for p in (self._ultrasonic_pub, self._pir_pub, self._hall_pub,
-                            self._failsafe_pub) if p is not None]
+                            self._failsafe_pub, self._commanded_pub, self._owners_pub)
+                if p is not None]
 
     def on_activate(self, state):
         for p in self._lifecycle_pubs():
@@ -187,6 +216,7 @@ class ArduinoCommNode(LifecycleNode):
             return TransitionCallbackReturn.FAILURE
 
         self._tx_timer = self.create_timer(0.02, self._send_servos)
+        self._owners_timer = self.create_timer(1.0, self._publish_owners)
 
         self._running   = True
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
@@ -210,6 +240,9 @@ class ArduinoCommNode(LifecycleNode):
         if self._tx_timer:
             self.destroy_timer(self._tx_timer)
             self._tx_timer = None
+        if self._owners_timer:
+            self.destroy_timer(self._owners_timer)
+            self._owners_timer = None
 
         # Close serial
         self._close_serial()
@@ -227,7 +260,7 @@ class ArduinoCommNode(LifecycleNode):
         for p in self._lifecycle_pubs():
             self.destroy_lifecycle_publisher(p)
         self._ultrasonic_pub = self._pir_pub = self._hall_pub = None
-        self._failsafe_pub = None
+        self._failsafe_pub = self._commanded_pub = self._owners_pub = None
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state):
@@ -382,20 +415,20 @@ class ArduinoCommNode(LifecycleNode):
             i = self._body_map[name]
             _, center, _ = self.BODY_JOINTS[i]
             self._body_degs[i] = clamp_deg(rad_to_deg(pos_rad, center))
-            if vel != 0.0:
-                step = deg_per_sec_to_step(math.degrees(abs(vel)))
-                if step != self._body_speeds[i]:
-                    self._body_speeds[i] = step
-                    self._speeds_dirty = True
+            step = (deg_per_sec_to_step(math.degrees(abs(vel))) if vel != 0.0
+                    else self._default_body_steps[i])
+            if step and step != self._body_speeds[i]:
+                self._body_speeds[i] = step
+                self._speeds_dirty = True
         elif name in self._face_map:
             i = self._face_map[name]
             _, center, _ = self.FACE_JOINTS[i]
             self._face_degs[i] = clamp_deg(rad_to_deg(pos_rad, center))
-            if vel != 0.0:
-                step = deg_per_sec_to_step(math.degrees(abs(vel)))
-                if step != self._face_speeds[i]:
-                    self._face_speeds[i] = step
-                    self._speeds_dirty = True
+            step = (deg_per_sec_to_step(math.degrees(abs(vel))) if vel != 0.0
+                    else self._default_face_steps[i])
+            if step and step != self._face_speeds[i]:
+                self._face_speeds[i] = step
+                self._speeds_dirty = True
 
     def _sleep_cb(self, msg: Bool) -> None:
         with self._lock:
@@ -403,27 +436,55 @@ class ArduinoCommNode(LifecycleNode):
                 self._sleeping    = msg.data
                 self._sleep_dirty = True
 
-    def _joint_cmd_cb(self, msg: JointState) -> None:
+    def _arb_cmd_cb(self, msg: JointCommand) -> None:
+        self._handle_cmd(msg.source or 'unknown', msg.priority, msg.lease_sec,
+                         msg.release, msg.cmd)
+
+    def _legacy_cmd_cb(self, msg: JointState) -> None:
+        self._handle_cmd('legacy', JointCommand.PRIORITY_LEGACY, 0.0, False, msg)
+
+    def _owns(self, name: str) -> bool:
+        """This board drives the joint, or its mirrored eye."""
+        return (name in self._body_map or name in self._face_map
+                or self.EYE_SYNC.get(name, '') in self._body_map
+                or self.EYE_SYNC.get(name, '') in self._face_map)
+
+    def _handle_cmd(self, source: str, priority: int, lease_sec: float,
+                    release: bool, js: JointState) -> None:
+        accepted = JointState()
         with self._lock:
-            vels = msg.velocity
-            for idx, (name, pos_rad) in enumerate(zip(msg.name, msg.position)):
+            vels = js.velocity
+            for idx, (name, pos_rad) in enumerate(zip(js.name, js.position)):
+                if not self._owns(name):
+                    continue
+                if release:
+                    self._arbiter.release(name, source)
+                    continue
+                ok, owner = self._arbiter.claim(name, source, priority, lease_sec)
+                if not ok:
+                    self.get_logger().debug(
+                        f'{name}: {source}(p{priority}) rejected — owned by '
+                        f'{owner.source}(p{owner.priority})')
+                    continue
                 vel = vels[idx] if idx < len(vels) else 0.0
                 self._apply_joint(name, pos_rad, vel)
                 # Mirror the paired eye (eye_lr_L <-> eye_lr_R, eye_ud_L <-> eye_ud_R)
                 mirror = self.EYE_SYNC.get(name)
                 if mirror:
                     self._apply_joint(mirror, pos_rad, vel)
+                if math.isfinite(pos_rad):
+                    accepted.name.append(name)
+                    accepted.position.append(pos_rad)
+        if accepted.name and self._commanded_pub is not None:
+            accepted.header.stamp = self.get_clock().now().to_msg()
+            self._commanded_pub.publish(accepted)
 
-    def _face_cmd_cb(self, msg: JointState) -> None:
+    def _publish_owners(self) -> None:
         with self._lock:
-            vels = msg.velocity
-            for idx, (name, pos_rad) in enumerate(zip(msg.name, msg.position)):
-                vel = vels[idx] if idx < len(vels) else 0.0
-                self._apply_joint(name, pos_rad, vel)
-                # Mirror the paired eye
-                mirror = self.EYE_SYNC.get(name)
-                if mirror:
-                    self._apply_joint(mirror, pos_rad, vel)
+            owners = self._arbiter.owners()
+            rejected = self._arbiter.rejected
+        self._owners_pub.publish(String(data=json.dumps(
+            {'owners': owners, 'rejected_total': rejected})))
 
     # -----------------------------------------------------------------------
     # TX: send servo packet at 50 Hz

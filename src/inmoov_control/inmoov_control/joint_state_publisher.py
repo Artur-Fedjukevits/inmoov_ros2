@@ -3,7 +3,8 @@ joint_state_publisher.py — Publishes /joint_states and /face_joint_states.
 
 There is no position feedback from the Arduino (no encoders, no echo channel
 in the protocol), so the node re-publishes the last *commanded* positions: it
-subscribes to /joint_command and /face_command and publishes them as
+subscribes to /joint_commanded (the commands the Arduino nodes actually accepted
+after per-joint arbitration — see inmoov_msgs/JointCommand) and publishes them as
 /joint_states / /face_joint_states with a proper header.stamp. Until a joint is
 commanded it is reported at its rest position (rest_deg of the joint tables).
 
@@ -21,7 +22,7 @@ import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from sensor_msgs.msg import JointState
 
-from .arduino_comm_node  import deg_to_rad
+from .arduino_comm_node  import ArduinoCommNode, deg_to_rad
 from .arduino_right_node import ArduinoRightNode
 from .arduino_left_node  import ArduinoLeftNode
 
@@ -60,8 +61,7 @@ class JointStatePublisher(LifecycleNode):
 
     def on_configure(self, state):
         self._subs = [
-            self.create_subscription(JointState, '/joint_command', self._body_cb, 10),
-            self.create_subscription(JointState, '/face_command',  self._face_cb, 10),
+            self.create_subscription(JointState, '/joint_commanded', self._accepted_cb, 20),
         ]
         self._js_pub   = self.create_lifecycle_publisher(JointState, '/joint_states',      10)
         self._face_pub = self.create_lifecycle_publisher(JointState, '/face_joint_states', 10)
@@ -103,15 +103,14 @@ class JointStatePublisher(LifecycleNode):
     def on_error(self, state):
         return TransitionCallbackReturn.SUCCESS
 
-    def _body_cb(self, msg: JointState) -> None:
+    def _accepted_cb(self, msg: JointState) -> None:
         for name, pos in zip(msg.name, msg.position):
-            if name in self._body:
-                self._body[name] = pos
-
-    def _face_cb(self, msg: JointState) -> None:
-        for name, pos in zip(msg.name, msg.position):
-            if name in self._face:
-                self._face[name] = pos
+            # The firmware side mirrors the eyes (EYE_SYNC) — so do we
+            for n in (name, ArduinoCommNode.EYE_SYNC.get(name)):
+                if n in self._body:
+                    self._body[n] = pos
+                elif n in self._face:
+                    self._face[n] = pos
 
     def _publish(self) -> None:
         now = self.get_clock().now().to_msg()

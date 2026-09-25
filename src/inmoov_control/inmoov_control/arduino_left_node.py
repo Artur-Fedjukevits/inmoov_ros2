@@ -75,6 +75,11 @@ class ArduinoLeftNode(ArduinoCommNode):
         ('forhead_R',       90,  85),   # [27] ch 13, rest=85, min=85,  max=105
     ]
 
+    # Firmware table step (deg per 60 ms tick) — default speed, same order
+    DEFAULT_STEPS = [2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 1, 2, 2, 2,   # body
+                     1, 1, 10,                                      # eye_lr, eye_ud, jaw
+                     2, 2, 2, 2, 2, 2, 2, 2, 2, 2]                  # PCA face
+
     HAS_ULTRASONIC   = True
     HAS_PIR          = False
     HAS_HALL         = True

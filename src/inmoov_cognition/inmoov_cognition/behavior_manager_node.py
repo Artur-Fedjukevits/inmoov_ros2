@@ -65,6 +65,7 @@ from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import JointState
+from inmoov_msgs.msg import JointCommand
 from std_msgs.msg import String, Bool, Float32
 from geometry_msgs.msg import Twist
 
@@ -150,18 +151,24 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
     _TORSO_HALF_RANGE       = 30.0   # _REST_MIDSTOM ± this = _TORSO_MIN/_TORSO_MAX
     _TORSO_PARTIAL_FRACTION = 0.3    # scope='partial'
 
+    # Arbitration (inmoov_msgs/JointCommand): the override holds the head for
+    # 5 s + 1.5 s (see _send_head_cmd / _resume_head_tracker) — the lease covers
+    # it with a margin; _enable_tracker_now releases explicitly.
+    _SOURCE             = 'bt_command'
+    _HEAD_JOINTS        = ('rothead', 'neck', 'midstom')
+    _OVERRIDE_LEASE_SEC = 8.0
+
     def __init__(self, node: Node):
         super().__init__('ExecuteRobotCommand')
         self._node       = node
         self._pub_vel    = node.create_publisher(Twist,      'cmd_vel',          10)
         self._pub_arm    = node.create_publisher(String,     'arm_command',      10)
-        self._pub_joint  = node.create_publisher(JointState, '/joint_command',   10)
         self._pub_stat   = node.create_publisher(String,     'status_request',   10)
         self._timer      = None   # timer that stops motion
         self._head_timer = None   # timer that hands control back to head_tracker after a manual command
         self._last_scope = 'head'  # scope of the last head command — whether the torso needs to return to center
 
-        # Track the current rothead/neck from ANY /joint_command message (including
+        # Track the current rothead/neck from ANY accepted command (/joint_commanded, including
         # from head_tracker itself while it's following a face) — so that before a
         # manual command (robot_control/look_direction) we know WHERE the face was,
         # and afterward can return the head there instead of to REST. Same pattern
@@ -174,8 +181,9 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         # Was a track actually locked BEFORE the manual command (not just "the
         # head was at rest/center") — see _resume_head_tracker.
         self._had_lock_before_turn = False
+        # /joint_commanded = commands the Arduino nodes actually accepted (after arbitration)
         self._sub_joint = node.create_subscription(
-            JointState, '/joint_command', self._track_joint_cb, 10)
+            JointState, '/joint_commanded', self._track_joint_cb, 10)
 
         node.add_deactivate_hook(self.cancel_pending)
 
@@ -237,28 +245,15 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         rothead = max(30.0, min(140.0, self._REST_ROTHEAD + pan))
         neck    = max(0.0,  min(100.0, self._REST_NECK    + tilt))
 
-        names     = ['rothead', 'neck']
-        positions = [
-            (rothead - 90.0) * math.pi / 180.0,
-            (neck    - 90.0) * math.pi / 180.0,
-        ]
+        joints = {'rothead': rothead, 'neck': neck}
 
         midstom = None
         if scope in ('partial', 'full') and pan != 0:
             fraction = self._TORSO_PARTIAL_FRACTION if scope == 'partial' else 1.0
             offset   = math.copysign(self._TORSO_HALF_RANGE * fraction, pan)
             midstom  = max(self._TORSO_MIN, min(self._TORSO_MAX, self._REST_MIDSTOM + offset))
-            names.append('midstom')
-            positions.append((midstom - 90.0) * math.pi / 180.0)
+            joints['midstom'] = midstom
 
-        msg = JointState()
-        msg.name     = names
-        msg.position = positions
-
-        # Disable head_tracker FIRST — it will publish REST(rothead=90,neck=40) on /joint_command.
-        # We publish our own command 200ms later: REST is guaranteed to reach the arduino first,
-        # our command arrives later and overwrites it. Without the delay, REST overwrites us.
-        self._node.enable_head_tracker(False)
         self._last_scope = scope
         torso_log = f' midstom={midstom:.0f}°' if midstom is not None else ''
         self._node.get_logger().info(
@@ -267,15 +262,19 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
 
         if self._head_timer:
             self._head_timer.cancel()
-        self._head_timer = threading.Timer(0.2, self._send_head_cmd, args=[msg])
-        self._head_timer.daemon = True
-        self._head_timer.start()
+        # Command first, holding the head (priority 70) for the whole override;
+        # the REST pose the tracker sends when disabled (priority 40, no lease) is
+        # then rejected by the arbiter — no more "wait 200 ms and overwrite it".
+        self._send_head_cmd(joints)
+        self._node.enable_head_tracker(False)
 
     def cancel_pending(self):
         """Node deactivating: drop the head-command timer chain, stop any timed move."""
         if self._head_timer:
             self._head_timer.cancel()
             self._head_timer = None
+        if self._override_active:
+            self._node.release_joints(self._SOURCE, self._HEAD_JOINTS)
         self._override_active = False
         self._last_scope      = 'head'
         if self._timer:
@@ -283,13 +282,11 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
             self._timer = None
             self._pub_vel.publish(Twist())
 
-    def _send_head_cmd(self, msg: JointState):
-        if not self._node.lc_active:   # deactivated while the 0.2 s timer was pending
-            return
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        if 'midstom' in msg.name:
+    def _send_head_cmd(self, joints: dict):
+        if 'midstom' in joints:
             self._node.note_own_torso_move()
-        self._pub_joint.publish(msg)
+        self._node.send_joints(self._SOURCE, JointCommand.PRIORITY_BT_COMMAND,
+                               self._OVERRIDE_LEASE_SEC, joints)
         # After 5s hand control back to head_tracker (it will resume following the face)
         self._head_timer = threading.Timer(5.0, self._resume_head_tracker)
         self._head_timer.daemon = True
@@ -314,21 +311,15 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         if not self._node.lc_active:
             return
         if self._had_lock_before_turn:
-            back = JointState()
-            back.header.stamp = self._node.get_clock().now().to_msg()
-            back.name     = ['rothead', 'neck']
-            back.position = [
-                (self._pre_turn_rothead - 90.0) * math.pi / 180.0,
-                (self._pre_turn_neck    - 90.0) * math.pi / 180.0,
-            ]
+            back = {'rothead': self._pre_turn_rothead, 'neck': self._pre_turn_neck}
             if self._last_scope != 'head':
                 # The torso was moved by a manual command (scope=partial/full) —
                 # head_tracker only controls the head, so the torso won't return
                 # to center on its own.
-                back.name.append('midstom')
-                back.position.append(0.0)
+                back['midstom'] = self._REST_MIDSTOM
                 self._node.note_own_torso_move()
-            self._pub_joint.publish(back)
+            # Hold it until _enable_tracker_now releases (1.5 s below)
+            self._node.send_joints(self._SOURCE, JointCommand.PRIORITY_BT_COMMAND, 3.0, back)
             self._node.get_logger().info(
                 f'Head: returning to pre-command position rothead={self._pre_turn_rothead:.0f}° '
                 f'neck={self._pre_turn_neck:.0f}°')
@@ -351,6 +342,7 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
     def _enable_tracker_now(self):
         if not self._node.lc_active:
             return
+        self._node.release_joints(self._SOURCE, self._HEAD_JOINTS)
         self._node.enable_head_tracker(True)
         self._head_timer = None
         self._node.get_logger().info('Head: control returned to head_tracker')
@@ -705,7 +697,6 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
     def __init__(self, node: Node):
         super().__init__('PIRScan')
         self._node      = node
-        self._head_pub  = node.create_publisher(JointState, '/joint_command', 10)
         self._bb = py_trees.blackboard.Client(name='PIRScan')
         self._bb.register_key(key='/pir/scan_active',
                                access=py_trees.common.Access.WRITE)
@@ -714,15 +705,9 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
         self._completed  = False   # True once _done() has been called (scan finished without a face)
 
     def _head_cmd(self, rothead: float) -> None:
-        msg = JointState()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.name     = ['rothead', 'neck']
-        msg.position = [
-            (rothead     - 90.0) * math.pi / 180.0,
-            (self._NECK  - 90.0) * math.pi / 180.0,
-        ]
-        msg.velocity = [self._SCAN_VEL, self._SCAN_VEL]
-        self._head_pub.publish(msg)
+        # Lease covers the longest go+dwell phase pair; released when the scan ends
+        self._node.send_joints('bt_scan', JointCommand.PRIORITY_BT_SCAN, 3.0,
+                               {'rothead': rothead, 'neck': self._NECK}, vel=self._SCAN_VEL)
 
     def initialise(self) -> None:
         self._phase     = 0
@@ -753,6 +738,7 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
     def _done(self) -> py_trees.common.Status:
         """Scan finished — no face found. Disable detection."""
         self._completed = True
+        self._node.release_joints('bt_scan', ('rothead', 'neck'))
         self._node.enable_face_detection(False)
         self._bb.pir.scan_active = False
         self._node.get_logger().info('PIRScan: finished — no face detected, face_detection disabled')
@@ -768,6 +754,7 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
                 return
             # A real preempt: SocialBranch has taken over control (a face was found).
             # Hand the head to vision_head_tracker, leave face_detection enabled.
+            self._node.release_joints('bt_scan', ('rothead', 'neck'))
             self._node.enable_head_tracker(True)
             self._node.get_logger().info('PIRScan: interrupted (face found) — head_tracker enabled')
 
@@ -818,7 +805,6 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     def __init__(self, node: Node):
         super().__init__('SoundScan')
         self._node      = node
-        self._torso_pub = node.create_publisher(JointState, '/joint_command', 10)
         self._bb = py_trees.blackboard.Client(name='SoundScan')
         self._bb.register_key(key='/sound/scan_active',
                                access=py_trees.common.Access.WRITE)
@@ -829,12 +815,10 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
 
     def _torso_cmd(self, midstom: float) -> None:
         self._node.note_own_torso_move()
-        msg = JointState()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.name     = ['midstom']
-        msg.position = [(midstom - 90.0) * math.pi / 180.0]
-        msg.velocity = [self._TURN_VEL]
-        self._torso_pub.publish(msg)
+        # Lease covers go + the whole dwell; released on found / done / preempt
+        self._node.send_joints('bt_scan', JointCommand.PRIORITY_BT_SCAN,
+                               self._GO_DURATION + self._DWELL_TIMEOUT + 1.0,
+                               {'midstom': midstom}, vel=self._TURN_VEL)
 
     def initialise(self) -> None:
         self._completed = False
@@ -896,6 +880,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
 
     def _found(self) -> py_trees.common.Status:
         self._completed = True
+        self._node.release_joints('bt_scan', ('midstom',))
         self._bb.sound.scan_active = False
         self._node.aim_head_at_human()   # aim the head using OAK-D right away, don't wait for face_detection to find it
         self._node.enable_head_tracker(True)
@@ -905,6 +890,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
 
     def _done(self) -> py_trees.common.Status:
         self._completed = True
+        self._node.release_joints('bt_scan', ('midstom',))
         self._node.enable_face_detection(False)
         self._bb.sound.scan_active = False
         # First failure of the session (right after the wake word) — count it as
@@ -928,6 +914,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
                 return
             # A real preempt (e.g. /social/person_present became True some other way,
             # SocialBranch intercepted before we ourselves saw /human_detected).
+            self._node.release_joints('bt_scan', ('midstom',))
             self._node.enable_head_tracker(True)
             self._node.get_logger().info('SoundScan: interrupted (person found) — head_tracker enabled')
 
@@ -953,7 +940,6 @@ class FaceSearchAttempt(py_trees.behaviour.Behaviour):
     def __init__(self, node: Node):
         super().__init__('FaceSearchAttempt')
         self._node = node
-        self._torso_pub = node.create_publisher(JointState, '/joint_command', 10)
 
     def update(self) -> py_trees.common.Status:
         node = self._node
@@ -965,12 +951,9 @@ class FaceSearchAttempt(py_trees.behaviour.Behaviour):
         node.enable_face_detection(True)
         if target is not None:
             node.note_own_torso_move()
-            msg = JointState()
-            msg.header.stamp = node.get_clock().now().to_msg()
-            msg.name     = ['midstom']
-            msg.position = [(target - 90.0) * math.pi / 180.0]
-            msg.velocity = [1.0]
-            self._torso_pub.publish(msg)
+            # Short lease: the turn itself (~0.6 s) with a margin; no release needed
+            node.send_joints('bt_scan', JointCommand.PRIORITY_BT_SCAN, 1.5,
+                             {'midstom': target}, vel=1.0)
             node.get_logger().info(
                 f'FaceSearch: attempt #{node._face_search_attempts} — '
                 f'{source} → midstom={target:.0f}°')
@@ -1003,18 +986,12 @@ class IdleBlinkBehaviour(py_trees.behaviour.Behaviour):
     def __init__(self, node: Node, name: str = 'IdleBlink'):
         super().__init__(name)
         self._node       = node
-        self._pub        = node.create_publisher(JointState, '/face_command', 10)
         self._next_blink = time.monotonic() + random.uniform(self._INTERVAL_MIN, self._INTERVAL_MAX)
         self._open_at    = None
 
     def _send(self, positions: dict, vel: float = 0.0) -> None:
-        msg = JointState()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.name     = list(positions.keys())
-        msg.position = [(float(v) - 90.0) * math.pi / 180.0 for v in positions.values()]
-        if vel != 0.0:
-            msg.velocity = [vel] * len(positions)
-        self._pub.publish(msg)
+        # Lowest priority, no lease: an expression holding the eyelids wins
+        self._node.send_joints('blink', JointCommand.PRIORITY_BLINK, 0.0, positions, vel=vel)
 
     def initialise(self) -> None:
         self._next_blink = time.monotonic() + random.uniform(self._INTERVAL_MIN, self._INTERVAL_MAX)
@@ -1407,6 +1384,28 @@ class BehaviorManagerNode(LifecycleNode):
         self.lc_active = False
         self._deactivate_hooks: list = []   # BT leaves' cancel callbacks
 
+    def send_joints(self, source: str, priority: int, lease_sec: float,
+                    joints_deg: dict, vel: float = 0.0) -> None:
+        """Arbitrated servo command (inmoov_msgs/JointCommand on /joint_cmd).
+        joints_deg: joint → angle in degrees (0..180, center 90)."""
+        if not self.lc_active:
+            return
+        js = JointState()
+        js.header.stamp = self.get_clock().now().to_msg()
+        js.name     = list(joints_deg.keys())
+        js.position = [(float(v) - 90.0) * math.pi / 180.0 for v in joints_deg.values()]
+        if vel != 0.0:
+            js.velocity = [float(vel)] * len(js.name)
+        self._joint_cmd_pub.publish(JointCommand(
+            source=source, priority=priority, lease_sec=float(lease_sec), cmd=js))
+
+    def release_joints(self, source: str, names) -> None:
+        """Give up this source's leases (works while INACTIVE too — used on deactivate)."""
+        js = JointState()
+        js.name     = list(names)
+        js.position = [0.0] * len(js.name)
+        self._joint_cmd_pub.publish(JointCommand(source=source, release=True, cmd=js))
+
     def add_deactivate_hook(self, fn) -> None:
         """BT leaves register cleanup here (pending timers etc.), run on deactivate."""
         self._deactivate_hooks.append(fn)
@@ -1453,15 +1452,10 @@ class BehaviorManagerNode(LifecycleNode):
         rothead = max(SoundScanBehaviour._ROTHEAD_MIN, min(
             SoundScanBehaviour._ROTHEAD_MAX,
             SoundScanBehaviour._ROTHEAD_CENTER + angle * SoundScanBehaviour._AIM_GAIN))
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name     = ['rothead', 'neck']
-        msg.position = [
-            (rothead - 90.0) * math.pi / 180.0,
-            (SoundScanBehaviour._NECK_REST - 90.0) * math.pi / 180.0,
-        ]
-        msg.velocity = [SoundScanBehaviour._TURN_VEL, SoundScanBehaviour._TURN_VEL]
-        self._aim_joint_pub.publish(msg)
+        # Short lease: the turn itself; head_tracker takes over right after
+        self.send_joints('bt_scan', JointCommand.PRIORITY_BT_SCAN, 1.5,
+                         {'rothead': rothead, 'neck': SoundScanBehaviour._NECK_REST},
+                         vel=SoundScanBehaviour._TURN_VEL)
         self.get_logger().info(
             f'AimHead: aiming the head at the person (OAK-D angle={angle:.0f}° → rothead={rothead:.0f}°)')
 
@@ -1946,6 +1940,10 @@ class BehaviorManagerNode(LifecycleNode):
         self._tick_rate     = self.get_parameter('bt_tick_rate_hz').value
         self._pir_cooldown  = self.get_parameter('pir_scan_cooldown_sec').value
 
+        # All servo commands of this node (BT leaves + aim_head_at_human) — plain
+        # publisher, gated by lc_active in send_joints()
+        self._joint_cmd_pub = self.create_publisher(JointCommand, '/joint_cmd', 20)
+
         self._tree = build_tree(self, tavily_key)
         self._tree.setup_with_descendants()
 
@@ -1961,9 +1959,6 @@ class BehaviorManagerNode(LifecycleNode):
         # like /robot_sleep, so that a restarted llm_node immediately sees the current status.
         self._face_search_status_pub = self.create_lifecycle_publisher(
             String, '/behavior/face_search_status', lqos)
-        # For aim_head_at_human() — a plain (non-lifecycle) publisher, like the
-        # other BT leaves in this file (SoundScanBehaviour, FaceSearchAttempt).
-        self._aim_joint_pub = self.create_publisher(JointState, '/joint_command', 10)
 
         self.create_subscription(String, '/llm_response',   self._llm_response_cb,   10)
         self.create_subscription(String, 'robot_events',    self._event_cb,           10)

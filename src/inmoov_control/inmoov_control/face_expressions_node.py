@@ -22,10 +22,9 @@ Calibration:
   which survives rebuilds and is loaded on import. Without it the
   face_expressions_calibration.json shipped with the package is used.
 
-IMPORTANT — firmware protocol quirk:
-  Sending degree value 0 in /face_command means "go to rest" (not 0°).
-  Arduino firmware: val==0 → use rest_angle, else constrain(val, min, max).
-  All minimum-position commands therefore use 1° (firmware clamps to min_angle).
+Commands go out as inmoov_msgs/JointCommand on /joint_cmd (source 'expression',
+priority 30, see FaceExpressions._ANIM_LEASE_SEC). The firmware treats every
+angle literally and clamps it to the joint's min/max (0 is 0°, not "rest").
 
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
@@ -42,6 +41,7 @@ from rclpy.node import Node
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
+from inmoov_msgs.msg import JointCommand
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Servo hardware limits & rest positions
@@ -243,21 +243,30 @@ class FaceExpressions:
         'helplessness':     'sorry',
     }
 
+    # Arbitration (inmoov_msgs/JointCommand, priority 30): animated expressions hold
+    # their joints briefly (blink can't cut in mid-animation); static holds take no
+    # lease. The head tracker (eyes) and TTS (jaw) outrank us, so e.g. neutral()
+    # at the end of speech no longer yanks the eyes away from a tracked face.
+    _ANIM_LEASE_SEC = 1.0
+
     def __init__(self, node: Node):
         self._node = node
-        self._pub = node.create_publisher(JointState, '/face_command', 10)
+        self._pub = node.create_publisher(JointCommand, '/joint_cmd', 10)
+        self._lease_sec = self._ANIM_LEASE_SEC
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _send(self, positions: dict[str, int]) -> None:
-        """Publish /face_command for given {joint: degrees} dict."""
+        """Publish an arbitrated command for given {joint: degrees} dict."""
         if not positions:
             return
         msg = JointState()
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.name = list(positions.keys())
         msg.position = [_r(v) for v in positions.values()]
-        self._pub.publish(msg)
+        self._pub.publish(JointCommand(
+            source='expression', priority=JointCommand.PRIORITY_EXPRESSION,
+            lease_sec=self._lease_sec, cmd=msg))
 
     def _rest(self, joints: list[str] | None = None) -> None:
         if joints is None:
@@ -283,6 +292,13 @@ class FaceExpressions:
         until the caller (speech duration) explicitly changes/reverts it,
         unlike the one-shot animated methods below (happy()/surprise()/etc.)
         used by /face_expression."""
+        self._lease_sec = 0.0   # static pose — write only, don't hold (serialised executor)
+        try:
+            self._hold(name)
+        finally:
+            self._lease_sec = self._ANIM_LEASE_SEC
+
+    def _hold(self, name: str) -> None:
         if name == 'neutral':
             # EXPRESSIONS_DATA['neutral'] == {} → _expr('neutral') would send
             # an empty positions dict, which _send() no-ops on. Without this,

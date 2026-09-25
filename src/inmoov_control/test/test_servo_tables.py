@@ -6,7 +6,8 @@ order and start from their rest values; the firmware accepts SET_SERVOS only wit
 exactly SERVO_TOTAL_COUNT bytes and treats every byte as a literal angle. So:
   1. same servo count,
   2. same order (Python name ↔ ServoIndex enum name),
-  3. same rest angle as the firmware servo table.
+  3. same rest angle as the firmware servo table,
+  4. same default speed (step) as the firmware table (DEFAULT_STEPS).
 min/max live only in the firmware (Python keeps them in comments), so they are
 not compared.
 
@@ -60,8 +61,9 @@ def _same_joint(enum_name: str, py_name: str) -> bool:
     return e == p or (p[-1] in 'lr' and e == p[:-1])
 
 
-# rest is field 2 in the left struct ({current, target, rest, ...}) and field 3 in
-# the right one ({Servo(), current, target, rest, ...}) — see InMoov{Left,Right}.h.
+# rest is field 2 in the left struct ({current, target, rest, min, max, step, ...}) and
+# field 3 in the right one ({Servo(), current, target, rest, min, max, step, ...}) —
+# see InMoov{Left,Right}.h. step is always rest + 3.
 CASES = [
     ('InMoovLeft',  ArduinoLeftNode,  2),
     ('InMoovRight', ArduinoRightNode, 3),
@@ -100,3 +102,13 @@ def test_servo_rest(board, node_cls, rest_field):
     for i, ((py_name, _, py_rest), row) in enumerate(zip(joints, rows)):
         fw_rest = int(row[rest_field])
         assert py_rest == fw_rest, f'{board}[{i}] {py_name}: Python rest {py_rest} ≠ firmware {fw_rest}'
+
+
+@pytest.mark.parametrize('board,node_cls,rest_field', CASES)
+def test_default_steps(board, node_cls, rest_field):
+    _, rows = _load(board)
+    steps = node_cls.DEFAULT_STEPS
+    assert len(steps) == len(rows), f'{board}: DEFAULT_STEPS length'
+    for i, (row, py_step) in enumerate(zip(rows, steps)):
+        fw_step = int(row[rest_field + 3])
+        assert py_step == fw_step, f'{board}[{i}]: Python step {py_step} ≠ firmware {fw_step}'

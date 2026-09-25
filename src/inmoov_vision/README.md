@@ -74,7 +74,7 @@ in `inmoov_cognition`; this package only produces the signal.
           +--> face_recognition_node  --> /face/identity   (<-> /memory/query)
           +--> emotion_recognition_node -> /face/emotion
           +--> face_gallery_node -------> photos on disk + /memory/query gallery_* ops
-          +--> vision_head_tracker_node -> /joint_command, /face_command,
+          +--> vision_head_tracker_node -> /joint_cmd (priority 40),
                                            /head_tracker/face_locked
 
  Gates (published by inmoov_cognition):
@@ -362,9 +362,13 @@ tracked face. Runs a timer at `track_hz` while `/head_tracker/enable` is
 - **Diagnostics**: a `SUSPICIOUS track_id JUMP` warning when the target
   `track_id` changes and the new bbox is near the frame edge (|offset| > 0.5);
   a tracking log line every 3 s.
-- Rothead/neck from any other publisher on `/joint_command` (e.g. a one-off
-  head aim by `SoundScanBehaviour`) are picked up so the P controller starts
-  from the real position.
+- Rothead/neck from any other accepted command (`/joint_commanded`, e.g. a
+  one-off head aim by `SoundScanBehaviour`) are picked up so the P controller
+  starts from the real position.
+- Commands go out as `inmoov_msgs/JointCommand` on `/joint_cmd` (source
+  `head_tracker`, priority 40, 0.5 s lease refreshed every tick); the REST
+  pose sent on disable holds no lease and is dropped if a higher-priority
+  source (BT look_direction, scans) holds the head.
 - Joint values are published as radians relative to 90 deg
   (`(deg - 90) * pi / 180`).
 
@@ -394,8 +398,8 @@ tracked face. Runs a timer at `track_hz` while `/head_tracker/enable` is
 | `/head_tracker/enable` | `std_msgs/Bool` | sub | Latched; `False` returns to rest and publishes `face_locked=False`. |
 | `/face/identity` | `std_msgs/String` (JSON) | sub | Binds the interlocutor's `track_id`. |
 | `/social_context` | `std_msgs/String` (JSON) | sub | `state == 'interacting'` + `person_id` selects the target person. |
-| `/joint_command` | `sensor_msgs/JointState` | sub + pub | Publishes `rothead`, `neck`; also subscribes to sync from external head commands. |
-| `/face_command` | `sensor_msgs/JointState` | pub | `eye_lr_L`+`eye_ud_L` or `eye_lr_R`+`eye_ud_R`. |
+| `/joint_cmd` | `inmoov_msgs/JointCommand` | pub | `rothead`, `neck`; `eye_lr_L`+`eye_ud_L` or `eye_lr_R`+`eye_ud_R`. |
+| `/joint_commanded` | `sensor_msgs/JointState` | sub | Accepted commands — syncs rothead/neck from external head commands. |
 | `/head_tracker/face_locked` | `std_msgs/Bool` | pub | True iff a fresh bbox exists *right now*; published every tick, not latched. Single source of truth for "face caught" used by the face-search retry behaviours in `behavior_manager_node`. |
 
 ### `oak_node`
