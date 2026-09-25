@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from inmoov_control.protocol import (
     build_frame, build_set_servos, build_sleep, FrameParser,
-    CMD_SET_SERVOS, CMD_ULTRASONIC, CMD_PIR, CMD_SLEEP, CMD_HALL, crc8
+    CMD_SET_SERVOS, CMD_ULTRASONIC, CMD_PIR, CMD_SLEEP, CMD_HALL, CMD_STATUS, crc8
 )
 
 
@@ -220,3 +220,20 @@ def test_roundtrip_right_arduino():
     frames = parse_all(frame)
     _, data = frames[0]
     assert list(data) == values
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Firmware failsafe status + literal 0°
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_parse_status_frame():
+    """CMD_STATUS from firmware: 1 = entered failsafe, 0 = left it."""
+    for flag in (1, 0):
+        frames = parse_all(build_frame(CMD_STATUS, bytes([flag])))
+        assert frames == [(CMD_STATUS, bytes([flag]))]
+
+def test_zero_degrees_is_sent_literally():
+    """0 is a real angle for the firmware now (no rest sentinel) — must reach it as 0."""
+    frame = build_set_servos([0, 90, 0])
+    _, data = parse_all(frame)[0]
+    assert list(data) == [0, 90, 0]

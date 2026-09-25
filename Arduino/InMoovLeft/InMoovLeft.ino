@@ -12,12 +12,24 @@
  *   CRC8 = XOR of CMD, LEN, and all DATA bytes
  *
  * ROS2 → Arduino:
- *   CMD=0x01  SET_SERVOS: DATA = SERVO_TOTAL_COUNT bytes, degrees 0-180
+ *   CMD=0x01  SET_SERVOS: DATA = exactly SERVO_TOTAL_COUNT bytes, degrees 0-180.
+ *             Every value is a literal angle (0 is 0°, not "rest"), clamped
+ *             to the joint's min/max. Also serves as the host heartbeat.
+ *   CMD=0x02  SET_SPEEDS: DATA = exactly SERVO_TOTAL_COUNT bytes, step per
+ *             SMOOTH_INTERVAL_MS tick; 0 = keep current.
  *   CMD=0x03  SLEEP:      DATA = 1 byte, 0=awake, 1=sleeping.
  *             While sleeping, ULTRASONIC/HALL telemetry stops.
  *
+ * Host-loss failsafe: no valid SET_SERVOS for HOST_TIMEOUT_MS (after the
+ * first one) → every servo slowly returns to rest (step capped at its table
+ * value, PWM stays on) and ignores stale targets until the next SET_SERVOS.
+ * Detects a dead driver / USB link only — a hung ROS graph upstream of the
+ * driver keeps the heartbeat alive with the last targets.
+ *
  * Arduino → ROS2:
  *   CMD=0x10  ULTRASONIC: DATA = uint16 big-endian, distance in cm
+ *   CMD=0x13  STATUS:     DATA = 1 byte, 1 = entered failsafe, 0 = left it
+ *             (sent on each transition).
  *   CMD=0x12  HALL:       DATA = 5 x uint16 big-endian, raw analogRead (0-1023)
  *             order: [thumb, index, middle, ring, pinky] — same semantic order
  *             as the right arm, but MIDDLE/PINKY physical pins are swapped
@@ -51,6 +63,8 @@
 #define ULTRASONIC_INTERVAL_MS  250
 #define ULTRASONIC_TIMEOUT_US   25000   // ~4m
 #define HALL_INTERVAL_MS        100
+#define HOST_TIMEOUT_MS         1500    // no SET_SERVOS this long → failsafe
+#define FRAME_BYTE_TIMEOUT_MS   50      // gap inside a frame → drop it
 
 #define ULTRASONIC_TRIG_PIN     64
 #define ULTRASONIC_ECHO_PIN     63
@@ -79,6 +93,7 @@
 #define CMD_DIAG_RESP   0x21
 #define CMD_ULTRASONIC  0x10
 #define CMD_HALL        0x12
+#define CMD_STATUS      0x13
 
 bool sleeping = false;   // set via CMD_SLEEP; gates ultrasonic/hall telemetry
 
@@ -158,6 +173,18 @@ uint8_t  pBuf[64];
 
 int16_t  incoming[SERVO_TOTAL_COUNT];
 bool     packet_received = false;
+unsigned long last_byte_ms = 0;
+
+// Host-loss failsafe
+bool          host_seen        = false;   // armed after the first SET_SERVOS
+bool          failsafe         = false;
+unsigned long last_servos_ms   = 0;
+uint8_t       failsafe_step[SERVO_TOTAL_COUNT];   // table steps, captured in setup()
+
+void sendStatus() {
+  uint8_t b = failsafe ? 1 : 0;
+  sendFrame(CMD_STATUS, &b, 1);
+}
 
 // Scan I2C bus, read PCA9685 MODE1, respond with CMD_DIAG_RESP
 void runDiag() {
@@ -194,19 +221,41 @@ void processFrame(uint8_t cmd, uint8_t* data, uint8_t len) {
   }
 
   if (cmd == CMD_SET_SPEEDS) {
-    uint8_t n = min((uint8_t)SERVO_TOTAL_COUNT, len);
-    for (uint8_t i = 0; i < n; i++) {
+    if (len != SERVO_TOTAL_COUNT) return;
+    for (uint8_t i = 0; i < SERVO_TOTAL_COUNT; i++) {
       if (data[i] > 0) servos[i].step = data[i];
     }
     return;
   }
 
-  if (cmd != CMD_SET_SERVOS) return;
-  uint8_t n = min((uint8_t)SERVO_TOTAL_COUNT, len);
-  for (uint8_t i = 0; i < n; i++) {
+  if (cmd != CMD_SET_SERVOS || len != SERVO_TOTAL_COUNT) return;
+  for (uint8_t i = 0; i < SERVO_TOTAL_COUNT; i++) {
     incoming[i] = (int16_t)data[i];
   }
   packet_received = true;
+  host_seen       = true;
+  last_servos_ms  = millis();
+  if (failsafe) {
+    failsafe = false;
+    sendStatus();
+  }
+}
+
+// Command angle → servo target: clamp to limits, EYE_UD GPIO inversion.
+int16_t commandToTarget(int i, int16_t val) {
+  SmoothServo &s = servos[i];
+  int16_t angle = constrain(val, s.min_angle, s.max_angle);
+  if (i == IDX_EYE_UD) angle = (s.min_angle + s.max_angle) - angle;
+  return angle;
+}
+
+void enterFailsafe() {
+  failsafe        = true;
+  packet_received = false;   // stale incoming[] must not overwrite rest
+  for (int i = 0; i < SERVO_TOTAL_COUNT; i++) {
+    servos[i].target = commandToTarget(i, servos[i].rest_angle);
+  }
+  sendStatus();
 }
 
 void feedByte(uint8_t b) {
@@ -222,9 +271,10 @@ void feedByte(uint8_t b) {
       pCmd   = b; pState = PS_LEN;  break;
     case PS_LEN:
       pLen   = b; pIdx = 0;
+      if (pLen > sizeof(pBuf)) { pState = PS_SOF1; break; }  // can't be ours
       pState = (pLen > 0) ? PS_DATA : PS_CRC;  break;
     case PS_DATA:
-      if (pIdx < sizeof(pBuf)) pBuf[pIdx++] = b;
+      pBuf[pIdx++] = b;
       if (pIdx == pLen) pState = PS_CRC;  break;
     case PS_CRC: {
       uint8_t crc = pCmd ^ pLen;
@@ -271,7 +321,8 @@ void setup() {
     s.current     = rest;
     s.target      = rest;
     s.last_update = now;
-    incoming[i]   = 0;
+    incoming[i]   = rest;
+    failsafe_step[i] = s.step;
 
     if (s.driver == DRIVER_GPIO) {
       s.servo_obj.attach(s.pin);
@@ -296,34 +347,40 @@ void loop() {
   // 1. Parse incoming serial bytes
   while (Serial.available()) {
     feedByte((uint8_t)Serial.read());
+    last_byte_ms = millis();
+  }
+  // Drop a frame stalled mid-way (bytes still queued are fed above first, so
+  // a loop blocked in pulseIn/I2C doesn't cut a legitimate frame).
+  if (pState != PS_SOF1 && millis() - last_byte_ms > FRAME_BYTE_TIMEOUT_MS) {
+    pState = PS_SOF1;
   }
 
-  // 2. Apply new targets (only after first packet received)
+  // 2. Host-loss failsafe
+  if (host_seen && !failsafe && millis() - last_servos_ms > HOST_TIMEOUT_MS) {
+    enterFailsafe();
+  }
+
+  // 3. Apply new targets (only after first packet received; never in failsafe)
   if (packet_received) {
     for (int i = 0; i < SERVO_TOTAL_COUNT; i++) {
-      SmoothServo &s  = servos[i];
-      int16_t     val = incoming[i];
-      // val=0 → return to rest 
-      int16_t angle = (val == 0) ? s.rest_angle
-                                 : constrain(val, s.min_angle, s.max_angle);
-      // EYE_UD GPIO inversion (angle = min + max - angle)
-      if (i == IDX_EYE_UD) angle = (s.min_angle + s.max_angle) - angle;
-      s.target = angle;
+      servos[i].target = commandToTarget(i, incoming[i]);
     }
   }
 
-  // 3. Smooth movement + write
+  // 4. Smooth movement + write
   unsigned long now = millis();
   for (int i = 0; i < SERVO_TOTAL_COUNT; i++) {
     SmoothServo &s = servos[i];
     if (now - s.last_update < SMOOTH_INTERVAL_MS) continue;
     s.last_update = now;
 
+    // In failsafe never faster than the table speed (SET_SPEEDS may have raised it)
+    uint8_t step = failsafe ? min(s.step, failsafe_step[i]) : s.step;
     if (s.current < s.target) {
-      s.current += s.step;
+      s.current += step;
       if (s.current > s.target) s.current = s.target;
     } else if (s.current > s.target) {
-      s.current -= s.step;
+      s.current -= step;
       if (s.current < s.target) s.current = s.target;
     } else {
       continue;  // position reached
@@ -331,7 +388,7 @@ void loop() {
     writeServo(s, s.current);
   }
 
-  // 4. Ultrasonic — auto at ULTRASONIC_INTERVAL_MS (paused while sleeping)
+  // 5. Ultrasonic — auto at ULTRASONIC_INTERVAL_MS (paused while sleeping)
   if (!sleeping && (now - ultrasonic_last >= ULTRASONIC_INTERVAL_MS)) {
     ultrasonic_last = now;
     int dist = readUltrasonicCM();
@@ -341,7 +398,7 @@ void loop() {
     }
   }
 
-  // 5. Hall finger sensors — auto at HALL_INTERVAL_MS (paused while sleeping)
+  // 6. Hall finger sensors — auto at HALL_INTERVAL_MS (paused while sleeping)
   if (!sleeping && (now - hall_last >= HALL_INTERVAL_MS)) {
     hall_last = now;
     uint16_t h[5] = {

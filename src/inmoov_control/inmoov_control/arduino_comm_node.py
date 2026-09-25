@@ -13,6 +13,9 @@ Link robustness:
   - A serial error (unplugged board, USB reset) closes the port; the RX thread
     then reopens it with a growing back-off (_RECONNECT_MIN_SEC → _RECONNECT_MAX_SEC)
     while the node stays active.
+  - The firmware returns to rest by itself if SET_SERVOS frames stop for 1.5 s
+    (host-loss failsafe); the 50 Hz TX stream is its heartbeat. Transitions are
+    reported as CMD_STATUS and published on ~/failsafe (latched Bool).
   - The sleep flag and the speed table are re-sent after every (re)connect and
     every _STATE_RESEND_SEC — an Arduino that reset on its own (firmware
     defaults: awake, table speeds) is resynchronised without a USB drop.
@@ -37,7 +40,7 @@ from sensor_msgs.msg import JointState
 
 from .protocol import (
     FrameParser, build_set_servos, build_set_speeds, build_sleep, deg_per_sec_to_step,
-    CMD_ULTRASONIC, CMD_PIR, CMD_HALL, CMD_ACK
+    CMD_ULTRASONIC, CMD_PIR, CMD_HALL, CMD_STATUS, CMD_ACK
 )
 
 _RECONNECT_MIN_SEC = 2.0    # first reopen attempt after a serial error
@@ -126,6 +129,7 @@ class ArduinoCommNode(LifecycleNode):
         self._ultrasonic_pub = None
         self._pir_pub        = None
         self._hall_pub       = None
+        self._failsafe_pub   = None
 
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
@@ -149,6 +153,9 @@ class ArduinoCommNode(LifecycleNode):
         if self.HAS_HALL:
             self._hall_pub = self.create_lifecycle_publisher(
                 Int16MultiArray, self.HALL_TOPIC, 10)
+        self._failsafe_pub = self.create_lifecycle_publisher(
+            Bool, '~/failsafe',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         node_name = self.get_name()
         body_names = [n for n, _, _ in self.BODY_JOINTS]
@@ -157,34 +164,26 @@ class ArduinoCommNode(LifecycleNode):
             f'body={len(self.BODY_JOINTS)}, face={len(self.FACE_JOINTS)} joints')
         return TransitionCallbackReturn.SUCCESS
 
+    def _lifecycle_pubs(self):
+        return [p for p in (self._ultrasonic_pub, self._pir_pub, self._hall_pub,
+                            self._failsafe_pub) if p is not None]
+
     def on_activate(self, state):
-        if self._ultrasonic_pub:
-            self._ultrasonic_pub.on_activate(state)
-        if self._pir_pub:
-            self._pir_pub.on_activate(state)
-        if self._hall_pub:
-            self._hall_pub.on_activate(state)
+        for p in self._lifecycle_pubs():
+            p.on_activate(state)
 
         # Check that the port exists on the filesystem
         if not os.path.exists(self._serial_port):
             self.get_logger().error(
                 f'Serial port not found: {self._serial_port} → FAILURE (retry)')
-            if self._ultrasonic_pub:
-                self._ultrasonic_pub.on_deactivate(state)
-            if self._pir_pub:
-                self._pir_pub.on_deactivate(state)
-            if self._hall_pub:
-                self._hall_pub.on_deactivate(state)
+            for p in self._lifecycle_pubs():
+                p.on_deactivate(state)
             return TransitionCallbackReturn.FAILURE
 
         self._connect_serial()
         if self._ser is None:
-            if self._ultrasonic_pub:
-                self._ultrasonic_pub.on_deactivate(state)
-            if self._pir_pub:
-                self._pir_pub.on_deactivate(state)
-            if self._hall_pub:
-                self._hall_pub.on_deactivate(state)
+            for p in self._lifecycle_pubs():
+                p.on_deactivate(state)
             return TransitionCallbackReturn.FAILURE
 
         self._tx_timer = self.create_timer(0.02, self._send_servos)
@@ -215,12 +214,8 @@ class ArduinoCommNode(LifecycleNode):
         # Close serial
         self._close_serial()
 
-        if self._ultrasonic_pub:
-            self._ultrasonic_pub.on_deactivate(state)
-        if self._pir_pub:
-            self._pir_pub.on_deactivate(state)
-        if self._hall_pub:
-            self._hall_pub.on_deactivate(state)
+        for p in self._lifecycle_pubs():
+            p.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
@@ -229,10 +224,10 @@ class ArduinoCommNode(LifecycleNode):
         for s in self._subs:
             self.destroy_subscription(s)
         self._subs = []
-        for p in (self._ultrasonic_pub, self._pir_pub, self._hall_pub):
-            if p is not None:
-                self.destroy_lifecycle_publisher(p)
+        for p in self._lifecycle_pubs():
+            self.destroy_lifecycle_publisher(p)
         self._ultrasonic_pub = self._pir_pub = self._hall_pub = None
+        self._failsafe_pub = None
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state):
@@ -361,12 +356,28 @@ class ArduinoCommNode(LifecycleNode):
             msg.data = [(data[i] << 8) | data[i + 1] for i in range(0, 10, 2)]
             self._hall_pub.publish(msg)
 
+        elif cmd == CMD_STATUS and len(data) >= 1:
+            active = bool(data[0])
+            if active:
+                self.get_logger().error(
+                    'Arduino entered host-loss FAILSAFE (no servo frames for 1.5 s) '
+                    '— returning to rest')
+            else:
+                self.get_logger().warn('Arduino left failsafe — servo frames resumed')
+            if self._failsafe_pub:
+                self._failsafe_pub.publish(Bool(data=active))
+
     # -----------------------------------------------------------------------
     # Command callbacks
     # -----------------------------------------------------------------------
 
     def _apply_joint(self, name: str, pos_rad: float, vel: float) -> None:
         """Applies a position to the body or face map. Called under self._lock."""
+        # NaN/Inf would raise in round() and kill the executor → drop the joint
+        if not math.isfinite(pos_rad):
+            return
+        if not math.isfinite(vel):
+            vel = 0.0
         if name in self._body_map:
             i = self._body_map[name]
             _, center, _ = self.BODY_JOINTS[i]

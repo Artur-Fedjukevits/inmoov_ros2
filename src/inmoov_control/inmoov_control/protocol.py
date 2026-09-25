@@ -11,8 +11,12 @@ Frame format (both directions):
   CRC8 = XOR of CMD + LEN + all DATA bytes
 
 ROS → Arduino commands:
-  CMD_SET_SERVOS   = 0x01   DATA: servo values, 1 byte each (0–180 degrees)
-  CMD_SET_SPEEDS   = 0x02   DATA: step sizes, 1 byte each (0=keep current, 1–255 degrees/tick)
+  CMD_SET_SERVOS   = 0x01   DATA: servo values, 1 byte each (0–180 degrees).
+                              Exactly one byte per servo (other lengths are
+                              ignored); 0 is a literal 0°, not "rest". Doubles
+                              as the host heartbeat for the firmware failsafe.
+  CMD_SET_SPEEDS   = 0x02   DATA: step sizes, 1 byte each (0=keep current, 1–255 degrees/tick),
+                              exactly one byte per servo
                               speed_deg_per_sec ≈ step * 1000 / SMOOTH_INTERVAL_MS (default 60ms)
                               e.g. step=10 → ~167°/s, step=2 → ~33°/s
   CMD_SLEEP        = 0x03   DATA: 1 byte, 0 = awake, 1 = sleeping
@@ -24,7 +28,9 @@ Arduino → ROS events:
   CMD_ULTRASONIC   = 0x10   DATA: uint16 big-endian, distance in cm
   CMD_PIR          = 0x11   DATA: 1 byte, 0 = no motion, 1 = motion detected
   CMD_HALL         = 0x12   DATA: 5 × uint16 big-endian, raw analogRead (0-1023)
-                              order: [thumb, index, middle, ring, pinky] — right hand only
+                              order: [thumb, index, middle, ring, pinky]
+  CMD_STATUS       = 0x13   DATA: 1 byte, 1 = entered host-loss failsafe (no SET_SERVOS
+                              for 1.5 s → slow return to rest), 0 = left it
   CMD_DIAG_RESP    = 0x21   DATA: [n_devices, addr0, addr1, ..., pca_mode1]
                               n_devices: number of I2C devices found
                               addrN:     I2C address of each device (7-bit)
@@ -48,6 +54,7 @@ CMD_DIAG_RESP   = 0x21
 CMD_ULTRASONIC  = 0x10
 CMD_PIR         = 0x11
 CMD_HALL        = 0x12
+CMD_STATUS      = 0x13
 CMD_ACK         = 0xFF
 
 HEADER_LEN = 4   # SOF(2) + CMD(1) + LEN(1)
