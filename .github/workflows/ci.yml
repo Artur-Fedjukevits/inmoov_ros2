@@ -1,0 +1,38 @@
+# CI: pyflakes-level lint + colcon build + hardware-free unit tests.
+# The test job runs in the same ros:jazzy image as `tools/ci_install.sh` expects;
+# reproduce locally with:
+#   docker run --rm -v "$PWD":/ws -w /ws ros:jazzy bash -c \
+#     'tools/ci_install.sh && . /opt/ros/jazzy/setup.sh && colcon build && . install/setup.sh && tools/run_tests.sh'
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install flake8
+      # Errors only (unused imports, undefined names, …); style is not enforced.
+      # F841 (unused local variable) is left out on purpose.
+      - run: flake8 --select=F --extend-ignore=F841 src
+
+  test:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: tools/ci_install.sh
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build
+      - name: Unit tests
+        shell: bash
+        run: |
+          source install/setup.bash
+          tools/run_tests.sh

@@ -92,7 +92,11 @@ listed in the packages' `requirements.txt`:
 
 ```bash
 cd ~/ros2_ws
-rosdep install --from-paths src --ignore-src -y
+rosdep install --from-paths src --ignore-src -y \
+    --skip-keys "python3-onnxruntime-pip python3-insightface-pip"
+export PIP_IGNORE_INSTALLED=1     # pip packages go on top of Debian's (numpy 2 over 1.x, …)
+pip install "numpy>=2.0" scipy
+pip install --index-url https://download.pytorch.org/whl/cpu torch
 pip install -r src/inmoov_voice/requirements.txt \
             -r src/inmoov_vision/requirements.txt \
             -r src/inmoov_cognition/requirements.txt \
@@ -100,6 +104,9 @@ pip install -r src/inmoov_voice/requirements.txt \
 colcon build
 source install/setup.bash
 ```
+
+[`tools/ci_install.sh`](tools/ci_install.sh) is the same sequence, verified in a clean
+`ros:jazzy` container (it's what CI runs).
 
 Tests (no hardware needed, after building and sourcing): `tools/run_tests.sh`
 — runs every package's unit tests (skips the ament style linters and the

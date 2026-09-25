@@ -7,4 +7,6 @@ torch>=2.4             # 2.10.0+cpu — Silero VAD, speechbrain
 sounddevice>=0.5      # 0.5.5  — tts_node playback, audio_source_node
 speechbrain>=1.0      # 1.1.0  — voice_detector (ECAPA-TDNN speaker verification), voice_emotion_node
 onnx-asr>=0.12        # 0.12.0 — parakeet_stt_node (Parakeet-TDT)
-openwakeword>=0.6     # 0.6.0  — openwakeword_node
+# openwakeword_node. PyPI's 0.6.0 needs tflite-runtime, which has no Python 3.12
+# wheel; upstream main switched to ai-edge-litert — the robot runs this commit:
+openwakeword @ git+https://github.com/dscripka/openWakeWord@368c03716d1e92591906a84949bc477f3a834455
