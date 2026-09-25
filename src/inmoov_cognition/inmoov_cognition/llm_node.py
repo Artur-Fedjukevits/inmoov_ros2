@@ -1151,6 +1151,11 @@ def _models_url(chat_url: str) -> str:
     return _base_url(chat_url) + '/v1/models'
 
 
+# Camera frames: newest only, no retransmits (face_capture publishes RELIABLE —
+# a BEST_EFFORT subscriber is compatible with it)
+_CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+
 class LLMNode(LifecycleNode):
     def __init__(self):
         super().__init__('llm_node')
@@ -3097,9 +3102,9 @@ class LLMNode(LifecycleNode):
         self.create_subscription(String, 'openhab_schema',  self._oh_schema_callback,      10)
         self.create_subscription(String, 'openhab_items',   self._oh_items_callback,       10)
         self.create_subscription(CompressedImage, '/camera/eye_left/compressed',
-                                  self._eye_camera_cb, 5)
+                                  self._eye_camera_cb, _CAMERA_QOS)
         self.create_subscription(CompressedImage, '/camera/eye_right/compressed',
-                                  self._eye_camera_right_cb, 5)
+                                  self._eye_camera_right_cb, _CAMERA_QOS)
         self.create_subscription(Bool,   '/introducing',    self._introducing_cb,          10)
         self.create_subscription(Bool,   '/go_idle',        self._go_idle_cb,              10)
         self.create_subscription(Bool,   '/robot_sleep',    self._robot_sleep_cb,          _latched)

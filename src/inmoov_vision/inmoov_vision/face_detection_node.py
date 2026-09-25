@@ -60,6 +60,10 @@ from std_msgs.msg import String
 
 from insightface.app import FaceAnalysis
 
+# Camera frames: newest only, no retransmits (face_capture publishes RELIABLE —
+# a BEST_EFFORT subscriber is compatible with it)
+_CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+
 
 class FaceDetectionNode(LifecycleNode):
     def __init__(self):
@@ -136,7 +140,8 @@ class FaceDetectionNode(LifecycleNode):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-        self.create_subscription(CompressedImage, cam_topic, self._frame_callback, 5)
+        # BEST_EFFORT/depth 1: only the newest frame matters, no retransmits of stale ones
+        self.create_subscription(CompressedImage, cam_topic, self._frame_callback, _CAMERA_QOS)
         self.create_subscription(_Bool, '/face_detection/enable', self._enable_cb, latched_qos)
         if self._fallback_for:
             self.create_subscription(
@@ -183,13 +188,11 @@ class FaceDetectionNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def _frame_callback(self, msg: CompressedImage):
-        """Store the latest frame without processing it — just a buffer."""
+        """Store the latest JPEG without processing it — decoded only when a detection
+        actually runs (det_hz, and only while enabled), not for every camera frame."""
         if not self._lc_active:
             return
-        buf = np.frombuffer(msg.data, dtype=np.uint8)
-        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        if frame is None:
-            return
+        frame = msg.data   # JPEG bytes; decoded in _detect
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         with self._frame_lock:
             self._latest_frame = frame
@@ -238,7 +241,7 @@ class FaceDetectionNode(LifecycleNode):
         with self._frame_lock:
             if self._latest_frame is None:
                 return
-            frame = self._latest_frame.copy()
+            frame = self._latest_frame   # immutable JPEG bytes — no copy needed
             stamp = self._latest_stamp
 
         # Live bug 2026-08-31/09-01: suspicion that the USB camera in the eye
@@ -268,8 +271,11 @@ class FaceDetectionNode(LifecycleNode):
         threading.Thread(
             target=self._detect, args=(frame, stamp, self._generation), daemon=True).start()
 
-    def _detect(self, frame: np.ndarray, stamp: float, generation: int):
+    def _detect(self, jpeg, stamp: float, generation: int):
         try:
+            frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                return
             faces = self._app.get(frame)
             result = {
                 'stamp': stamp,

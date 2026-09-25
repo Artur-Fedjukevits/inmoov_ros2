@@ -68,6 +68,11 @@ from std_msgs.msg import Bool, String
 from inmoov_msgs.srv import MemoryQuery
 
 
+# Camera frames: newest only, no retransmits (face_capture publishes RELIABLE —
+# a BEST_EFFORT subscriber is compatible with it)
+_CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+
 class FaceGalleryNode(LifecycleNode):
     def __init__(self):
         super().__init__('face_gallery_node')
@@ -123,8 +128,8 @@ class FaceGalleryNode(LifecycleNode):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-        self.create_subscription(CompressedImage, '/camera/eye_left/compressed',  self._left_cb,  5)
-        self.create_subscription(CompressedImage, '/camera/eye_right/compressed', self._right_cb, 5)
+        self.create_subscription(CompressedImage, '/camera/eye_left/compressed',  self._left_cb, _CAMERA_QOS)
+        self.create_subscription(CompressedImage, '/camera/eye_right/compressed', self._right_cb, _CAMERA_QOS)
         self.create_subscription(String, '/face/tracks/left',  self._left_tracks_cb,  10)
         self.create_subscription(String, '/face/tracks/right', self._right_tracks_cb, 10)
         self.create_subscription(String, '/social_context',    self._social_cb,        10)
@@ -175,27 +180,26 @@ class FaceGalleryNode(LifecycleNode):
 
     # ── Callbacks ─────────────────────────────────────────────────────────
 
+    # Frames are kept as JPEG bytes and decoded only when a photo is actually
+    # saved (_do_capture), not for every camera frame.
     def _left_cb(self, msg: CompressedImage):
         if self._sleeping or not self._lc_active:
             return
-        frame = self._decode(msg)
-        if frame is not None:
-            with self._lock:
-                self._last_left = frame
+        with self._lock:
+            self._last_left = msg.data
 
     def _right_cb(self, msg: CompressedImage):
         if self._sleeping or not self._lc_active:
             return
-        frame = self._decode(msg)
-        if frame is not None:
-            with self._lock:
-                self._last_right = frame
+        with self._lock:
+            self._last_right = msg.data
 
     @staticmethod
-    def _decode(msg: CompressedImage) -> np.ndarray | None:
+    def _decode(jpeg) -> np.ndarray | None:
+        if jpeg is None:
+            return None
         try:
-            buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-            return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            return cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
         except Exception:
             return None
 
@@ -382,6 +386,9 @@ class FaceGalleryNode(LifecycleNode):
             emb_arr /= norm
         if self._is_duplicate(emb_arr):
             return
+
+        frame_left  = self._decode(frame_left)
+        frame_right = self._decode(frame_right) if right_bbox is not None else None
 
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         uid   = uuid.uuid4().hex[:6]

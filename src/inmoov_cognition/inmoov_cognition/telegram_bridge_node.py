@@ -118,6 +118,11 @@ _LATCHED = QoSProfile(
 
 # ── Main class ───────────────────────────────────────────────────────────────
 
+# Camera frames: newest only, no retransmits (face_capture publishes RELIABLE —
+# a BEST_EFFORT subscriber is compatible with it)
+_CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+
 class TelegramBridgeNode(LifecycleNode):
 
     def __init__(self):
@@ -160,7 +165,7 @@ class TelegramBridgeNode(LifecycleNode):
         self.create_subscription(String,          '/social_context',              self._social_context_cb,    10)
         self.create_subscription(Bool,            '/robot_sleep',                 self._robot_sleep_cb,     _LATCHED)
         self.create_subscription(String,          '/telegram_response',           self._telegram_response_cb, 10)
-        self.create_subscription(CompressedImage, '/camera/eye_left/compressed',  self._camera_cb, 5)
+        self.create_subscription(CompressedImage, '/camera/eye_left/compressed',  self._camera_cb, _CAMERA_QOS)
         self.create_subscription(String,          '/telegram_push',               self._telegram_push_cb,     10)
         self.create_subscription(String,          '/openhab_items',               self._openhab_items_cb,     10)
         self.create_subscription(String,          '/lifecycle/status',            self._lifecycle_status_cb,  10)

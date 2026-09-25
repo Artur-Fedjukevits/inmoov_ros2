@@ -8,6 +8,14 @@ Publishes compressed JPEG frames — no raw Image topics.
 Topics:
   /camera/eye_left/compressed   (sensor_msgs/CompressedImage)
   /camera/eye_right/compressed  (sensor_msgs/CompressedImage)
+  header.frame_id = the eye the picture really comes from ('eye_left'/'eye_right');
+  on a camera failure the other eye's last frame is republished with ITS OWN
+  frame_id and stamp, so consumers can tell the mirror (and a frozen source) apart.
+
+Capture path: the cameras are opened in MJPG and their JPEG is published as-is
+(CAP_PROP_CONVERT_RGB=0) — no decode/encode on the NUC (~0.2 % CPU for both eyes
+vs ~70 % for YUYV → BGR → cv2.imencode). A horizontal flip, or a camera that
+refuses MJPG, falls back to decode + re-encode with jpeg_quality.
 
 Parameters:
   cam_left, cam_right  — paths to the V4L2 devices (by-path)
@@ -43,7 +51,8 @@ class FaceCaptureNode(LifecycleNode):
         self._caps        = {}
         self._fails       = {'left': 0, 'right': 0}
         self._last_reopen = {'left': 0.0, 'right': 0.0}
-        self._last_frame  = {'left': None, 'right': None}
+        self._last_frame  = {'left': None, 'right': None}   # (jpeg bytes, stamp)
+        self._passthrough = {'left': False, 'right': False}  # publishing camera MJPEG as-is
         self._timer       = None
 
     def _dp(self, name, default=None):
@@ -145,14 +154,21 @@ class FaceCaptureNode(LifecycleNode):
     def _open(self, side: str):
         dev = self._devs[side]
         cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FOURCC,       cv2.VideoWriter_fourcc(*'MJPG'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
         cap.set(cv2.CAP_PROP_FPS,          self._fps)
         cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
         if not cap.isOpened():
             self.get_logger().error(f'Failed to open camera {side} ({dev})')
-        else:
-            self.get_logger().info(f'Camera {side} opened: {dev}')
+            return cap
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC)).to_bytes(4, 'little').decode(errors='replace')
+        passthrough = fourcc == 'MJPG' and not self._flips[side]
+        if passthrough:
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)   # read() returns the camera's JPEG bytes
+        self._passthrough[side] = passthrough
+        mode = 'MJPEG passthrough' if passthrough else f'{fourcc} decode+re-encode'
+        self.get_logger().info(f'Camera {side} opened: {dev} ({mode})')
         return cap
 
     def _reopen(self, side: str):
@@ -186,6 +202,9 @@ class FaceCaptureNode(LifecycleNode):
             return
 
         ret, frame = cap.read()
+        if ret and self._passthrough[side]:
+            jpeg = frame.tobytes() if frame is not None else b''
+            ret = jpeg[:2] == b'\xff\xd8'   # truncated/corrupt MJPEG frame → treat as a miss
 
         if not ret:
             self._fails[side] += 1
@@ -199,30 +218,40 @@ class FaceCaptureNode(LifecycleNode):
 
         # Successful frame
         self._fails[side] = 0
-        if self._flips[side]:
-            frame = cv2.flip(frame, 1)
-        self._last_frame[side] = frame
-        self._publish_frame(frame, self._pubs[side], stamp)
+        if not self._passthrough[side]:
+            if self._flips[side]:
+                frame = cv2.flip(frame, 1)
+            ok, buf = cv2.imencode(
+                '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._quality])
+            if not ok:
+                return
+            jpeg = buf.tobytes()
+        self._last_frame[side] = (jpeg, stamp)
+        self._publish_jpeg(jpeg, self._pubs[side], stamp, f'eye_{side}')
 
     def _publish_fallback(self, side: str, stamp):
-        """If our own camera is unavailable — publish a mirror of the other one."""
+        """Own camera unavailable — republish the other eye's last frame.
+
+        Keeps that frame's own stamp and frame_id: a re-stamped copy would look
+        "fresh" to face_detection's frozen-camera check even when the other eye
+        itself stopped updating.
+        """
         other = 'right' if side == 'left' else 'left'
-        frame = self._last_frame.get(other)
-        if frame is None:
+        last = self._last_frame.get(other)
+        if last is None:
             return
+        jpeg, other_stamp = last
         self.get_logger().debug(
             f'Camera {side}: falling back to {other}', throttle_duration_sec=10.0)
-        self._publish_frame(frame, self._pubs[side], stamp)
+        self._publish_jpeg(jpeg, self._pubs[side], other_stamp, f'eye_{other}')
 
-    def _publish_frame(self, frame, pub, stamp):
-        ok, buf = cv2.imencode(
-            '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self._quality])
-        if not ok:
-            return
+    @staticmethod
+    def _publish_jpeg(jpeg: bytes, pub, stamp, frame_id: str):
         msg = CompressedImage()
-        msg.header.stamp = stamp
-        msg.format       = 'jpeg'
-        msg.data         = buf.tobytes()
+        msg.header.stamp    = stamp
+        msg.header.frame_id = frame_id
+        msg.format          = 'jpeg'
+        msg.data            = jpeg
         pub.publish(msg)
 
     # destroy_node replaced by on_shutdown / on_deactivate (lifecycle)

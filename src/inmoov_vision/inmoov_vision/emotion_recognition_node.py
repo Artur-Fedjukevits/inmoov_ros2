@@ -62,6 +62,11 @@ _LABEL_MAP = {
 }
 
 
+# Camera frames: newest only, no retransmits (face_capture publishes RELIABLE —
+# a BEST_EFFORT subscriber is compatible with it)
+_CAMERA_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+
 class EmotionRecognitionNode(LifecycleNode):
     def __init__(self):
         super().__init__('emotion_recognition_node')
@@ -107,8 +112,8 @@ class EmotionRecognitionNode(LifecycleNode):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-        self.create_subscription(CompressedImage, '/camera/eye_left/compressed',  self._left_frame_cb,  5)
-        self.create_subscription(CompressedImage, '/camera/eye_right/compressed', self._right_frame_cb, 5)
+        self.create_subscription(CompressedImage, '/camera/eye_left/compressed',  self._left_frame_cb, _CAMERA_QOS)
+        self.create_subscription(CompressedImage, '/camera/eye_right/compressed', self._right_frame_cb, _CAMERA_QOS)
         self.create_subscription(String, '/face/tracks/left',  self._left_tracks_cb,  10)
         self.create_subscription(String, '/face/tracks/right', self._right_tracks_cb, 10)
         self.create_subscription(Bool, '/robot_sleep', self._sleep_cb, latched_qos)
