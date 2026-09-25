@@ -77,6 +77,10 @@ class EmotionRecognitionNode(LifecycleNode):
         self._last_left_t  = self._last_right_t = 0.0
         self._sleeping     = False
         self._busy         = False
+        # Lifecycle ACTIVE flag + generation: frames are ignored while INACTIVE, and a
+        # worker started before deactivate→activate must not publish its stale result.
+        self._lc_active    = False
+        self._generation   = 0
         self._active_side  = 'left'
 
     def _dp(self, name, default=None):
@@ -113,11 +117,17 @@ class EmotionRecognitionNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
+        self._lc_active = True
         self._pub.on_activate(state)
         self._timer = self.create_timer(1.0 / self._analysis_hz, self._trigger)
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
+        self._lc_active = False
+        self._generation += 1
+        with self._frame_lock:
+            self._left_frames.clear()
+            self._right_frames.clear()
         if self._timer:
             self.destroy_timer(self._timer)
             self._timer = None
@@ -139,13 +149,13 @@ class EmotionRecognitionNode(LifecycleNode):
     # ── Frame callbacks ───────────────────────────────────────────────────
 
     def _left_frame_cb(self, msg: CompressedImage):
-        if self._sleeping:
+        if self._sleeping or not self._lc_active:
             return
         with self._frame_lock:
             self._left_frames.append((self._msg_stamp(msg), bytes(msg.data)))
 
     def _right_frame_cb(self, msg: CompressedImage):
-        if self._sleeping:
+        if self._sleeping or not self._lc_active:
             return
         with self._frame_lock:
             self._right_frames.append((self._msg_stamp(msg), bytes(msg.data)))
@@ -237,11 +247,12 @@ class EmotionRecognitionNode(LifecycleNode):
 
         self._busy = True
         threading.Thread(
-            target=self._analyze, args=(frame, tracks, side), daemon=True).start()
+            target=self._analyze, args=(frame, tracks, side, self._generation),
+            daemon=True).start()
 
     # ── Emotion analysis ──────────────────────────────────────────────────
 
-    def _analyze(self, frame: np.ndarray, tracks: list, source: str):
+    def _analyze(self, frame: np.ndarray, tracks: list, source: str, generation: int):
         try:
             h, w = frame.shape[:2]
             for track in tracks:
@@ -269,6 +280,8 @@ class EmotionRecognitionNode(LifecycleNode):
                         for i in labels
                     }
 
+                    if generation != self._generation:
+                        return   # deactivated while inferring
                     msg = String()
                     msg.data = json.dumps({
                         'track_id':   track['track_id'],

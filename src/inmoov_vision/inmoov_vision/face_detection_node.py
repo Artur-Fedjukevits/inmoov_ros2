@@ -70,6 +70,10 @@ class FaceDetectionNode(LifecycleNode):
         self._latest_frame = None
         self._latest_stamp = 0.0
         self._busy         = False
+        # Lifecycle ACTIVE flag + generation: frames are ignored while INACTIVE, and a
+        # worker started before deactivate→activate must not publish its stale result.
+        self._lc_active    = False
+        self._generation   = 0
         self._enabled      = False
         self._last_frame_t = self._last_detect_t = self._no_face_since = 0.0
         self._fallback_for       = ''
@@ -146,6 +150,7 @@ class FaceDetectionNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
+        self._lc_active = True
         self._pub.on_activate(state)
         # Grace period: consider primary alive from the moment of activation,
         # not from the epoch (otherwise _last_primary_t=0.0 → time.time()-0
@@ -158,9 +163,13 @@ class FaceDetectionNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
+        self._lc_active = False
+        self._generation += 1
         for t in self._timers:
             self.destroy_timer(t)
         self._timers.clear()
+        with self._frame_lock:
+            self._latest_frame = None   # don't detect on a pre-sleep frame after WAKE
         self._pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
@@ -175,6 +184,8 @@ class FaceDetectionNode(LifecycleNode):
 
     def _frame_callback(self, msg: CompressedImage):
         """Store the latest frame without processing it — just a buffer."""
+        if not self._lc_active:
+            return
         buf = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
@@ -255,9 +266,9 @@ class FaceDetectionNode(LifecycleNode):
         self._last_detect_t = time.time()
         self._busy = True
         threading.Thread(
-            target=self._detect, args=(frame, stamp), daemon=True).start()
+            target=self._detect, args=(frame, stamp, self._generation), daemon=True).start()
 
-    def _detect(self, frame: np.ndarray, stamp: float):
+    def _detect(self, frame: np.ndarray, stamp: float, generation: int):
         try:
             faces = self._app.get(frame)
             result = {
@@ -283,6 +294,8 @@ class FaceDetectionNode(LifecycleNode):
                 if self._no_face_since == 0.0:
                     self._no_face_since = time.time()
 
+            if generation != self._generation:
+                return   # deactivated (and maybe re-activated) while inferring
             msg = String()
             msg.data = json.dumps(result)
             self._pub.publish(msg)

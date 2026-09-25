@@ -74,6 +74,7 @@ class FaceGalleryNode(LifecycleNode):
         self._timer                = None
         self._lock                 = threading.Lock()
         self._sleeping             = False
+        self._lc_active            = False   # lifecycle ACTIVE: frames ignored otherwise
         self._last_left            = self._last_right = None
         self._left_bbox            = self._right_bbox = None
         self._left_det_score       = self._right_det_score = 0.0
@@ -135,13 +136,20 @@ class FaceGalleryNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
+        self._lc_active = True
         self._timer = self.create_timer(0.5, self._capture_tick)
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
+        self._lc_active = False
         if self._timer:
             self.destroy_timer(self._timer)
             self._timer = None
+        # Pre-sleep frames/bboxes must not be saved as a "fresh" photo after WAKE
+        with self._lock:
+            self._last_left = self._last_right = None
+            self._left_bbox = self._right_bbox = None
+            self._left_embedding = self._right_embedding = None
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
@@ -168,7 +176,7 @@ class FaceGalleryNode(LifecycleNode):
     # ── Callbacks ─────────────────────────────────────────────────────────
 
     def _left_cb(self, msg: CompressedImage):
-        if self._sleeping:
+        if self._sleeping or not self._lc_active:
             return
         frame = self._decode(msg)
         if frame is not None:
@@ -176,7 +184,7 @@ class FaceGalleryNode(LifecycleNode):
                 self._last_left = frame
 
     def _right_cb(self, msg: CompressedImage):
-        if self._sleeping:
+        if self._sleeping or not self._lc_active:
             return
         frame = self._decode(msg)
         if frame is not None:

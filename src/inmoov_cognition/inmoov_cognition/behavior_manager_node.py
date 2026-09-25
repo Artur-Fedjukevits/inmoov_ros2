@@ -177,6 +177,8 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         self._sub_joint = node.create_subscription(
             JointState, '/joint_command', self._track_joint_cb, 10)
 
+        node.add_deactivate_hook(self.cancel_pending)
+
         self._bb = py_trees.blackboard.Client(name='ExecCmd')
         self._bb.register_key(key='/robot/command',
                                access=py_trees.common.Access.READ)
@@ -269,7 +271,21 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         self._head_timer.daemon = True
         self._head_timer.start()
 
+    def cancel_pending(self):
+        """Node deactivating: drop the head-command timer chain, stop any timed move."""
+        if self._head_timer:
+            self._head_timer.cancel()
+            self._head_timer = None
+        self._override_active = False
+        self._last_scope      = 'head'
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+            self._pub_vel.publish(Twist())
+
     def _send_head_cmd(self, msg: JointState):
+        if not self._node.lc_active:   # deactivated while the 0.2 s timer was pending
+            return
         msg.header.stamp = self._node.get_clock().now().to_msg()
         if 'midstom' in msg.name:
             self._node.note_own_torso_move()
@@ -295,6 +311,8 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         # and reliably lose the person again. Live bug 2026-08-31 (found by
         # the user): "looked left, took a photo, described it — and then
         # immediately turned back."
+        if not self._node.lc_active:
+            return
         if self._had_lock_before_turn:
             back = JointState()
             back.header.stamp = self._node.get_clock().now().to_msg()
@@ -331,6 +349,8 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         self._head_timer.start()
 
     def _enable_tracker_now(self):
+        if not self._node.lc_active:
+            return
         self._node.enable_head_tracker(True)
         self._head_timer = None
         self._node.get_logger().info('Head: control returned to head_tracker')
@@ -1381,6 +1401,16 @@ class BehaviorManagerNode(LifecycleNode):
         self._tree       = None
         self._tick_timer = None
 
+        # Lifecycle ACTIVE flag. Subscriptions and threading timers outlive
+        # deactivate, and the motor publishers here are plain (non-lifecycle) —
+        # everything that can move a servo outside the BT tick checks this flag.
+        self.lc_active = False
+        self._deactivate_hooks: list = []   # BT leaves' cancel callbacks
+
+    def add_deactivate_hook(self, fn) -> None:
+        """BT leaves register cleanup here (pending timers etc.), run on deactivate."""
+        self._deactivate_hooks.append(fn)
+
     # ── Vision control (BT is the sole orchestrator) ─────────────────────
 
     def enable_face_detection(self, enabled: bool) -> None:
@@ -1417,6 +1447,8 @@ class BehaviorManagerNode(LifecycleNode):
         Idea from the AIR2025 paper (Saini et al.). Formula/sign — see
         SoundScanBehaviour._ROTHEAD_* / _AIM_GAIN, not redefined here
         again, the same ones are used."""
+        if not self.lc_active:   # called from _human_detected_cb, which runs while INACTIVE too
+            return
         angle = self._last_human_angle
         rothead = max(SoundScanBehaviour._ROTHEAD_MIN, min(
             SoundScanBehaviour._ROTHEAD_MAX,
@@ -1620,6 +1652,10 @@ class BehaviorManagerNode(LifecycleNode):
 
     def _event_cb(self, msg: String):
         """Robot events from LLM tool calls (move/arm/head/sleep/search)."""
+        if not self.lc_active:
+            # INACTIVE: don't queue it — it would run on the next activation
+            self.get_logger().warn(f'robot_events while inactive — dropped: {msg.data[:80]}')
+            return
         try:
             event = json.loads(msg.data)
         except json.JSONDecodeError as e:
@@ -1752,6 +1788,8 @@ class BehaviorManagerNode(LifecycleNode):
     def _finalize_farewell(self):
         """Called by the timer: close the dialogue and turn vision off."""
         self._farewell_timer = None
+        if not self.lc_active:
+            return
         self._bb.social.person_present = False
         self.enable_head_tracker(False)
         self.enable_face_detection(False)
@@ -1943,6 +1981,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._head_tracker_pub.on_activate(state)
         self._go_idle_pub.on_activate(state)
         self._face_search_status_pub.on_activate(state)
+        self.lc_active = True
         self.enable_face_detection(False)
         self.enable_head_tracker(False)
         self._tick_timer = self.create_timer(1.0 / self._tick_rate, self._tick)
@@ -1953,9 +1992,18 @@ class BehaviorManagerNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
+        self.lc_active = False
         if self._tick_timer:
             self.destroy_timer(self._tick_timer)
             self._tick_timer = None
+        if self._farewell_timer is not None:
+            self._farewell_timer.cancel()
+            self._farewell_timer = None
+        for hook in self._deactivate_hooks:
+            try:
+                hook()
+            except Exception as e:
+                self.get_logger().warn(f'deactivate hook {hook}: {e}')
         self._face_det_pub.on_deactivate(state)
         self._head_tracker_pub.on_deactivate(state)
         self._go_idle_pub.on_deactivate(state)

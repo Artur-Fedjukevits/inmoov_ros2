@@ -62,6 +62,7 @@ class TTSNode(LifecycleNode):
         self._execute_lock       = threading.Lock()
         self._abort_lock         = threading.Lock()
         self._abort_event        = threading.Event()
+        self._current_resp       = None   # streaming HTTP response (closed on deactivate)
         self._goals_pending      = 0
         self._goals_pending_lock = threading.Lock()
         self._cancel_queued      = threading.Event()
@@ -145,6 +146,7 @@ class TTSNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
+        self._cancel_queued.clear()   # on_deactivate may have left it set with an empty queue
         self._speaking_pub.on_activate(state)
         self._jaw_pub.on_activate(state)
         self._face_expr_pub.on_activate(state)
@@ -187,9 +189,27 @@ class TTSNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
-        # Interrupt the current playback
+        # Interrupt the current playback and reject queued goals (they wait on
+        # _execute_lock and would otherwise start playing one after another)
+        self._cancel_queued.set()
         with self._abort_lock:
             self._abort_event.set()
+        # Unblock iter_content if the server is silent (abort is checked between chunks)
+        resp = self._current_resp
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        # Wait for the execute thread to finish (its finally publishes speaking=False
+        # while the publishers are still active)
+        if self._execute_lock.acquire(timeout=3.0):
+            self._execute_lock.release()
+        else:
+            self.get_logger().warn('TTS deactivate: execute thread still busy after 3s')
+        # Idempotent — guarantees listeners and the jaw end up in the idle state
+        self._publish_speaking(False)
+        self._publish_jaw(self._jaw_closed)
 
         if self._action_server is not None:
             self._action_server.destroy()
@@ -486,6 +506,7 @@ class TTSNode(LifecycleNode):
                 stream=True,
                 timeout=(self.connect_timeout, self.timeout_sec),
             ) as resp:
+                self._current_resp = resp
                 resp.raise_for_status()
                 fb('synthesizing')
 
@@ -540,6 +561,8 @@ class TTSNode(LifecycleNode):
             return False, 0, f'Timeout ({self.timeout_sec}s)'
         except requests.exceptions.HTTPError as e:
             return False, 0, f'HTTP error: {e}'
+        finally:
+            self._current_resp = None
 
     # ── Helper methods ─────────────────────────────────────────────────────
 

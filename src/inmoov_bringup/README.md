@@ -60,9 +60,10 @@ any custom API from the nodes it manages.
   (`_SLEEP_DEACTIVATE` in the source — `face_capture_node`,
   `face_detection_node_{left,right}`, `face_tracker_node_{left,right}`,
   `face_recognition_node`, `face_gallery_node`, `emotion_recognition_node`,
-  `vision_head_tracker_node`, `human_detection_node`, `oak_node`,
-  `voice_detector_node`) get `DEACTIVATE`d on `SLEEP` and re-activated on
-  `WAKE`. Triggered either by the `/lifecycle/command` topic or automatically
+  `vision_head_tracker_node`, `human_detection_node`, `oak_node`) get
+  `DEACTIVATE`d on `SLEEP` and re-activated on `WAKE`. `voice_detector_node`
+  stays active so the command right after the wake word isn't lost while
+  WAKE is still running. Triggered either by the `/lifecycle/command` topic or automatically
   by the latched `/robot_sleep` topic (published elsewhere in the system,
   e.g. by `inmoov_cognition`).
 - **Shutdown**: stops the watchdog, then takes every node through

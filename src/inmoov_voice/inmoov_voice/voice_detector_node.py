@@ -190,6 +190,12 @@ class VoiceDetectorNode(LifecycleNode):
         # word — we don't rely on _is_person_present() alone.
         self._last_wake_time          = 0.0
         self._POST_WAKE_LISTEN_GRACE_SEC = 15.0
+        # Lifecycle ACTIVE flag: callbacks ignore wake/audio while INACTIVE
+        # (subscriptions stay alive through deactivate).
+        self._lc_active       = False
+        # Pending delayed re-listen (one-shot ROS timer on the executor thread, so it
+        # never races the audio callback). Cancelled on sleep/go_idle/wake/deactivate.
+        self._relisten_timer  = None
 
         sv_status = 'on' if self._sv_enabled else 'off'
         self.get_logger().info(
@@ -199,6 +205,7 @@ class VoiceDetectorNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
+        self._lc_active = True
         self.publisher_.on_activate(state)
         self._voice_emb_pub.on_activate(state)
         self._sleep_pub.on_activate(state)
@@ -206,7 +213,12 @@ class VoiceDetectorNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
+        self._lc_active = False
+        self._cancel_relisten()
         self.is_active = False
+        self.audio_buffer = []
+        self._sv_buf.clear()
+        self._pre_roll_buffer.clear()
         self.publisher_.on_deactivate(state)
         self._voice_emb_pub.on_deactivate(state)
         self._sleep_pub.on_deactivate(state)
@@ -222,11 +234,46 @@ class VoiceDetectorNode(LifecycleNode):
     def on_error(self, state):
         return TransitionCallbackReturn.SUCCESS
 
+    # ── Delayed re-listen ─────────────────────────────────────────────────
+
+    def _schedule_relisten(self, delay_sec: float):
+        """(Re)schedules _activate_after_tts after delay_sec; replaces any pending one."""
+        self._cancel_relisten()
+        self._relisten_timer = self.create_timer(delay_sec, self._relisten_fire)
+
+    def _cancel_relisten(self):
+        if self._relisten_timer is not None:
+            self.destroy_timer(self._relisten_timer)
+            self._relisten_timer = None
+
+    def _relisten_fire(self):
+        self._cancel_relisten()   # one-shot
+        if self._lc_active:
+            self._activate_after_tts()
+
+    # ── Pre-roll ──────────────────────────────────────────────────────────
+
+    def _take_pre_roll_speech(self) -> list:
+        """Speech chunks from the last ~1.5 s of idle audio; clears the pre-roll.
+
+        While idle the audio callback only buffers chunks — VAD runs here, once,
+        on activation (~50-80 ms) instead of on every chunk around the clock.
+        """
+        chunks = list(self._pre_roll_buffer)
+        self._pre_roll_buffer.clear()
+        if not chunks:
+            return []
+        self.vad_model.reset_states()
+        with torch.no_grad():
+            return [a for a in chunks
+                    if self.vad_model(torch.from_numpy(a), self.rate).item() > self.vad_threshold]
+
     # ── Control callbacks ─────────────────────────────────────────────────
 
     def wake_callback(self, msg: Bool):
-        if not msg.data:
+        if not msg.data or not self._lc_active:
             return
+        self._cancel_relisten()
 
         if self._sleeping:
             wake_msg = Bool()
@@ -258,8 +305,7 @@ class VoiceDetectorNode(LifecycleNode):
                 self._sv_last_gallery_add = 0.0
             return
 
-        speech_chunks = [a for a, c in self._pre_roll_buffer if c > self.vad_threshold]
-        self._pre_roll_buffer.clear()
+        speech_chunks = self._take_pre_roll_speech()
         self._onset_buf.clear()
         self.get_logger().info('Woke up! Listening for a command...')
         self.is_active       = True
@@ -282,8 +328,7 @@ class VoiceDetectorNode(LifecycleNode):
         if not msg.data:
             if self._is_person_present() and not self._sleeping:
                 self.get_logger().info('STT: silence — keep listening (person nearby)')
-                import threading
-                threading.Timer(0.5, self._activate_after_tts).start()
+                self._schedule_relisten(0.5)
             else:
                 self.get_logger().info('STT: silence — back to the wake word')
         else:
@@ -292,8 +337,7 @@ class VoiceDetectorNode(LifecycleNode):
             # Safety timer: activate after 6s if TTS never started.
             # If TTS did arrive earlier — _activate_after_tts checks tts_speaking and won't duplicate.
             if self._is_person_present() and not self._sleeping:
-                import threading
-                threading.Timer(6.0, self._activate_after_tts).start()
+                self._schedule_relisten(6.0)
 
     def _go_idle_cb(self, msg: Bool):
         """Explicit goodbye from the BT — stop recording immediately, reset the grace period.
@@ -303,6 +347,7 @@ class VoiceDetectorNode(LifecycleNode):
         """
         if not msg.data:
             return
+        self._cancel_relisten()
         self._person_present   = False
         self._person_last_seen = 0.0   # reset the grace period — don't wait 120s
         self._stt_sent_time    = 0.0
@@ -328,6 +373,7 @@ class VoiceDetectorNode(LifecycleNode):
     def _robot_sleep_cb(self, msg: Bool):
         self._sleeping = msg.data
         if msg.data:
+            self._cancel_relisten()
             if self.is_active:
                 self.audio_buffer    = []
                 self.silence_counter = 0
@@ -352,8 +398,7 @@ class VoiceDetectorNode(LifecycleNode):
 
     def _activate_after_tts(self):
         if not self.is_active and not self.tts_speaking and not self._sleeping:
-            speech_chunks = [a for a, c in self._pre_roll_buffer if c > self.vad_threshold]
-            self._pre_roll_buffer.clear()
+            speech_chunks = self._take_pre_roll_speech()
             self._onset_buf.clear()
             self.is_active       = True
             self.audio_buffer    = []
@@ -434,8 +479,7 @@ class VoiceDetectorNode(LifecycleNode):
                     self.get_logger().info('TTS finished — sleep mode, auto-activation skipped')
                 elif self._is_person_present():
                     self.get_logger().info('TTS finished — waiting for the user reply...')
-                    import threading
-                    threading.Timer(1.2, self._activate_after_tts).start()
+                    self._schedule_relisten(1.2)
                 else:
                     self.get_logger().info(
                         'TTS finished — nobody in frame, auto-activation disabled')
@@ -672,6 +716,8 @@ class VoiceDetectorNode(LifecycleNode):
     # ── Main audio callback ───────────────────────────────────────────────
 
     def _audio_callback(self, msg: Float32MultiArray):
+        if not self._lc_active:
+            return
         audio_float32 = np.array(msg.data, dtype=np.float32)
 
         if self._chunk_size is None:
@@ -691,13 +737,9 @@ class VoiceDetectorNode(LifecycleNode):
             self._pre_roll_buffer.clear()
             return
 
-        with torch.no_grad():
-            confidence = self.vad_model(
-                torch.from_numpy(audio_float32), self.rate
-            ).item()
-
         if not self.is_active:
-            self._pre_roll_buffer.append((audio_float32, confidence))
+            # Idle: buffer only, VAD runs lazily on activation (_take_pre_roll_speech)
+            self._pre_roll_buffer.append(audio_float32)
             if self._pre_roll_maxlen and len(self._pre_roll_buffer) > self._pre_roll_maxlen:
                 self._pre_roll_buffer.popleft()
 
@@ -709,6 +751,11 @@ class VoiceDetectorNode(LifecycleNode):
                 )
                 self._stt_sent_time = 0.0
             return
+
+        with torch.no_grad():
+            confidence = self.vad_model(
+                torch.from_numpy(audio_float32), self.rate
+            ).item()
 
         # Timeout waiting for the first word
         if not self.audio_buffer and not self._sv_buf:
@@ -805,8 +852,7 @@ class VoiceDetectorNode(LifecycleNode):
                 f'{" (introducing)" if self._introducing else ""} — ignoring'
             )
             if self._should_keep_listening() and not self._sleeping:
-                import threading
-                threading.Timer(0.5, self._activate_after_tts).start()
+                self._schedule_relisten(0.5)
 
         self.audio_buffer    = []
         self.silence_counter = 0

@@ -17,7 +17,7 @@ Control via the /lifecycle/command topic:
                     the full activation
   DEACTIVATE      — deactivate everything except Foundation (tier 0); the
                     watchdog and SLEEP/WAKE transitions are paused until ACTIVATE
-  SLEEP           — deactivate vision + processing, keep voice/LLM
+  SLEEP           — deactivate vision, keep voice/LLM
   WAKE            — reactivate after SLEEP
   SHUTDOWN        — shutdown all nodes
   RESTART_TIER N  — restart a specific tier
@@ -55,14 +55,15 @@ _STATE_INACTIVE     = State.PRIMARY_STATE_INACTIVE
 _STATE_ACTIVE       = State.PRIMARY_STATE_ACTIVE
 _STATE_UNCONFIGURED = State.PRIMARY_STATE_UNCONFIGURED
 
-# Nodes deactivated on SLEEP (vision + VAD)
+# Nodes deactivated on SLEEP (vision). voice_detector_node stays ACTIVE: the
+# phrase right after the wake word must reach STT before WAKE finishes, and it
+# costs nothing while idle (VAD runs only on activation / while recording).
 _SLEEP_DEACTIVATE = {
     'face_capture_node', 'face_detection_node_left', 'face_detection_node_right',
     'face_tracker_node_left', 'face_tracker_node_right',
     'face_recognition_node', 'face_gallery_node',
     'emotion_recognition_node', 'vision_head_tracker_node',
     'human_detection_node', 'oak_node',
-    'voice_detector_node',
 }
 
 # Degradation reasons
