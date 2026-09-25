@@ -18,6 +18,9 @@ Parameters:
   device_name  (str)   — search by name substring
   watchdog_sec (float) — restart if no audio for N seconds (default 5.0)
 
+/diagnostics ('microphone'): ERROR when no audio chunk for watchdog_sec,
+WARN while the device returns pure zeros (hardware Mute), with chunk age.
+
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
@@ -32,6 +35,8 @@ import time
 from collections import deque
 
 import rclpy
+from diagnostic_msgs.msg import DiagnosticStatus
+from diagnostic_updater import Updater
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 import pyaudio
@@ -72,6 +77,7 @@ class AudioSourceNode(LifecycleNode):
         self._pa                  = None
         self._stream              = None
         self._last_ok             = 0.0
+        self._diag                = None
         self._restart_count       = 0
         self._timers              = []
         self._pub                 = None
@@ -121,7 +127,28 @@ class AudioSourceNode(LifecycleNode):
         self._pw_full_restart_cooldown = self.get_parameter('pw_full_restart_cooldown_sec').value
 
         self._pub = self.create_lifecycle_publisher(Float32MultiArray, 'raw_audio', 20)
+        if self._diag is None:
+            self._diag = Updater(self, period=1.0)
+            device = self._device_name or 'default'
+            self._diag.setHardwareID(f'audio input "{device}"')
+            self._diag.add('microphone', self._diagnose)
         return TransitionCallbackReturn.SUCCESS
+
+    def _diagnose(self, stat):
+        active = bool(getattr(self, '_stream_running', False))
+        age = time.time() - self._last_ok if self._last_ok else float('inf')
+        stat.add('stream_open', str(self._stream is not None))
+        stat.add('last_chunk_age_sec', f'{age:.1f}')
+        stat.add('zero_chunks_in_a_row', str(self._zero_streak))
+        if not active:
+            stat.summary(DiagnosticStatus.OK, 'inactive')
+        elif age > self._watchdog_sec:
+            stat.summary(DiagnosticStatus.ERROR, f'no audio for {age:.0f} s')
+        elif self._zero_streak >= self._ZERO_WARN_AFTER:
+            stat.summary(DiagnosticStatus.WARN, 'microphone returns zeros (Mute button?)')
+        else:
+            stat.summary(DiagnosticStatus.OK, 'streaming')
+        return stat
 
     def on_activate(self, state):
         self._pub.on_activate(state)

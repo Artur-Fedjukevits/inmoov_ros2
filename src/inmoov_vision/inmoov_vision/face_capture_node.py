@@ -11,6 +11,8 @@ Topics:
   header.frame_id = the eye the picture really comes from ('eye_left'/'eye_right');
   on a camera failure the other eye's last frame is republished with ITS OWN
   frame_id and stamp, so consumers can tell the mirror (and a frozen source) apart.
+  /diagnostics — per eye: OK / WARN (mirroring the other eye) / ERROR (no frames),
+  with frame age, measured fps and capture mode.
 
 Capture path: the cameras are opened in MJPG and their JPEG is published as-is
 (CAP_PROP_CONVERT_RGB=0) — no decode/encode on the NUC (~0.2 % CPU for both eyes
@@ -34,6 +36,8 @@ import time
 import cv2
 
 import rclpy
+from diagnostic_msgs.msg import DiagnosticStatus
+from diagnostic_updater import Updater
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from sensor_msgs.msg import CompressedImage
 
@@ -54,6 +58,11 @@ class FaceCaptureNode(LifecycleNode):
         self._last_frame  = {'left': None, 'right': None}   # (jpeg bytes, stamp)
         self._passthrough = {'left': False, 'right': False}  # publishing camera MJPEG as-is
         self._timer       = None
+        self._active      = False
+        # Diagnostics: last own frame (monotonic) and frames since the last report
+        self._last_ok_t   = {'left': 0.0, 'right': 0.0}
+        self._n_frames    = {'left': 0, 'right': 0}
+        self._diag        = None
 
     def _dp(self, name, default=None):
         """Safe declare_parameter: ignores repeated declaration on re-configure."""
@@ -91,7 +100,35 @@ class FaceCaptureNode(LifecycleNode):
             'right': self.create_lifecycle_publisher(
                 CompressedImage, 'camera/eye_right/compressed', 5),
         }
+        if self._diag is None:
+            self._diag = Updater(self, period=1.0)
+            self._diag.setHardwareID('eye cameras (UVC)')
+            for side in ('left', 'right'):
+                self._diag.add(f'eye camera {side}',
+                               lambda stat, side=side: self._diagnose(stat, side))
         return TransitionCallbackReturn.SUCCESS
+
+    def _diagnose(self, stat, side: str):
+        now = time.monotonic()
+        fps = self._n_frames[side] / 1.0   # Updater period = 1 s
+        self._n_frames[side] = 0
+        age = now - self._last_ok_t[side] if self._last_ok_t[side] else float('inf')
+        stat.add('device', self._devs[side])
+        stat.add('mode', 'MJPEG passthrough' if self._passthrough[side] else 'decode+re-encode')
+        stat.add('fps', f'{fps:.1f}')
+        stat.add('last_frame_age_sec', f'{age:.1f}')
+        stat.add('consecutive_failures', str(self._fails[side]))
+        if not self._active:
+            stat.summary(DiagnosticStatus.OK, 'inactive')
+        elif age > 3.0:
+            other = 'right' if side == 'left' else 'left'
+            level = (DiagnosticStatus.WARN if now - self._last_ok_t[other] < 3.0
+                     else DiagnosticStatus.ERROR)
+            stat.summary(level, f'no frames for {age:.0f} s'
+                         + (f' — mirroring the {other} eye' if level == DiagnosticStatus.WARN else ''))
+        else:
+            stat.summary(DiagnosticStatus.OK, f'{fps:.0f} fps')
+        return stat
 
     def on_activate(self, state):
         for pub in self._pubs.values():
@@ -110,6 +147,7 @@ class FaceCaptureNode(LifecycleNode):
             return TransitionCallbackReturn.FAILURE
 
         self._timer = self.create_timer(1.0 / self._fps, self._capture)
+        self._active = True
         self.get_logger().info(
             f'FaceCapture active: left={self._devs["left"]}, '
             f'right={self._devs["right"]}, '
@@ -117,6 +155,7 @@ class FaceCaptureNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
+        self._active = False
         if self._timer:
             self.destroy_timer(self._timer)
             self._timer = None
@@ -227,6 +266,8 @@ class FaceCaptureNode(LifecycleNode):
                 return
             jpeg = buf.tobytes()
         self._last_frame[side] = (jpeg, stamp)
+        self._last_ok_t[side] = time.monotonic()
+        self._n_frames[side] += 1
         self._publish_jpeg(jpeg, self._pubs[side], stamp, f'eye_{side}')
 
     def _publish_fallback(self, side: str, stamp):

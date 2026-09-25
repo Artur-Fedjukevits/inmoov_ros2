@@ -19,6 +19,8 @@
   <exec_depend>python3-insightface-pip</exec_depend>
   <!-- No rosdep keys: depthai (v3 Python API, oak_node) and hsemotion-onnx
        (emotion_recognition_node) — install them from requirements.txt -->
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>diagnostic_updater</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

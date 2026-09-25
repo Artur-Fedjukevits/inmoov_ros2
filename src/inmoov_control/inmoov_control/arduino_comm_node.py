@@ -9,6 +9,8 @@ Replaces xicro for servo control. Handles:
   /joint_commanded (JointState) — the commands actually ACCEPTED by the arbiter
       (for nodes that track the current pose: head tracker, BT, joint_state_publisher)
   ~/joint_owners   (String JSON, 1 Hz) — live leases, for debugging
+  /diagnostics     — link: OK / WARN (firmware failsafe active) / ERROR (serial
+      link down, reconnecting), with last-telemetry age and rejected commands
 
 A command without velocity (or 0) moves the joint at its default speed (the
 firmware table step, DEFAULT_STEPS) — speed is no longer inherited from
@@ -41,6 +43,8 @@ import threading
 import time
 import serial
 
+from diagnostic_msgs.msg import DiagnosticStatus
+from diagnostic_updater import Updater
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Int16, Int16MultiArray, Bool, String
@@ -154,6 +158,10 @@ class ArduinoCommNode(LifecycleNode):
         self._commanded_pub  = None
         self._owners_pub     = None
         self._owners_timer   = None
+        # Diagnostics
+        self._diag           = None
+        self._failsafe       = False   # last CMD_STATUS from the firmware
+        self._last_rx_t      = 0.0     # monotonic time of the last RX frame
 
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
@@ -183,6 +191,10 @@ class ArduinoCommNode(LifecycleNode):
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._commanded_pub = self.create_lifecycle_publisher(JointState, '/joint_commanded', 20)
         self._owners_pub    = self.create_lifecycle_publisher(String, '~/joint_owners', 1)
+        if self._diag is None:
+            self._diag = Updater(self, period=1.0)
+            self._diag.setHardwareID(f'Arduino Mega @ {self._serial_port}')
+            self._diag.add(f'{self.get_name()} link', self._diagnose)
 
         node_name = self.get_name()
         self.get_logger().info(
@@ -301,6 +313,7 @@ class ArduinoCommNode(LifecycleNode):
             time.sleep(2.0)           # wait for Arduino bootloader
             # No reset_input_buffer — FrameParser discards bootloader garbage via SOF check
             self._parser = FrameParser()
+            self._failsafe = False   # opening the port resets the board — it boots normal
             with self._lock:
                 # A fresh Arduino boots awake with table speeds — resend both
                 self._sleep_dirty  = True
@@ -363,6 +376,7 @@ class ArduinoCommNode(LifecycleNode):
                 if not chunk:
                     continue
 
+                self._last_rx_t = time.monotonic()
                 self._parser.push(chunk)
                 for cmd, data in self._parser.frames:
                     self._handle_rx(cmd, data)
@@ -389,6 +403,7 @@ class ArduinoCommNode(LifecycleNode):
 
         elif cmd == CMD_STATUS and len(data) >= 1:
             active = bool(data[0])
+            self._failsafe = active
             if active:
                 self.get_logger().error(
                     'Arduino entered host-loss FAILSAFE (no servo frames for 1.5 s) '
@@ -476,6 +491,26 @@ class ArduinoCommNode(LifecycleNode):
         if accepted.name and self._commanded_pub is not None:
             accepted.header.stamp = self.get_clock().now().to_msg()
             self._commanded_pub.publish(accepted)
+
+    def _diagnose(self, stat):
+        ser = self._ser
+        connected = ser is not None and ser.is_open
+        age = time.monotonic() - self._last_rx_t if self._last_rx_t else float('inf')
+        stat.add('port', self._serial_port)
+        stat.add('connected', str(connected))
+        stat.add('firmware_failsafe', str(self._failsafe))
+        stat.add('sleeping', str(self._sleeping))
+        stat.add('last_telemetry_age_sec', f'{age:.1f}')   # telemetry pauses while asleep
+        stat.add('rejected_commands', str(self._arbiter.rejected))
+        if not self._running:
+            stat.summary(DiagnosticStatus.OK, 'inactive')
+        elif not connected:
+            stat.summary(DiagnosticStatus.ERROR, 'serial link down — reconnecting')
+        elif self._failsafe:
+            stat.summary(DiagnosticStatus.WARN, 'firmware failsafe active (no servo frames)')
+        else:
+            stat.summary(DiagnosticStatus.OK, 'connected')
+        return stat
 
     def _publish_owners(self) -> None:
         with self._lock:

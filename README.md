@@ -117,6 +117,19 @@ driven by `lifecycle_manager`); `vision:=false` / `telegram:=true` toggle the
 optional parts. Single nodes can be run with `ros2 run` and transitioned with
 `ros2 lifecycle set` — see each package's README.
 
+## Health
+
+The hardware nodes publish `/diagnostics` once a second — eye cameras (fps,
+frame age, mirroring the other eye), OAK-D pipeline (detection packets/s),
+microphone (chunk age, hardware Mute), Arduino links (connected, firmware
+failsafe, rejected servo commands):
+
+```bash
+ros2 topic echo /diagnostics     # or: ros2 run rqt_robot_monitor rqt_robot_monitor
+```
+
+Lifecycle state of every node is on `/lifecycle/status` (see `inmoov_bringup`).
+
 ## Arduino firmware
 
 [`Arduino/InMoovLeft/`](Arduino/InMoovLeft/) and

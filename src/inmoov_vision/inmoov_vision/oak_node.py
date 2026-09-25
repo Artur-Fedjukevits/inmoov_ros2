@@ -17,6 +17,8 @@ Parameters:
 Robustness: the OAK thread is a supervisor — if pipeline creation fails, the
 pipeline stops or the device disconnects, it rebuilds the pipeline with a
 growing back-off (_RESTART_MIN_SEC → _RESTART_MAX_SEC) while the node is active.
+/diagnostics ('oak pipeline'): ERROR when no detection packet arrived for 3 s —
+distinguishes an empty scene (packets keep coming) from a dead pipeline.
 
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
@@ -28,6 +30,8 @@ import threading
 import time
 
 import rclpy
+from diagnostic_msgs.msg import DiagnosticStatus
+from diagnostic_updater import Updater
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from std_msgs.msg import String
 
@@ -68,6 +72,12 @@ class OakNode(LifecycleNode):
         self._oak_thread = None
         self._det_pub    = None
         self._near_pub   = None
+        # Diagnostics: the pipeline delivers a detection packet every frame,
+        # even with no objects — so packet age tells "empty scene" from "dead OAK"
+        self._last_packet_t = 0.0
+        self._n_packets     = 0
+        self._restarts      = 0
+        self._diag          = None
 
     def _dp(self, name, default=None):
         """Safe declare_parameter: ignores re-declaration on re-configure."""
@@ -85,6 +95,10 @@ class OakNode(LifecycleNode):
 
         self._det_pub  = self.create_lifecycle_publisher(String, 'objects/detections', 10)
         self._near_pub = self.create_lifecycle_publisher(String, 'objects/nearest', 10)
+        if self._diag is None:
+            self._diag = Updater(self, period=1.0)
+            self._diag.setHardwareID('OAK-D Lite')
+            self._diag.add('oak pipeline', self._diagnose)
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
@@ -123,6 +137,22 @@ class OakNode(LifecycleNode):
         self._running = False
         return TransitionCallbackReturn.SUCCESS
 
+    def _diagnose(self, stat):
+        age = time.monotonic() - self._last_packet_t if self._last_packet_t else float('inf')
+        rate = self._n_packets / 1.0   # Updater period = 1 s
+        self._n_packets = 0
+        stat.add('model', self._model_name)
+        stat.add('packets_per_sec', f'{rate:.1f}')
+        stat.add('last_packet_age_sec', f'{age:.1f}')
+        stat.add('pipeline_restarts', str(self._restarts))
+        if not self._running:
+            stat.summary(DiagnosticStatus.OK, 'inactive')
+        elif age > 3.0:
+            stat.summary(DiagnosticStatus.ERROR, f'no detection packets for {age:.0f} s')
+        else:
+            stat.summary(DiagnosticStatus.OK, f'{rate:.0f} packets/s')
+        return stat
+
     def _run_oak(self):
         """Supervisor: (re)builds the pipeline until the node is deactivated."""
         attempt = 0
@@ -135,6 +165,7 @@ class OakNode(LifecycleNode):
                 attempt = 0
             delay = min(_RESTART_MIN_SEC * (2 ** attempt), _RESTART_MAX_SEC)
             attempt += 1
+            self._restarts += 1
             self.get_logger().warn(
                 f'OAK pipeline stopped — rebuilding in {delay:.0f}s (attempt {attempt})')
             deadline = time.monotonic() + delay
@@ -192,6 +223,8 @@ class OakNode(LifecycleNode):
                     if packet is None:
                         time.sleep(0.01)
                         continue
+                    self._last_packet_t = time.monotonic()
+                    self._n_packets += 1
                     self._process(packet.detections)
                 if self._running:
                     self.get_logger().error('OAK pipeline is no longer running')
