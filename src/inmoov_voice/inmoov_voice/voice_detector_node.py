@@ -38,6 +38,7 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import collections
+import json
 import os
 import time
 
@@ -500,8 +501,7 @@ class VoiceDetectorNode(LifecycleNode):
         if not self._sv_enabled or self._sv_encoder is None:
             return
         try:
-            import json as _json
-            data = _json.loads(msg.data)
+            data = json.loads(msg.data)
             anchor_person_id = data.get('person_id')
         except Exception as e:
             self.get_logger().warn(f'SV: failed to parse the voice gallery: {e}')
@@ -606,12 +606,10 @@ class VoiceDetectorNode(LifecycleNode):
         return True
 
     def _publish_voice_emb(self, emb: np.ndarray, ts: float = None):
-        import json as _json
-        import time as _t
         emb_msg = String()
-        emb_msg.data = _json.dumps({
+        emb_msg.data = json.dumps({
             'embedding': emb.tolist(),
-            'timestamp': ts if ts is not None else _t.time(),
+            'timestamp': ts if ts is not None else time.time(),
         })
         self._voice_emb_pub.publish(emb_msg)
 

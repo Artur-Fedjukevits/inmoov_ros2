@@ -47,8 +47,11 @@ Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
+import glob
 import json
 import logging
+import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -457,7 +460,6 @@ class MemoryNode(LifecycleNode):
             ctx = json.loads(msg.data)
             present = ctx.get('person_present', False)
             name    = ctx.get('name', '')
-            emotion = ctx.get('emotion', 'neutral')
 
             # List of people nearby
             people = [name] if present and name else []
@@ -1138,7 +1140,6 @@ class MemoryNode(LifecycleNode):
         return {'photos': [list(r) for r in rows]}
 
     def _merge_persons(self, req: dict) -> dict:
-        import os, shutil, glob, json as _json
         from_id = req['from_id']
         to_id   = req['to_id']
         GALLERY_LIMIT = 30
@@ -1269,13 +1270,13 @@ class MemoryNode(LifecycleNode):
                 for ep_id, parts_json in ep_conn.execute(
                         'SELECT id, participants FROM episodes').fetchall():
                     try:
-                        parts = _json.loads(parts_json) if parts_json else []
+                        parts = json.loads(parts_json) if parts_json else []
                     except Exception:
                         continue
                     if from_name in parts:
                         new_parts = [to_name if p == from_name else p for p in parts]
                         ep_conn.execute('UPDATE episodes SET participants=? WHERE id=?',
-                                        (_json.dumps(new_parts, ensure_ascii=False), ep_id))
+                                        (json.dumps(new_parts, ensure_ascii=False), ep_id))
         except Exception as e:
             self.get_logger().warn(f'merge_persons: episodic update failed: {e}')
 
@@ -1285,7 +1286,6 @@ class MemoryNode(LifecycleNode):
 
     def _person_gallery_dir(self, pid: int, name: str) -> str:
         """Person's photo folder — same layout as face_gallery_node (persons/{id}_{name})."""
-        import glob, os
         existing = [d for d in glob.glob(os.path.join(self._gallery_dir, 'persons', f'{pid}_*'))
                     if os.path.isdir(d)]
         if existing:
@@ -1296,7 +1296,6 @@ class MemoryNode(LifecycleNode):
 
     @staticmethod
     def _unique_path(directory: str, filename: str) -> str:
-        import os
         stem, ext = os.path.splitext(filename)
         dest, n = os.path.join(directory, filename), 1
         while os.path.exists(dest):
@@ -1306,7 +1305,6 @@ class MemoryNode(LifecycleNode):
 
     @staticmethod
     def _remove_quietly(path: str):
-        import os
         try:
             os.remove(path)
         except OSError:
@@ -1526,13 +1524,12 @@ class MemoryNode(LifecycleNode):
         have centroid similarity >= _SV_QUALITY_MIN, otherwise it's noise/another
         person's voice — discard it.
         """
-        import time as _time
         pid         = req['person_id']
         try:
             new_emb = as_embedding(req['embedding'], self._voice_emb_dim)
         except ValueError as e:
             return {'added': False, 'reason': f'invalid_embedding: {e}'}
-        recorded_at = float(req.get('timestamp', _time.time()))
+        recorded_at = float(req.get('timestamp', time.time()))
 
         with self._lock:
             if not self._db.execute('SELECT 1 FROM persons WHERE id=?', (pid,)).fetchone():
@@ -1569,7 +1566,7 @@ class MemoryNode(LifecycleNode):
 
             # Gallery full — check the age of the oldest entry
             oldest = min(entries, key=lambda e: e['recorded_at'])
-            age_days = (_time.time() - oldest['recorded_at']) / 86400
+            age_days = (time.time() - oldest['recorded_at']) / 86400
             if age_days < self._SV_REFRESH_DAYS:
                 return {'added': False, 'reason': 'gallery_full_and_fresh',
                         'oldest_age_days': round(age_days, 1)}

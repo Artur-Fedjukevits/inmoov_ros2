@@ -41,7 +41,6 @@ import threading
 import time
 import serial
 
-import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from std_msgs.msg import Int16, Int16MultiArray, Bool, String
@@ -52,7 +51,7 @@ from .joint_arbiter import JointArbiter
 
 from .protocol import (
     FrameParser, build_set_servos, build_set_speeds, build_sleep, deg_per_sec_to_step,
-    CMD_ULTRASONIC, CMD_PIR, CMD_HALL, CMD_STATUS, CMD_ACK
+    CMD_ULTRASONIC, CMD_PIR, CMD_HALL, CMD_STATUS
 )
 
 _RECONNECT_MIN_SEC = 2.0    # first reopen attempt after a serial error
@@ -186,7 +185,6 @@ class ArduinoCommNode(LifecycleNode):
         self._owners_pub    = self.create_lifecycle_publisher(String, '~/joint_owners', 1)
 
         node_name = self.get_name()
-        body_names = [n for n, _, _ in self.BODY_JOINTS]
         self.get_logger().info(
             f'{node_name} configured | port={self._serial_port} | '
             f'body={len(self.BODY_JOINTS)}, face={len(self.FACE_JOINTS)} joints')

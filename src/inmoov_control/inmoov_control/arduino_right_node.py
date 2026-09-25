@@ -42,7 +42,6 @@ Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
-import sys
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from .arduino_comm_node import ArduinoCommNode

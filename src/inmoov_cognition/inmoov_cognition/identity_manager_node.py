@@ -695,12 +695,11 @@ class IdentityManagerNode(LifecycleNode):
 
     def _add_voice_to_gallery(self, person_id: int, emb: list, ts: float = None):
         """Adds the embedding to the voice gallery (memory_node applies the 7-day rule)."""
-        import time as _t
         result = self._call_memory({
             'op':        'add_voice_to_gallery',
             'person_id': person_id,
             'embedding': emb,
-            'timestamp': ts if ts is not None else _t.time(),
+            'timestamp': ts if ts is not None else time.time(),
         })
         if result is None:
             self.get_logger().warn(f'Voice gallery: _call_memory returned None (timeout/error) for pid={person_id}')
@@ -1178,8 +1177,6 @@ class IdentityManagerNode(LifecycleNode):
 
         # Post-farewell cooldown: the person said goodbye themselves — don't greet until the wake word
         if (now - goodbye_ts) < self._post_goodbye_ignore_sec:
-            remaining_min = (self._post_goodbye_ignore_sec - (now - goodbye_ts)) / 60
-
             with self._lock:
                 self._state         = State.IDLE
                 self._primary_track = None
@@ -1302,7 +1299,6 @@ class IdentityManagerNode(LifecycleNode):
             self._introduce_attempts = 0
             self._enroll_embeddings  = []   # start accumulating from scratch
             self._enrolled_track_id  = None
-            emotion = self._last_emotion or 'surprised'
 
         phrase = random.choice(self._INTRO_PHRASES)
         self.get_logger().info('Unknown person — starting an introduction')
@@ -1433,8 +1429,6 @@ class IdentityManagerNode(LifecycleNode):
                 dialogue_active = (self._last_dialogue_ts > 0.0 and
                                    (now - self._last_dialogue_ts) < 60.0)
                 if dialogue_active:
-                    face_lost_sec = now - self._last_face_time
-                    dialogue_sec  = now - self._last_dialogue_ts
                     self._face_hunt_since = 0.0
                     return
 
@@ -1449,7 +1443,6 @@ class IdentityManagerNode(LifecycleNode):
                 # Face lost — check body detection as a fallback signal
                 human_detected = (now - self._last_human_time) < self._no_human_timeout
                 if human_detected:
-                    face_lost_sec = now - self._last_face_time
                     if self._face_hunt_since == 0.0:
                         self._face_hunt_since = now
                     hunt_sec = now - self._face_hunt_since

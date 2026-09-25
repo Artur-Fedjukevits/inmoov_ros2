@@ -16,11 +16,9 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import sqlite3
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 from inmoov_memory.sqlite_util import session

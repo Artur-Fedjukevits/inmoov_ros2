@@ -40,14 +40,11 @@ import base64
 import concurrent.futures
 import datetime
 import json
-import os
 import re
 import shutil
-import socket
 import threading
 import time
 import uuid
-import wave
 import requests
 
 import rclpy
@@ -1122,14 +1119,13 @@ def _resolve_reminder_date(date_str: str | None) -> str | None:
 
 def _resolve_reminder_time(time_str: str | None) -> str | None:
     """Normalizes a time string into HH:MM format. None/empty → None."""
-    import re as _re
     if not time_str:
         return None
     s = time_str.strip()
     if not s:
         return None
     # Already in HH:MM or H:MM format
-    m = _re.fullmatch(r'(\d{1,2}):(\d{2})', s)
+    m = re.fullmatch(r'(\d{1,2}):(\d{2})', s)
     if m:
         h, mn = int(m.group(1)), int(m.group(2))
         if 0 <= h <= 23 and 0 <= mn <= 59:
@@ -2342,7 +2338,6 @@ class LLMNode(LifecycleNode):
     }
 
     def _tool_get_weather(self, args: dict) -> dict:
-        import datetime
         from collections import Counter
 
         location = (args.get('location') or '').strip() or self._DEFAULT_LOC

@@ -17,7 +17,6 @@ Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
-import math
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from sensor_msgs.msg import JointState

@@ -57,7 +57,7 @@ def check_mode1(mode1: int) -> list[str]:
 
 def run(port: str, timeout: float = 5.0):
     print(f"\n{'─'*60}")
-    print(f"PCA9685 I2C Diagnostic Test")
+    print("PCA9685 I2C Diagnostic Test")
     print(f"Port:    {port}")
     print(f"Target:  Left Arduino Mega → PCA9685 @ 0x{PCA9685_ADDR:02X}")
     print(f"{'─'*60}\n")
@@ -80,7 +80,6 @@ def run(port: str, timeout: float = 5.0):
     # Wait for response
     parser   = FrameParser()
     deadline = time.time() + timeout
-    resp_cmd = None
     resp_data = None
 
     while time.time() < deadline:
@@ -89,7 +88,6 @@ def run(port: str, timeout: float = 5.0):
             parser.push(raw)
             for cmd, data in parser.frames:
                 if cmd == CMD_DIAG_RESP:
-                    resp_cmd  = cmd
                     resp_data = data
                     break
             parser.frames.clear()
@@ -131,7 +129,7 @@ def run(port: str, timeout: float = 5.0):
     print(f"[ OK ] PCA9685 found at 0x{PCA9685_ADDR:02X}")
 
     if pca_mode1 == 0xFF:
-        print(f"[WARN] MODE1 register read failed (returned 0xFF — may mean read error)")
+        print("[WARN] MODE1 register read failed (returned 0xFF — may mean read error)")
     else:
         print(f"[ OK ] MODE1 register = 0x{pca_mode1:02X} ({pca_mode1:08b}b)")
         for note in check_mode1(pca_mode1):

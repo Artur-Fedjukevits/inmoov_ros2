@@ -28,9 +28,6 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
-import time
-
-import numpy as np
 
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn

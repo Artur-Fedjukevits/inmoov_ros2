@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import serial
 from inmoov_control.protocol import (
     build_set_servos, FrameParser,
-    CMD_SET_SERVOS, CMD_ULTRASONIC, CMD_PIR
+    CMD_ULTRASONIC, CMD_PIR
 )
 
 
@@ -86,7 +86,7 @@ def format_rx(cmd: int, data: bytes) -> str:
 
 def run_test(port: str, mode: str, count: int, delay: float):
     print(f"\n{'─'*60}")
-    print(f"InMoov Arduino Serial Test")
+    print("InMoov Arduino Serial Test")
     print(f"Port:  {port}")
     print(f"Mode:  {mode} Arduino")
     print(f"{'─'*60}\n")
@@ -99,7 +99,7 @@ def run_test(port: str, mode: str, count: int, delay: float):
 
     time.sleep(2.0)   # Arduino resets on serial connect, wait for bootloader
     ser.reset_input_buffer()
-    print(f"[OK] Port opened. Waiting for Arduino ready...\n")
+    print("[OK] Port opened. Waiting for Arduino ready...\n")
 
     parser   = FrameParser()
     sequence = SEQUENCES[mode]
@@ -150,7 +150,7 @@ def run_test(port: str, mode: str, count: int, delay: float):
 def run_listen(port: str, duration: float):
     """Listen-only mode: print all sensor frames for N seconds (no servo commands)."""
     print(f"\n{'─'*60}")
-    print(f"InMoov Arduino Sensor Listen")
+    print("InMoov Arduino Sensor Listen")
     print(f"Port:     {port}")
     print(f"Duration: {duration} s  (Ctrl-C to stop)")
     print(f"{'─'*60}\n")

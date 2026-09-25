@@ -24,7 +24,7 @@ import importlib
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -234,7 +234,7 @@ def check_openhab() -> list[Check]:
         checks.append(Check(
             name, 'ok' if llm_items else 'warn',
             f'{len(llm_items)} devices tagged ChatGPT (out of {len(all_items)} total)',
-            f'Without the ChatGPT tag the LLM cannot see the devices' if not llm_items else ''
+            'Without the ChatGPT tag the LLM cannot see the devices' if not llm_items else ''
         ))
     except Exception as e:
         checks.append(Check(name, 'fail', str(e)))
@@ -397,7 +397,7 @@ def check_ros2_env() -> list[Check]:
     else:
         checks.append(Check(
             'Workspace sourced', 'warn',
-            f'Workspace not found in AMENT_PREFIX_PATH',
+            'Workspace not found in AMENT_PREFIX_PATH',
             f'Run: source {ws_path}/install/setup.bash'
         ))
 

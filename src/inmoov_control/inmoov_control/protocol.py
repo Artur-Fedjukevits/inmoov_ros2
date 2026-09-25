@@ -42,8 +42,6 @@ Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
-import struct
-
 SOF = b'\xAA\x55'
 
 CMD_SET_SERVOS  = 0x01

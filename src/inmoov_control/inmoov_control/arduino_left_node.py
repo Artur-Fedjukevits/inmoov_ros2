@@ -29,10 +29,8 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import rclpy
-import math
 from rclpy.executors import MultiThreadedExecutor
-from sensor_msgs.msg import JointState
-from .arduino_comm_node import ArduinoCommNode, clamp_deg, rad_to_deg
+from .arduino_comm_node import ArduinoCommNode
 
 DEFAULT_PORT = '/dev/serial/by-path/pci-0000:c6:00.3-usb-0:1.3:1.0-port0'
 

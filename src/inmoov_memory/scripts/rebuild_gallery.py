@@ -91,7 +91,6 @@ def rebuild(db_path: str, gallery_dir: str):
                 continue
 
             person_id   = int(parts[0])
-            person_name = parts[1].replace('_', ' ')
 
             # Check that the person exists in the DB
             row = db.execute('SELECT name FROM persons WHERE id=?', (person_id,)).fetchone()
