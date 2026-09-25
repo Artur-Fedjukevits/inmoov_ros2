@@ -21,6 +21,7 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import argparse
+import os
 import sqlite3
 import sys
 from datetime import datetime
@@ -144,9 +145,9 @@ def rebuild(db_path: str, gallery_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(description='Rebuild face gallery embeddings from photos')
-    parser.add_argument('--db',      default='/home/artur/inmoov_memory.db',
+    parser.add_argument('--db',      default=os.path.expanduser('~/inmoov_memory.db'),
                         help='Path to SQLite database')
-    parser.add_argument('--gallery', default='/home/artur/inmoov_faces',
+    parser.add_argument('--gallery', default=os.path.expanduser('~/inmoov_faces'),
                         help='Path to gallery root directory')
     args = parser.parse_args()
 

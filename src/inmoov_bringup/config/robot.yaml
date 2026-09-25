@@ -1,0 +1,38 @@
+# robot.yaml — everything specific to THIS robot, machine and network.
+#
+# inmoov.launch.py takes the defaults of its launch arguments from here; any
+# value can still be overridden on the command line (ros2 launch ... llm_url:=...).
+# To use another file (e.g. for a second robot) without touching this one:
+#   INMOOV_ROBOT_CONFIG=/path/to/robot.yaml ros2 launch inmoov_bringup inmoov.launch.py
+# Sections are only for readability — every key is a launch-argument name.
+# '~' is expanded. Secrets are NOT kept here — they come from the environment:
+#   VLLM_BEARER_TOKEN, TAVILY_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_ID.
+#
+# Author: Artur Fedjukevits
+# Assisted by: Claude Code (Anthropic)
+# License: GNU General Public License v3.0 (see repository root LICENSE)
+
+servers:
+  llm_url:          http://192.168.10.118:18020/v1/chat/completions   # OpenAI-compatible (vLLM)
+  llm_fallback_url: ''                                                # '' = no fallback
+  vision_llm_url:   http://192.168.10.118:18090/v1/chat/completions   # look_and_describe (2-4 images)
+  tts_server_url:   http://192.168.10.118:8000
+  tts_fallback_url: ''
+  cast_to_file_url: http://192.168.10.118:8000/tts/to_file           # broadcast_message → Chromecast
+  openhab_url:      http://192.168.10.118:8080
+
+devices:
+  # by-path: stable across reboots; by-id is useless (both eye cameras share a serial)
+  port_left:  /dev/serial/by-path/pci-0000:c6:00.3-usb-0:1.3:1.0-port0
+  port_right: /dev/serial/by-path/pci-0000:c6:00.3-usb-0:5:1.0-port0
+  cam_left:   /dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0
+  cam_right:  /dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0
+
+paths:
+  wakeword_model:   ~/openWakeWord/my_custom_model/ey_lyonya.onnx
+  memory_db_path:   ~/inmoov_memory.db       # people, face/voice galleries
+  episodic_db_path: ~/inmoov_episodic.db
+  semantic_db_path: ~/inmoov_semantic.db
+  chroma_path:      ~/inmoov_chroma
+  reminder_db_path: ~/inmoov_reminders.db
+  gallery_dir:      ~/inmoov_faces           # face photos (face_gallery_node + memory_node)

@@ -8,7 +8,7 @@ test_dialogue_guards.py — llm_node dialogue policy without ROS or an LLM.
     after the current reply (no TTS cancel), dropped on /introducing
 
 Run:
-  cd /home/artur/ros2_ws && source install/setup.bash
+  cd ~/ros2_ws && source install/setup.bash
   python3 -m pytest src/inmoov_cognition/test/test_dialogue_guards.py -v
 """
 

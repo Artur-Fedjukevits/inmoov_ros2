@@ -8,7 +8,7 @@ test_joint_arbiter.py — per-joint arbitration (no hardware needed).
   vs TTS jaw, legacy topic — plus the default-speed rule.
 
 Run:
-  cd /home/artur/ros2_ws && source install/setup.bash
+  cd ~/ros2_ws && source install/setup.bash
   python3 -m pytest src/inmoov_control/test/test_joint_arbiter.py -v
 """
 

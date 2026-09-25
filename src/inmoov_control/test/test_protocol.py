@@ -10,7 +10,7 @@ Tests:
   6. Round-trip: build → parse → same data
 
 Run:
-  cd /home/artur/ros2_ws
+  cd ~/ros2_ws
   python3 -m pytest src/inmoov_control/test/test_protocol.py -v
 """
 

@@ -22,6 +22,7 @@ Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
+import os
 import time
 
 import rclpy
@@ -52,7 +53,7 @@ class WakeWordNode(LifecycleNode):
     def on_configure(self, state):
         self._dp(
             'model_path',
-            '/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'
+            os.path.expanduser('~/openWakeWord/my_custom_model/ey_lyonya.onnx')
         )
         self._dp('threshold',    0.2)
         self._dp('debounce_sec', 1.5)

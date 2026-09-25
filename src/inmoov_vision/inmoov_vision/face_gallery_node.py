@@ -51,6 +51,7 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
+import os
 import shutil
 import threading
 import time
@@ -102,7 +103,7 @@ class FaceGalleryNode(LifecycleNode):
             self.declare_parameter(name, default)
 
     def on_configure(self, state):
-        self._dp('gallery_dir',            '/home/artur/inmoov_faces')
+        self._dp('gallery_dir',            os.path.expanduser('~/inmoov_faces'))
         self._dp('enroll_interval_sec',    1.0)
         self._dp('interact_interval_sec',  15.0)
         self._dp('min_det_score',          0.80)

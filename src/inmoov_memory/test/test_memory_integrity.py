@@ -3,7 +3,7 @@ test_memory_integrity.py — merge_persons, embedding validation, Chroma reconci
 settings. Everything runs on temp files; no ROS graph, LLM or ChromaDB needed.
 
 Run:
-  cd /home/artur/ros2_ws && source install/setup.bash
+  cd ~/ros2_ws && source install/setup.bash
   python3 -m pytest src/inmoov_memory/test/test_memory_integrity.py -v
 """
 

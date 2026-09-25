@@ -12,7 +12,7 @@ min/max live only in the firmware (Python keeps them in comments), so they are
 not compared.
 
 Run:
-  cd /home/artur/ros2_ws
+  cd ~/ros2_ws
   python3 -m pytest src/inmoov_control/test/test_servo_tables.py -v
 """
 

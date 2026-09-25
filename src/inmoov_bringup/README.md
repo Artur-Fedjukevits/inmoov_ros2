@@ -161,6 +161,23 @@ nodes (`face_capture_node`, `oak_node`, `face_detection_node_*`,
 `emotion_recognition_node`, `vision_head_tracker_node`, `human_detection_node`,
 `scene_manager_node`) are started only if `vision:=true`.
 
+### Robot configuration (`config/robot.yaml`)
+
+Everything specific to this robot, machine and network lives in
+[`config/robot.yaml`](config/robot.yaml): server URLs (LLM, vision LLM, TTS,
+openHAB), device paths (Arduino ports, eye cameras) and data paths (memory
+DBs, Chroma, face gallery, wake-word model). The launch file uses it for the
+defaults of the matching launch arguments below; `~` is expanded. For another
+robot, point `INMOOV_ROBOT_CONFIG` at a copy instead of editing the file:
+
+```bash
+INMOOV_ROBOT_CONFIG=~/my_robot.yaml ros2 launch inmoov_bringup inmoov.launch.py
+```
+
+Secrets are never read from it — they stay in the environment
+(`VLLM_BEARER_TOKEN`, `TAVILY_API_KEY`, `TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_ALLOWED_CHAT_ID`).
+
 ### Launch arguments
 
 Servers / LLM:

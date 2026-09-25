@@ -4,17 +4,17 @@ memory_node.py — Memory Manager Node (v2)
 ==========================================
 Single ROS2 node that manages all of the robot's memory:
 
-  SOCIAL MEMORY (SQLite, /home/artur/inmoov_memory.db):
+  SOCIAL MEMORY (SQLite, ~/inmoov_memory.db):
     persons, person_gallery, person_notes, robot_knowledge
     — face/voice recognition, notes about people
 
   WORKING MEMORY (RAM, WorkingMemory):
     time, location, mode, people nearby — always in the LLM context
 
-  EPISODIC MEMORY (SQLite, /home/artur/inmoov_episodic.db):
+  EPISODIC MEMORY (SQLite, ~/inmoov_episodic.db):
     short-term memories, dialogues — last 5 included in prompting
 
-  SEMANTIC MEMORY (SQLite + ChromaDB, /home/artur/inmoov_semantic.db):
+  SEMANTIC MEMORY (SQLite + ChromaDB, ~/inmoov_semantic.db):
     long-term facts, preferences — only via tool call
 
 ROS2 interfaces:
@@ -130,12 +130,12 @@ class MemoryNode(LifecycleNode):
 
     def on_configure(self, state):
         # ── Parameters ─────────────────────────────────────────────────────
-        self._dp('db_path',                    '/home/artur/inmoov_memory.db')
-        self._dp('episodic_db_path',           '/home/artur/inmoov_episodic.db')
-        self._dp('semantic_db_path',           '/home/artur/inmoov_semantic.db')
-        self._dp('chroma_path',                '/home/artur/inmoov_chroma')
-        self._dp('reminder_db_path',           '/home/artur/inmoov_reminders.db')
-        self._dp('gallery_dir',                '/home/artur/inmoov_faces')  # face_gallery_node's gallery_dir
+        self._dp('db_path',                    os.path.expanduser('~/inmoov_memory.db'))
+        self._dp('episodic_db_path',           os.path.expanduser('~/inmoov_episodic.db'))
+        self._dp('semantic_db_path',           os.path.expanduser('~/inmoov_semantic.db'))
+        self._dp('chroma_path',                os.path.expanduser('~/inmoov_chroma'))
+        self._dp('reminder_db_path',           os.path.expanduser('~/inmoov_reminders.db'))
+        self._dp('gallery_dir',                os.path.expanduser('~/inmoov_faces'))  # face_gallery_node's gallery_dir
         self._dp('llm_url',   'http://192.168.10.118:18020/v1/chat/completions')
         self._dp('llm_model', 'qwen3.8-27b')
         self._dp('bearer_token', '')

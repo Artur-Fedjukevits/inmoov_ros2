@@ -158,7 +158,7 @@ class TelegramBridgeNode(LifecycleNode):
         self._dp('llm_timeout_sec', 35.0)
         self._dp('cam_device',
             '/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0')
-        self._dp('memory_db_path', '/home/artur/inmoov_memory.db')
+        self._dp('memory_db_path', os.path.expanduser('~/inmoov_memory.db'))
 
         self._allowed_chat_id = self.get_parameter('allowed_chat_id').value
         self._llm_timeout     = self.get_parameter('llm_timeout_sec').value

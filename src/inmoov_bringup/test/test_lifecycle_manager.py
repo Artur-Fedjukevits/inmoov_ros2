@@ -6,7 +6,7 @@ bursts, a late node reconciled into sleep, critical crash → cascade → recove
 (ordered by the queue, no sleep), SHUTDOWN pre-empting a retry loop.
 
 Run:
-  cd /home/artur/ros2_ws && source install/setup.bash
+  cd ~/ros2_ws && source install/setup.bash
   python3 -m pytest src/inmoov_bringup/test/test_lifecycle_manager.py -v
 """
 

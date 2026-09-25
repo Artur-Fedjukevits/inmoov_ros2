@@ -69,7 +69,7 @@ TTS_PRIMARY     = f'http://{PRIMARY_HOST}:8000'
 TTS_LOCAL       = ''   # local CosyVoice fallback removed (empty = not checked)
 OPENHAB_URL     = f'http://{PRIMARY_HOST}:8080'
 LLM_MODEL       = 'qwen3.8-27b'
-WAKEWORD_MODEL  = '/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'
+WAKEWORD_MODEL  = os.path.expanduser('~/openWakeWord/my_custom_model/ey_lyonya.onnx')
 TIMEOUT         = 4.0
 
 
@@ -391,7 +391,7 @@ def check_ros2_env() -> list[Check]:
 
     # Workspace
     ament_path = os.environ.get('AMENT_PREFIX_PATH', '')
-    ws_path = '/home/artur/ros2_ws'
+    ws_path = os.path.expanduser('~/ros2_ws')
     if ws_path in ament_path:
         checks.append(Check('Workspace sourced', 'ok', ws_path))
     else:

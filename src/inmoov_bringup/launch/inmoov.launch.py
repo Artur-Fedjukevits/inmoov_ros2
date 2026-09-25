@@ -5,6 +5,10 @@ inmoov.launch.py — main launch file for the InMoov Robot (inmoov_bringup).
 Order: lifecycle_manager starts first and brings up all nodes
 tier by tier (0→6) — no TimerAction, driven by actual readiness.
 
+Machine-specific defaults (servers, device paths, data paths) come from
+config/robot.yaml (or the file in $INMOOV_ROBOT_CONFIG); secrets from the
+environment. Every value can still be overridden as a launch argument.
+
 Usage:
   ros2 launch inmoov_bringup inmoov.launch.py
   ros2 launch inmoov_bringup inmoov.launch.py tavily_api_key:=tvly-...
@@ -18,6 +22,8 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 
 import os
 
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, OpaqueFunction
 from launch.conditions import IfCondition
@@ -43,6 +49,19 @@ _VISION_NODES = [
     'vision_head_tracker_node', 'human_detection_node', 'scene_manager_node',
 ]
 _TELEGRAM_NODES = ['telegram_bridge_node']
+
+
+def _load_robot_config() -> dict:
+    """config/robot.yaml (or $INMOOV_ROBOT_CONFIG) flattened to {launch_arg: str}."""
+    path = os.environ.get('INMOOV_ROBOT_CONFIG') or os.path.join(
+        get_package_share_directory('inmoov_bringup'), 'config', 'robot.yaml')
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+    flat = {}
+    for section in cfg.values():
+        flat.update(section or {})
+    return {k: os.path.expanduser(v) if isinstance(v, str) else str(v)
+            for k, v in flat.items()}
 
 
 def _is_true(context, arg: str) -> bool:
@@ -75,6 +94,7 @@ def _make_lifecycle_manager(context, config_path):
 
 
 def generate_launch_description():
+    robot = _load_robot_config()
 
     # ── Arguments ────────────────────────────────────────────────────────────
     args = [
@@ -83,18 +103,15 @@ def generate_launch_description():
         # by llm_node and identity_manager_node (name extraction). llm_fallback_url —
         # optional backup endpoint; empty = no fallback. (The local Ollama qwen2.5:7b on the
         # NUC was dropped: ~375 s CPU prefill for the ~8.7k-token prompt + 4096 ctx truncation.)
-        DeclareLaunchArgument('llm_url',
-            default_value='http://192.168.10.118:18020/v1/chat/completions'),
-        DeclareLaunchArgument('llm_fallback_url',
-            default_value=''),
+        DeclareLaunchArgument('llm_url',          default_value=robot['llm_url']),
+        DeclareLaunchArgument('llm_fallback_url', default_value=robot['llm_fallback_url']),
+        DeclareLaunchArgument('vision_llm_url',   default_value=robot['vision_llm_url']),
         DeclareLaunchArgument('llm_bearer_token',
             default_value=os.environ.get('VLLM_BEARER_TOKEN', '')),
-        DeclareLaunchArgument('tts_server_url',
-            default_value='http://192.168.10.118:8000'),
-        DeclareLaunchArgument('tts_fallback_url',
-            default_value=''),
-        DeclareLaunchArgument('openhab_url',
-            default_value='http://192.168.10.118:8080'),
+        DeclareLaunchArgument('tts_server_url',   default_value=robot['tts_server_url']),
+        DeclareLaunchArgument('tts_fallback_url', default_value=robot['tts_fallback_url']),
+        DeclareLaunchArgument('cast_to_file_url', default_value=robot['cast_to_file_url']),
+        DeclareLaunchArgument('openhab_url',      default_value=robot['openhab_url']),
 
         # LLM
         DeclareLaunchArgument('llm_model',
@@ -103,8 +120,7 @@ def generate_launch_description():
         DeclareLaunchArgument('llm_max_tokens',     default_value='512'),
 
         # Wake word
-        DeclareLaunchArgument('wakeword_model',
-            default_value='/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx'),
+        DeclareLaunchArgument('wakeword_model', default_value=robot['wakeword_model']),
         DeclareLaunchArgument('wakeword_threshold', default_value='0.2'),
 
         # Audio
@@ -127,21 +143,21 @@ def generate_launch_description():
             default_value=os.environ.get('TAVILY_API_KEY', '')),
 
         # Arduino
-        DeclareLaunchArgument('port_right',
-            default_value='/dev/serial/by-path/pci-0000:c6:00.3-usb-0:5:1.0-port0'),
-        DeclareLaunchArgument('port_left',
-            default_value='/dev/serial/by-path/pci-0000:c6:00.3-usb-0:1.3:1.0-port0'),
+        DeclareLaunchArgument('port_right', default_value=robot['port_right']),
+        DeclareLaunchArgument('port_left',  default_value=robot['port_left']),
 
         # Memory
-        DeclareLaunchArgument('memory_db_path',
-            default_value='/home/artur/inmoov_memory.db'),
+        DeclareLaunchArgument('memory_db_path',   default_value=robot['memory_db_path']),
+        DeclareLaunchArgument('episodic_db_path', default_value=robot['episodic_db_path']),
+        DeclareLaunchArgument('semantic_db_path', default_value=robot['semantic_db_path']),
+        DeclareLaunchArgument('chroma_path',      default_value=robot['chroma_path']),
+        DeclareLaunchArgument('reminder_db_path', default_value=robot['reminder_db_path']),
+        DeclareLaunchArgument('gallery_dir',      default_value=robot['gallery_dir']),
 
         # Vision
         DeclareLaunchArgument('vision',    default_value='true'),
-        DeclareLaunchArgument('cam_left',
-            default_value='/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0'),
-        DeclareLaunchArgument('cam_right',
-            default_value='/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0'),
+        DeclareLaunchArgument('cam_left',  default_value=robot['cam_left']),
+        DeclareLaunchArgument('cam_right', default_value=robot['cam_right']),
         DeclareLaunchArgument('fps',                  default_value='15'),
         DeclareLaunchArgument('detection_hz',         default_value='5.0'),
         DeclareLaunchArgument('det_thresh',           default_value='0.5'),
@@ -185,6 +201,11 @@ def generate_launch_description():
         respawn_delay=2.0,
         parameters=[{
             'db_path':              LaunchConfiguration('memory_db_path'),
+            'episodic_db_path':     LaunchConfiguration('episodic_db_path'),
+            'semantic_db_path':     LaunchConfiguration('semantic_db_path'),
+            'chroma_path':          LaunchConfiguration('chroma_path'),
+            'reminder_db_path':     LaunchConfiguration('reminder_db_path'),
+            'gallery_dir':          LaunchConfiguration('gallery_dir'),
             'similarity_threshold': 0.55,
             'llm_url':              LaunchConfiguration('llm_url'),
             'llm_model':            LaunchConfiguration('llm_model'),
@@ -435,7 +456,6 @@ def generate_launch_description():
         respawn_delay=2.0,
         parameters=[{
             'min_confidence': 0.55,
-            'savedir':        '/home/artur/.cache/speechbrain/voice_emotion',
         }],
     )
 
@@ -475,7 +495,7 @@ def generate_launch_description():
         respawn=True,
         respawn_delay=2.0,
         parameters=[{
-            'gallery_dir':           '/home/artur/inmoov_faces',
+            'gallery_dir':           LaunchConfiguration('gallery_dir'),
             'enroll_interval_sec':   1.0,
             'interact_interval_sec': 15.0,
             'min_det_score':         0.75,
@@ -578,6 +598,10 @@ def generate_launch_description():
             'keep_history':        True,
             'history_max_turns':   5,
             'openhab_url':         LaunchConfiguration('openhab_url'),
+            'vision_llm_url':      LaunchConfiguration('vision_llm_url'),
+            'tts_server_url':      LaunchConfiguration('tts_server_url'),
+            'tts_fallback_url':    LaunchConfiguration('tts_fallback_url'),
+            'cast_to_file_url':    LaunchConfiguration('cast_to_file_url'),
         }],
     )
 

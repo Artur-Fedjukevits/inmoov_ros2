@@ -7,7 +7,7 @@ test_camera_path.py — eye-camera frame path without cameras or models.
   face_detection: stores JPEG bytes, decodes only in _detect.
 
 Run:
-  cd /home/artur/ros2_ws && source install/setup.bash
+  cd ~/ros2_ws && source install/setup.bash
   python3 -m pytest src/inmoov_vision/test/test_camera_path.py -v
 """
 
