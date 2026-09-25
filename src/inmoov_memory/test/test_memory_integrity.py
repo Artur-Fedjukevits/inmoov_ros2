@@ -239,3 +239,67 @@ def test_session_commits_and_closes(tmp_path):
         c.execute('SELECT 1')                      # closed
     with session(path) as c:
         assert c.execute('SELECT v FROM t').fetchone()[0] == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram reminders: delivered only on the bridge's ACK
+
+class _Pub:
+    def __init__(self):
+        self.msgs = []
+
+    def publish(self, m):
+        self.msgs.append(json.loads(m.data))
+
+
+def _reminder_node(node, tmp_path):
+    from inmoov_memory.reminder_db import ReminderDB
+    node._reminder_db = ReminderDB(str(tmp_path / 'rem.db'))
+    node._tg_push_pub = _Pub()
+    node._tg_reminder_person_id = 5
+    rid = node._reminder_db.add_reminder(5, 'Артур', 'полить цветы', trigger_date='2000-01-01')
+    return rid
+
+
+def _ack(node, push_id, ok, error=''):
+    from std_msgs.msg import String
+    node._tg_push_ack_cb(String(data=json.dumps({'id': push_id, 'ok': ok, 'error': error})))
+
+
+def _delivered(node, rid):
+    return any(r['id'] == rid and r['delivered'] for r in node._reminder_db.list_reminders(5))
+
+
+def test_reminder_marked_delivered_only_after_ack(node, tmp_path):
+    rid = _reminder_node(node, tmp_path)
+    node._send_due_reminders_to_telegram()
+    assert node._tg_push_pub.msgs[0]['id'] == f'reminder:{rid}'
+    assert not _delivered(node, rid)
+
+    node._send_due_reminders_to_telegram()            # ACK pending → no duplicate
+    assert len(node._tg_push_pub.msgs) == 1
+
+    _ack(node, f'reminder:{rid}', True)
+    assert _delivered(node, rid)
+    node._send_due_reminders_to_telegram()
+    assert len(node._tg_push_pub.msgs) == 1           # delivered → not due any more
+
+
+def test_reminder_retried_after_failed_or_missing_ack(node, tmp_path):
+    rid = _reminder_node(node, tmp_path)
+    node._send_due_reminders_to_telegram()
+    _ack(node, f'reminder:{rid}', False, 'network down')
+    assert not _delivered(node, rid)
+    node._send_due_reminders_to_telegram()            # failed → sent again right away
+    assert len(node._tg_push_pub.msgs) == 2
+
+    node._tg_inflight[f'reminder:{rid}'] -= node._TG_ACK_TIMEOUT_SEC + 1   # no ACK for too long
+    node._send_due_reminders_to_telegram()
+    assert len(node._tg_push_pub.msgs) == 3
+
+
+def test_foreign_ack_ignored(node, tmp_path):
+    rid = _reminder_node(node, tmp_path)
+    _ack(node, f'reminder:{rid}', True)               # never sent by us
+    _ack(node, 'openhab:42', True)
+    assert not _delivered(node, rid)

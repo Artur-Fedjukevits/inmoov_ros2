@@ -168,3 +168,23 @@ def test_queued_command_dropped_when_introducing(monkeypatch):
     s._introducing = True
     LLMNode._dispatch_pending(s)
     assert s._queried == [] and s._processing is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# telegram_bridge push ACK
+
+def test_bridge_push_ack():
+    from inmoov_cognition.telegram_bridge_node import TelegramBridgeNode
+    pub = _Pub()
+    stub = types.SimpleNamespace(_ack_pub=pub, _allowed_chat_id=0, _loop=None,
+                                 get_logger=lambda: types.SimpleNamespace(warn=lambda *a: None))
+    stub._ack = lambda data, ok, error='': TelegramBridgeNode._ack(stub, data, ok, error)
+
+    TelegramBridgeNode._ack(stub, {'text': 'x', 'id': 'reminder:7'}, True)
+    TelegramBridgeNode._ack(stub, {'text': 'no id'}, True)          # no id → no ACK
+    assert [json.loads(m.data) for m in pub.msgs] == [{'id': 'reminder:7', 'ok': True}]
+
+    # No chat configured → immediate negative ACK instead of a silent drop
+    TelegramBridgeNode._telegram_push_cb(stub, String(data=json.dumps({'text': 'hi', 'id': 'reminder:8'})))
+    assert json.loads(pub.msgs[-1].data) == {'id': 'reminder:8', 'ok': False,
+                                             'error': 'no allowed_chat_id'}

@@ -116,6 +116,8 @@ class MemoryNode(LifecycleNode):
         self._tg_reminder_person_id = 5
         self._reminder_default_time = '07:00'
         self._sleeping        = False   # /robot_sleep latched state
+        # Telegram reminders sent but not yet ACKed: push id → monotonic send time
+        self._tg_inflight: dict[str, float] = {}
         self._bg_threads: list[threading.Thread] = []
         self._bg_lock         = threading.Lock()
 
@@ -198,6 +200,7 @@ class MemoryNode(LifecycleNode):
             reliability=ReliabilityPolicy.RELIABLE,
         )
         self.create_subscription(Bool, '/robot_sleep', self._robot_sleep_cb, _latched)
+        self.create_subscription(String, '/telegram_push_ack', self._tg_push_ack_cb, 10)
 
         # ── Lifecycle publishers (silent until on_activate is called) ──────
         self._ctx_pub     = self.create_lifecycle_publisher(String, '/memory/context', 10)
@@ -617,7 +620,10 @@ class MemoryNode(LifecycleNode):
     def _send_due_reminders_to_telegram(self):
         """Timer: checks overdue reminders (delivered=0) and sends them to Telegram.
 
-        Marks them delivered=1 after publishing — not sent again.
+        Marked delivered=1 only when telegram_bridge ACKs the push
+        (_tg_push_ack_cb). While an ACK is pending the reminder isn't re-sent;
+        a failed or unanswered push (bridge down, network) is retried on a later
+        tick instead of being lost.
         """
         import datetime as _dt
         import html as _html
@@ -634,18 +640,48 @@ class MemoryNode(LifecycleNode):
             self.get_logger().warn(f'TG reminder timer: get_due error: {e}')
             return
 
+        now = time.monotonic()
         for r in reminders:
+            push_id = f'reminder:{r["id"]}'
+            sent_at = self._tg_inflight.get(push_id)
+            if sent_at is not None and now - sent_at < self._TG_ACK_TIMEOUT_SEC:
+                continue   # waiting for the bridge's ACK
             text = f'⏰ <b>Напоминание:</b> {_html.escape(r["message"])}'
             try:
                 msg = String()
                 msg.data = json.dumps(
-                    {'text': text, 'parse_mode': 'HTML'}, ensure_ascii=False)
+                    {'text': text, 'parse_mode': 'HTML', 'id': push_id}, ensure_ascii=False)
                 self._tg_push_pub.publish(msg)
-                self._reminder_db.mark_delivered(r['id'])
+                self._tg_inflight[push_id] = now
                 self.get_logger().info(
-                    f'TG reminder: id={r["id"]} sent and marked delivered')
+                    f'TG reminder: id={r["id"]} sent'
+                    + (' (retry — no ACK)' if sent_at is not None else '')
+                    + ', waiting for ACK')
             except Exception as e:
                 self.get_logger().warn(f'TG reminder: send error id={r["id"]}: {e}')
+
+    _TG_ACK_TIMEOUT_SEC = 300.0   # no ACK this long → send again
+
+    def _tg_push_ack_cb(self, msg: String):
+        """telegram_bridge confirmed (or refused) a push we sent with an id."""
+        try:
+            ack = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        push_id = str(ack.get('id', ''))
+        if not push_id.startswith('reminder:') or push_id not in self._tg_inflight:
+            return
+        self._tg_inflight.pop(push_id, None)
+        rid = int(push_id.split(':', 1)[1])
+        if ack.get('ok'):
+            try:
+                self._reminder_db.mark_delivered(rid)
+                self.get_logger().info(f'TG reminder: id={rid} delivered ✓')
+            except Exception as e:
+                self.get_logger().warn(f'TG reminder: mark_delivered id={rid}: {e}')
+        else:
+            self.get_logger().warn(
+                f'TG reminder: id={rid} not delivered ({ack.get("error", "?")}) — will retry')
 
     def _publish_memory_context(self):
         """Publishes working memory + recent episodes to /memory/context."""

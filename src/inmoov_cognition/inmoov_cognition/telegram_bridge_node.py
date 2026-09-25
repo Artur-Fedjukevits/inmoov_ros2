@@ -28,7 +28,10 @@ Topics:
   /robot_sleep     (in/out latched)
   /telegram_ask    (out)  — request to llm_node
   /telegram_response (in) — response from llm_node
-  /telegram_push   (in)   — push notifications from other nodes (JSON: {"text": "..."})
+  /telegram_push   (in)   — push notifications from other nodes (JSON: {"text": "...",
+                             "parse_mode"?: "HTML", "id"?: "..."})
+  /telegram_push_ack (out) — for pushes with an "id": {"id", "ok", "error"?} once
+                             Telegram accepted (ok) or refused/failed (not ok) it
 Actions:
   speak — inmoov_msgs/action/Speak → tts_node
 
@@ -172,12 +175,14 @@ class TelegramBridgeNode(LifecycleNode):
 
         self._sleep_pub    = self.create_lifecycle_publisher(Bool, '/robot_sleep', _LATCHED)
         self._ask_pub      = self.create_lifecycle_publisher(String, '/telegram_ask', 10)
+        self._ack_pub      = self.create_lifecycle_publisher(String, '/telegram_push_ack', 10)
         self._speak_client = ActionClient(self, Speak, 'speak')
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
         self._sleep_pub.on_activate(state)
         self._ask_pub.on_activate(state)
+        self._ack_pub.on_activate(state)
         self._timer = self.create_timer(0.1, self._process_say_queue)
 
         self._token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
@@ -185,6 +190,7 @@ class TelegramBridgeNode(LifecycleNode):
             self.get_logger().warn('Telegram bridge: no token or chat_id — bot not started')
             return TransitionCallbackReturn.SUCCESS
 
+        self._bot_stop   = threading.Event()
         self._loop       = asyncio.new_event_loop()
         # Recreate the Queue for the new event loop — the old Queue is bound to
         # the previous loop and raises RuntimeError on re-activation.
@@ -200,24 +206,39 @@ class TelegramBridgeNode(LifecycleNode):
         if self._timer:
             self.destroy_timer(self._timer)
             self._timer = None
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._stop_bot()
         self._sleep_pub.on_deactivate(state)
         self._ask_pub.on_deactivate(state)
+        self._ack_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state):
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._stop_bot()
         return TransitionCallbackReturn.SUCCESS
 
     def on_error(self, state):
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._stop_bot()
         return TransitionCallbackReturn.SUCCESS
+
+    def _stop_bot(self, timeout: float = 10.0):
+        """Graceful stop: _run_bot sees the flag, stops polling and shuts the app down.
+
+        (loop.stop() used to kill run_until_complete mid-flight — 'Event loop stopped
+        before Future completed' — and left the old getUpdates poller running.)
+        """
+        stop = getattr(self, '_bot_stop', None)
+        if stop is not None:
+            stop.set()
+        t = getattr(self, '_tg_thread', None)
+        if t is not None and t.is_alive():
+            t.join(timeout)
+            if t.is_alive():
+                self.get_logger().warn('Telegram loop did not stop within '
+                                       f'{timeout:.0f}s — abandoned')
+        self._loop = None
 
     # ── ROS callbacks ────────────────────────────────────────────────────────
 
@@ -253,7 +274,7 @@ class TelegramBridgeNode(LifecycleNode):
         req_id = data.get('request_id', '')
         with self._pending_lock:
             q = self._pending.get(req_id)
-        if q and hasattr(self, '_loop'):
+        if q and getattr(self, '_loop', None) is not None:
             # thread-safe push into the asyncio event loop
             self._loop.call_soon_threadsafe(q.put_nowait, data)
 
@@ -283,9 +304,12 @@ class TelegramBridgeNode(LifecycleNode):
         except json.JSONDecodeError:
             data = {'text': msg.data}
         text = data.get('text', '').strip()
-        if not text or not self._allowed_chat_id:
+        if not text:
             return
-        if hasattr(self, '_loop'):
+        if not self._allowed_chat_id:
+            self._ack(data, False, 'no allowed_chat_id')
+            return
+        if getattr(self, '_loop', None) is not None:
             # Pass the whole dict along to preserve the sender's parse_mode
             self._loop.call_soon_threadsafe(self._push_queue.put_nowait, data)
 
@@ -834,8 +858,14 @@ class TelegramBridgeNode(LifecycleNode):
     # ── Telegram event loop ──────────────────────────────────────────────────
 
     def _run_telegram_loop(self):
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._run_bot())
+        loop = self._loop   # _stop_bot() clears self._loop — keep our own reference
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._run_bot())
+        except Exception as e:
+            self.get_logger().error(f'Telegram loop crashed: {e}')
+        finally:
+            loop.close()
 
     async def _push_sender(self, app):
         """Drains _push_queue and sends messages to Telegram.
@@ -843,7 +873,7 @@ class TelegramBridgeNode(LifecycleNode):
         Each queue element is a dict {"text": ..., "parse_mode": ...}.
         parse_mode comes from the payload; if not given — plain text (None).
         """
-        while rclpy.ok():
+        while rclpy.ok() and not self._bot_stop.is_set():
             try:
                 data = await asyncio.wait_for(self._push_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -859,8 +889,23 @@ class TelegramBridgeNode(LifecycleNode):
                     parse_mode=parse_mode,
                 )
                 self.get_logger().info(f'TG push sent: {text[:80]}')
+                self._ack(data, True)
             except Exception as e:
                 self.get_logger().warn(f'TG push error: {e}')
+                self._ack(data, False, str(e))
+
+    def _ack(self, data, ok: bool, error: str = '') -> None:
+        """/telegram_push_ack for pushes that carry an "id" (e.g. memory_node reminders)."""
+        push_id = data.get('id') if isinstance(data, dict) else None
+        if not push_id:
+            return
+        ack = {'id': push_id, 'ok': ok}
+        if error:
+            ack['error'] = error[:200]
+        try:
+            self._ack_pub.publish(String(data=json.dumps(ack, ensure_ascii=False)))
+        except Exception as e:
+            self.get_logger().warn(f'TG push ack publish failed: {e}')
 
     async def _run_bot(self):
         app = Application.builder().token(self._token).build()
@@ -883,8 +928,8 @@ class TelegramBridgeNode(LifecycleNode):
         await app.updater.start_polling(drop_pending_updates=True)
         self.get_logger().info('Telegram polling started')
 
-        while rclpy.ok():
-            await asyncio.sleep(1.0)
+        while rclpy.ok() and not self._bot_stop.is_set():
+            await asyncio.sleep(0.5)
 
         self.get_logger().info('Telegram: shutting down...')
         await app.updater.stop()
