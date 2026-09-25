@@ -195,9 +195,8 @@ class FakeCollection:
 
 
 def test_reconcile_chroma(tmp_path):
-    sm = SemanticMemory.__new__(SemanticMemory)
-    sm.db_path, sm._chroma = str(tmp_path / 'sem.db'), None
-    sm._init_db()
+    sm = SemanticMemory(str(tmp_path / 'sem.db'), str(tmp_path / 'no_chroma'))
+    sm._chroma = None
     sm.save_fact('Артур', 'любит', 'чай')          # Chroma was down: SQLite only
     sm.save_fact('Артур', 'живёт', 'Таллин')
     sm.save_fact('Никол', 'любит', 'кофе')
@@ -217,6 +216,33 @@ def test_reconcile_chroma(tmp_path):
     assert sm.reconcile_chroma() == {'upserted': 1, 'deleted': 1}
     assert fake.items[_chroma_id('Артур', 'любит')]['value'] == 'чай'
     assert 'deadbeef' not in fake.items
+
+
+
+def test_reconcile_does_not_delete_a_fact_saved_meanwhile(tmp_path):
+    """save_fact() running between reconcile's SQLite snapshot and its Chroma
+    delete must not lose the new fact (review 2026-09-26)."""
+    import threading
+    import time as _time
+    sm = SemanticMemory(str(tmp_path / 'sem.db'), str(tmp_path / 'no_chroma'))
+    fake = FakeCollection()
+    sm._chroma = fake
+    sm.save_fact('Артур', 'любит', 'чай')
+
+    writer = {}
+    orig_get = fake.get
+
+    def get_with_concurrent_save(include=None):
+        writer['t'] = threading.Thread(
+            target=lambda: sm.save_fact('Никол', 'любит', 'кофе'))
+        writer['t'].start()
+        _time.sleep(0.3)             # unserialised, the save completes right here
+        return orig_get(include)
+
+    fake.get = get_with_concurrent_save
+    sm.reconcile_chroma()
+    writer['t'].join(5)
+    assert _chroma_id('Никол', 'любит') in fake.items
 
 
 # ─────────────────────────────────────────────────────────────────────────────

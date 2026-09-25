@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import sqlite3
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -59,6 +60,10 @@ class SemanticMemory:
         self.db_path = db_path
         self.chroma_path = chroma_path
         self._chroma = None
+        # Serialises every SQLite+Chroma write pair with reconcile_chroma(): without
+        # it a fact saved between reconcile's SQLite snapshot and its Chroma delete
+        # was removed from the index as "extra".
+        self._write_lock = threading.RLock()
         self._init_db()
         self._init_chroma()
 
@@ -91,7 +96,12 @@ class SemanticMemory:
     # Writing facts
     # ------------------------------------------------------------------
 
-    def save_fact(
+    def save_fact(self, *args, **kwargs) -> int:
+        """Saves or updates a fact (SQLite + Chroma). Returns the record ID."""
+        with self._write_lock:
+            return self._save_fact(*args, **kwargs)
+
+    def _save_fact(
         self,
         subject: str,
         predicate: str,
@@ -253,6 +263,10 @@ class SemanticMemory:
 
     def delete_fact(self, subject: str, predicate: str) -> bool:
         """Deletes the fact from SQLite and its vector from ChromaDB."""
+        with self._write_lock:
+            return self._delete_fact(subject, predicate)
+
+    def _delete_fact(self, subject: str, predicate: str) -> bool:
         with self._conn() as conn:
             cur = conn.execute(
                 "DELETE FROM facts WHERE subject=? AND predicate=?",
@@ -271,6 +285,11 @@ class SemanticMemory:
     # ------------------------------------------------------------------
 
     def reconcile_chroma(self) -> dict:
+        """See _reconcile_chroma; holds the write lock for the whole snapshot→fix pass."""
+        with self._write_lock:
+            return self._reconcile_chroma()
+
+    def _reconcile_chroma(self) -> dict:
         """Brings the Chroma index in line with SQLite (the source of truth).
 
         save_fact/delete_fact write SQLite first and only log a Chroma failure, so
