@@ -1665,6 +1665,11 @@ class BehaviorManagerNode(LifecycleNode):
         action = event.get('action', '')
         self.get_logger().info(f'Event: {action}')
 
+        if action in ('move', 'arm', 'head') and self._bb.robot.sleep:
+            # SleepActive blocks the tree, so it would sit in the BB and run on WAKE —
+            # a stale motion out of nowhere. Asleep means no motion.
+            self.get_logger().warn(f'robot_events: {action} while asleep — dropped')
+            return
         if action in ('move', 'arm', 'head', 'status'):
             self._bb.robot.command = event
         elif action == 'sleep':
@@ -1803,6 +1808,7 @@ class BehaviorManagerNode(LifecycleNode):
     def _robot_sleep_cb(self, msg: Bool):
         """Synchronize the sleep mode from the latched topic."""
         self._bb.robot.sleep = msg.data
+        self._bb.robot.command = {}   # a pre-sleep command must not fire on WAKE
         if not msg.data:
             self._bb.robot.sleep_requested = False
             self._pir_next_scan_at = 0.0  # reset the cooldown — the wake word is more important

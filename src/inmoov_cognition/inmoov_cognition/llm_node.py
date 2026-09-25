@@ -59,6 +59,9 @@ from sensor_msgs.msg import CompressedImage
 from inmoov_msgs.action import Speak
 from inmoov_msgs.srv import MemoryQuery
 
+from inmoov_cognition.dialogue_guards import (
+    PendingUtterance, ToolAuditLog, filter_tools, parse_tool_list)
+
 
 # ── Tools (OpenAI tools API) ──────────────────────────────────────────
 TOOLS = [
@@ -1159,6 +1162,13 @@ class LLMNode(LifecycleNode):
         self.history         = []
         self._processing     = False
         self._lock           = threading.Lock()
+        # Voice command that arrived while _processing — run after the current reply
+        self._pending        = PendingUtterance(max_age_sec=30.0)
+        # Warmup is skipped once a real request ran; cancelled on deactivate
+        self._warmup_cancel  = threading.Event()
+        self._queried_since_activate = False
+        self._tg_denied_tools: frozenset = frozenset()
+        self._audit: ToolAuditLog | None = None
         self._tg_req_id:     str = ''   # request_id of the current Telegram request
         self._person_context = None
         # OpenHAB cache from openhab_bridge_node
@@ -1583,6 +1593,7 @@ class LLMNode(LifecycleNode):
         """
         if not msg.data:
             return
+        self._pending.clear()   # the person said goodbye — a queued phrase is moot
         with self._lock:
             history_snapshot      = self.history[:]
             person_ctx            = self._person_context
@@ -1596,6 +1607,7 @@ class LLMNode(LifecycleNode):
 
     def _robot_sleep_cb(self, msg: Bool):
         """Resets the dialogue history on entering/leaving sleep mode."""
+        self._pending.clear()
         with self._lock:
             history_snapshot = self.history[:]
             person_ctx       = self._person_context
@@ -1677,7 +1689,10 @@ class LLMNode(LifecycleNode):
                 self.get_logger().debug('LLM: /introducing=True — command ignored')
                 return
             if self._processing:
-                self.get_logger().warn('LLM is busy — command skipped')
+                replaced = self._pending.put(text)
+                self.get_logger().info(
+                    f'LLM is busy — command queued{" (replaced the previous one)" if replaced else ""}: '
+                    f'"{text[:60]}"')
                 return
             self._processing = True
         # Cancel any TTS chunks of the previous response still playing/pending
@@ -1728,7 +1743,8 @@ class LLMNode(LifecycleNode):
         threading.Thread(
             target=self._query_llm,
             args=(text,),
-            kwargs={'person_ctx_override': person_ctx, 'image_b64': image_b64},
+            kwargs={'person_ctx_override': person_ctx, 'image_b64': image_b64,
+                    'source': 'telegram'},
             daemon=True,
         ).start()
         self.get_logger().info(
@@ -1738,8 +1754,11 @@ class LLMNode(LifecycleNode):
     # ── Main LLM request ────────────────────────────────────────────────
 
     def _query_llm(self, user_text: str, person_ctx_override: dict | None = None,
-                    image_b64: str | None = None):
+                    image_b64: str | None = None, source: str = 'voice'):
         _t0 = time.time()
+        self._queried_since_activate = True
+        denied = self._tg_denied_tools if source == 'telegram' else frozenset()
+        tools  = filter_tools(TOOLS, denied)
         try:
             with self._lock:
                 person_ctx = (
@@ -1790,7 +1809,7 @@ class LLMNode(LifecycleNode):
             payload = {
                 'model':       self.model,
                 'messages':    messages,
-                'tools':       TOOLS,
+                'tools':       tools,
                 'stream':      False,
                 'temperature': self.temperature,
                 'max_tokens':  self.max_tokens,
@@ -1844,8 +1863,16 @@ class LLMNode(LifecycleNode):
                         args = json.loads(args)
                     args = dict(args)
                     st   = args.pop('speak_text', None)  # TTS meta-parameter
-                    self.get_logger().info(f'Tool call: {fn}({args})')
-                    res  = self._execute_tool(fn, args)
+                    self.get_logger().info(f'Tool call [{source}]: {fn}({args})')
+                    _tt = time.time()
+                    if fn in denied:
+                        # Not offered to the model for this source — refuse a hallucinated call
+                        st  = None
+                        res = {'success': False,
+                               'error': f'{fn} недоступен для запросов из {source}'}
+                    else:
+                        res = self._execute_tool(fn, args)
+                    self._audit.record(source, fn, args, res, time.time() - _tt)
                     self.get_logger().info(f'Tool result: {res}')
                     return fn, st, res, tc['id']
 
@@ -1917,7 +1944,7 @@ class LLMNode(LifecycleNode):
                     # from the user there, the LLM would hallucinate them.
                     # items_control is included: after search_openhab_items in R1 the LLM must
                     # be able to call it in R2 via a proper tool-call API.
-                    tools_r2 = [t for t in TOOLS
+                    tools_r2 = [t for t in tools
                                 if t['function']['name'] in (
                                     'set_voice_style', 'items_control')]
                     # Injecting a brief reminder right before the final answer:
@@ -2112,6 +2139,27 @@ class LLMNode(LifecycleNode):
         finally:
             with self._lock:
                 self._processing = False
+            self._dispatch_pending()
+
+    def _dispatch_pending(self):
+        """Runs the voice command that arrived while we were busy (if still fresh).
+
+        No /tts_cancel_queue here, unlike command_callback: the previous reply's
+        TTS may still be playing and the user should hear it — Speak goals queue.
+        """
+        text = self._pending.take()
+        if not text:
+            return
+        with self._lock:
+            if self._introducing:
+                self.get_logger().info(f'Queued command dropped (/introducing): "{text[:60]}"')
+                return
+            if self._processing:          # a Telegram request slipped in — keep waiting
+                self._pending.put(text)
+                return
+            self._processing = True
+        self.get_logger().info(f'Running queued command: "{text[:60]}"')
+        threading.Thread(target=self._query_llm, args=(text,), daemon=True).start()
 
     # ── Executing tool calls ────────────────────────────────────────────
 
@@ -2990,6 +3038,11 @@ class LLMNode(LifecycleNode):
         self._dp('tts_fallback_url',    '')
         self._dp('cast_volume',         80)
         self._dp('cast_to_file_url',    'http://192.168.10.118:8000/tts/to_file')
+        # Tools the LLM may NOT use for Telegram requests (comma-separated): nobody
+        # is necessarily next to the robot, so no motion and no destructive merges.
+        self._dp('telegram_tool_denylist', 'robot_control,look_direction,merge_persons')
+        # JSONL audit of every tool call ('' = off)
+        self._dp('tool_audit_log',      '~/.ros/inmoov_tool_audit.jsonl')
 
         # A separate vision model (look_and_describe/look_direction) — accepts
         # 2-4 base64 images in one request, an OpenAI-compatible /v1/chat/completions.
@@ -3022,6 +3075,9 @@ class LLMNode(LifecycleNode):
         self._tts_fallback_url = self.get_parameter('tts_fallback_url').value
         self._cast_volume      = self.get_parameter('cast_volume').value
         self._cast_to_file_url = self.get_parameter('cast_to_file_url').value
+        self._tg_denied_tools  = parse_tool_list(
+            self.get_parameter('telegram_tool_denylist').value)
+        self._audit            = ToolAuditLog(self.get_parameter('tool_audit_log').value)
         self._active_url       = self.llm_url
 
         _latched = QoSProfile(
@@ -3074,13 +3130,20 @@ class LLMNode(LifecycleNode):
         self._check_servers()
         # Background warmup: wait for the schema from openhab_bridge (10-15s), then
         # send a minimal request — loads the model and fills the KV cache.
+        self._warmup_cancel.clear()
+        self._queried_since_activate = False
         threading.Thread(target=self._warmup_llm, daemon=True).start()
         self.get_logger().info(f'LLM node ready. Model: {self.model}')
         return TransitionCallbackReturn.SUCCESS
 
     def _warmup_llm(self):
         """Warmup: load the model onto the GPU and fill the system-prompt KV cache."""
-        time.sleep(15.0)  # wait for openhab_bridge_node to publish the schema (every 10s)
+        # wait for openhab_bridge_node to publish the schema (every 10s)
+        if self._warmup_cancel.wait(15.0):
+            return   # deactivated
+        if self._queried_since_activate:
+            self.get_logger().info('LLM warmup skipped — a real request already warmed it')
+            return
         _t = time.time()
         try:
             with self._lock:
@@ -3105,6 +3168,8 @@ class LLMNode(LifecycleNode):
             self.get_logger().warn(f'LLM warmup: error {e}')
 
     def on_deactivate(self, state):
+        self._warmup_cancel.set()
+        self._pending.clear()
         self.event_pub.on_deactivate(state)
         self._response_pub.on_deactivate(state)
         self._tg_resp_pub.on_deactivate(state)
