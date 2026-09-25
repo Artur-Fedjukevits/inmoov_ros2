@@ -34,16 +34,28 @@ any custom API from the nodes it manages.
 
 **Behavior**
 
+- **Serial execution**: every operation — the commands, SLEEP/WAKE from
+  `/robot_sleep`, the watchdog's cascade and recovery — goes onto one queue
+  and is executed by a single worker thread, one at a time, so operations
+  never interleave. Each operation has a generation number: per-node
+  activation threads stop retrying once their operation is superseded, and
+  `SHUTDOWN` pre-empts the running operation. Queued SLEEP/WAKE apply the
+  *latest* requested sleep state, so a burst of toggles settles correctly.
 - **Startup**: after `autostart_delay_sec`, activates tiers 0→6 in order.
   Within a tier, all nodes are configured+activated in parallel threads, each
   with up to `retry_count` attempts (linearly increasing backoff:
   `retry_interval_sec * attempt`). If a `critical` node in a tier fails all
   retries, the tier — and the whole activation sequence — aborts and system
   state becomes `fault`. A non-critical failure just marks that node
-  `degraded` (reason `activation`) and the tier continues.
+  `degraded` (reason `activation`) and the tier continues. The whole tier
+  shares one `tier_advance_timeout_sec` deadline; a node still activating
+  after it is marked `degraded` (reason `timeout`) and the tier moves on.
+  When that node's thread finishes, a `RECONCILE` operation brings it to the
+  state wanted *now* (clears the mark, or deactivates it if the robot went to
+  sleep / was deactivated meanwhile).
 - **Watchdog**: starts `watchdog_startup_delay_sec` after the system reaches
   `active`, then polls `get_state` on every node every
-  `watchdog_interval_sec`. Detects two death scenarios: the service call gets
+  `watchdog_interval_sec` — detection only, actions are queued. Detects two death scenarios: the service call gets
   no response at all (process gone, no respawn yet), or the node answers but
   is back in `UNCONFIGURED` (process died and `ros2 launch respawn=True`
   already restarted it, but it hasn't been configured/activated again). A
@@ -51,10 +63,9 @@ any custom API from the nodes it manages.
   node in every tier above it (they're assumed to depend on it) and marks
   them `degraded` with reason `cascade_<tier_idx>`. Recovery
   (`_recover_node`) re-runs the normal activate-with-retry logic against the
-  respawned process; on success for a critical node it waits 3s (to avoid a
-  race with an in-flight `_cascade_deactivate`) then calls
-  `_cascade_recover`, which re-activates every tier that was cascade-degraded
-  because of this node. `max_respawn_count` caps how many times the watchdog
+  respawned process; it is queued after the cascade, so on success for a
+  critical node `_cascade_recover` re-activates every tier that was
+  cascade-degraded because of this node. `max_respawn_count` caps how many times the watchdog
   will attempt to recover a single node before giving up permanently.
 - **SLEEP / WAKE**: a fixed set of vision + VAD nodes
   (`_SLEEP_DEACTIVATE` in the source — `face_capture_node`,
@@ -86,7 +97,7 @@ any custom API from the nodes it manages.
 | `retry_count` | int | `3` | Activation attempts per node before giving up. |
 | `retry_interval_sec` | double | `10.0` | Base backoff between retries; actual wait is `retry_interval_sec * attempt`. |
 | `transition_timeout_sec` | double | `30.0` | Timeout waiting for a `change_state`/`get_state` service call. |
-| `tier_advance_timeout_sec` | double | `90.0` | Max time to wait (via `Thread.join`) for all nodes in a tier to finish activating before moving on. |
+| `tier_advance_timeout_sec` | double | `90.0` | One deadline for the whole tier; nodes still activating after it are marked `degraded(timeout)` and reconciled when they finish. |
 | `config_file` | string | `''` | Path to a YAML file (see `config/lifecycle.yaml`) defining `tiers` and overriding the parameters above. If empty, the manager waits for `configure_tiers()` to be called programmatically instead. |
 | `autostart_delay_sec` | double | `5.0` | Delay after startup before automatically activating tier 0. If tiers aren't configured yet, or this is `<= 0`, autostart is skipped and the manager waits in `idle` for an `ACTIVATE` command. |
 | `watchdog_interval_sec` | double | `5.0` | Polling interval for the watchdog loop. Set `<= 0` to disable the watchdog entirely. |
@@ -98,7 +109,7 @@ any custom API from the nodes it manages.
 
 | Topic | Type | Direction | Notes |
 |---|---|---|---|
-| `/lifecycle/status` | `std_msgs/String` (JSON) | publish, every 2s | `{system, sleep_mode, degraded_nodes[], recovering_nodes[], tiers: [{id, nodes: {name: {critical, degraded, degraded_reason, respawn_count, recovering, attempts}}}]}`. `system` is one of `idle` (no autostart, waiting for `ACTIVATE`), `starting`, `active`, `fault`, `degraded`, `sleep`, `waking`, `deactivated`, `shutdown`. |
+| `/lifecycle/status` | `std_msgs/String` (JSON) | publish, every 2s | `{system, sleep_mode, degraded_nodes[], recovering_nodes[], pending_ops, tiers: [{id, nodes: {name: {critical, degraded, degraded_reason, respawn_count, recovering, attempts}}}]}`. `system` is one of `idle` (no autostart, waiting for `ACTIVATE`), `starting`, `active`, `fault`, `degraded`, `sleep`, `waking`, `deactivated`, `shutdown`. |
 | `/lifecycle/command` | `std_msgs/String` | subscribe | Commands: `ACTIVATE`, `DEACTIVATE`, `SHUTDOWN`, `SLEEP`, `WAKE`, `RESTART_TIER <N>`. `DEACTIVATE` deactivates tiers N..1 top-down (Foundation stays active) and pauses the watchdog and SLEEP/WAKE transitions (the sleep flag is still remembered). `ACTIVATE` after `DEACTIVATE` re-activates tiers 1..N with a fresh retry budget (SLEEP-set nodes stay inactive if the robot is asleep); from `idle` or `fault` it runs the full tier 0..N activation; otherwise it is a no-op. |
 | `/robot_sleep` | `std_msgs/Bool` (latched, `TRANSIENT_LOCAL`/`RELIABLE`, depth 1) | subscribe | Drives the same SLEEP/WAKE logic as the command topic; published elsewhere in the system. |
 
@@ -107,15 +118,18 @@ any custom API from the nodes it manages.
 - `/<node_name>/change_state` (`lifecycle_msgs/srv/ChangeState`)
 - `/<node_name>/get_state` (`lifecycle_msgs/srv/GetState`)
 
-**Known issues / TODOs (from code comments)**
+**Known limitations**
 
-- `_recover_node`'s comment notes a deliberate 3-second sleep before
-  `_cascade_recover` to avoid a race where recovery could run before
-  `_cascade_deactivate` has finished marking all affected tiers
-  `cascade_<N>` — the sleep is a heuristic, not a synchronization guarantee.
-- `_cascade_recover` deliberately uses `continue` (not `break`) when a tier
-  wasn't cascade-degraded, since tiers can be marked `cascade_N` out of order
-  under race conditions with `_cascade_deactivate`.
+- A long operation (e.g. a recovery sitting in its retry back-off) delays
+  the operations queued behind it, including SLEEP/WAKE; only `SHUTDOWN`
+  pre-empts.
+- The watchdog sees process death only (`get_state` fails or the node is
+  back in `UNCONFIGURED`), not a node that is ACTIVE but no longer doing its
+  job.
+
+**Tests**: `test/test_lifecycle_manager.py` runs the manager against fake
+in-process lifecycle nodes (tier deadline + reconcile, SLEEP/WAKE bursts,
+crash → cascade → recovery, SHUTDOWN pre-emption).
 
 ## Launch
 

@@ -5,11 +5,23 @@ InmoovLifecycleManager — tier-based lifecycle orchestrator for the InMoov Robo
 Brings nodes up tier by tier (0..6) sequentially, in parallel within each tier.
 On failure: 3 attempts, then degraded (if the node isn't critical) or ABORT.
 
-Watchdog: periodically polls get_state on all nodes. On process death:
+Execution model: every operation — the commands below, SLEEP/WAKE from
+/robot_sleep, watchdog cascade/recovery — is put on ONE queue and executed by
+ONE worker thread, one operation at a time. Operations never interleave (no
+WAKE racing a cascade, no manual restart racing a recovery). Each operation
+gets a generation number; per-node activation threads stop retrying once their
+operation is no longer current, and SHUTDOWN pre-empts whatever is running.
+
+Tier activation has ONE deadline (tier_advance_timeout_sec) for the whole tier.
+A node still activating after it is marked degraded('timeout'); when its thread
+finishes, a RECONCILE operation brings it to the state the system wants *now*
+(e.g. deactivates it if the robot went to sleep meanwhile).
+
+Watchdog: periodically polls get_state on all nodes (detection only). On process death:
   - marks degraded_reason='watchdog'
-  - if the node is critical — cascades deactivation to all tiers above it
-  - on respawn (ros2 launch respawn=True) — automatically re-activates the node
-    and cascades the dependent tiers back up
+  - if the node is critical — queues a cascade deactivation of all tiers above it
+  - on respawn (ros2 launch respawn=True) — queues re-activation of the node
+    and of the cascaded tiers
 
 Control via the /lifecycle/command topic:
   ACTIVATE        — bring the whole system up (automatic on startup); after
@@ -19,7 +31,7 @@ Control via the /lifecycle/command topic:
                     watchdog and SLEEP/WAKE transitions are paused until ACTIVATE
   SLEEP           — deactivate vision, keep voice/LLM
   WAKE            — reactivate after SLEEP
-  SHUTDOWN        — shutdown all nodes
+  SHUTDOWN        — shutdown all nodes (pre-empts the running operation)
   RESTART_TIER N  — restart a specific tier
 
 Status is published on /lifecycle/status (JSON), including degraded_nodes[].
@@ -30,8 +42,9 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import json
-import time
+import queue
 import threading
+import time
 import yaml
 from typing import Optional
 
@@ -68,20 +81,26 @@ _SLEEP_DEACTIVATE = {
 
 # Degradation reasons
 _REASON_ACTIVATION = 'activation'   # failure during initial activation
+_REASON_TIMEOUT    = 'timeout'      # still activating when the tier deadline passed
 _REASON_WATCHDOG   = 'watchdog'     # process died (SIGKILL, OOM, segfault)
 _REASON_CASCADE    = 'cascade'      # cascade deactivation due to a node dying below
+
+
+class _Stale(Exception):
+    """The operation this work belongs to is no longer current."""
 
 
 class ManagedNode:
     """State of a single managed node."""
 
-    def __init__(self, name: str, critical: bool):
+    def __init__(self, name: str, critical: bool, tier: int):
         self.name = name
         self.critical = critical
+        self.tier = tier
         self.degraded = False
         self.degraded_reason = ''   # _REASON_* constant
         self.respawn_count = 0      # how many times the watchdog has brought the node back up
-        self.recovering = False     # recovery currently in progress
+        self.recovering = False     # recovery queued or in progress
         self.attempts = 0
         self._change_state_cli = None
         self._get_state_cli = None
@@ -94,8 +113,8 @@ class ManagedNode:
 
 class InmoovLifecycleManager(Node):
 
-    def __init__(self):
-        super().__init__('lifecycle_manager')
+    def __init__(self, **kwargs):
+        super().__init__('lifecycle_manager', **kwargs)
 
         # Parameters
         self.declare_parameter('retry_count',                3)
@@ -146,10 +165,18 @@ class InmoovLifecycleManager(Node):
         self._all_nodes: dict[str, ManagedNode] = {}
         self._system_state = 'starting'
         self._sleep_mode = False
-        self._lock = threading.Lock()
+        self._sleep_nodes = set(_SLEEP_DEACTIVATE)
         self._startup_timer = None
         self._watchdog_stop = threading.Event()
         self._watchdog_started = False
+
+        # Serial execution: one queue, one worker
+        self._ops: queue.Queue = queue.Queue()
+        self._op_gen = 0                     # bumped at the start of every operation
+        self._gen_lock = threading.Lock()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True,
+                                        name='lifecycle_worker')
+        self._worker.start()
 
         # Status publishing timer
         self._status_timer = self.create_timer(2.0, self._publish_status)
@@ -211,12 +238,13 @@ class InmoovLifecycleManager(Node):
     def configure_tiers(self, tiers_cfg: list[dict]):
         """Initialize tiers from the config. Immediately creates all service clients."""
         for tier_cfg in tiers_cfg:
+            tier_idx = len(self._tiers)
             tier_nodes = []
             critical_set = set(tier_cfg.get('critical', []))
             for node_name in tier_cfg['nodes']:
                 if node_name in self._disabled_nodes:
                     continue
-                mn = ManagedNode(node_name, critical=(node_name in critical_set))
+                mn = ManagedNode(node_name, critical=(node_name in critical_set), tier=tier_idx)
                 self._all_nodes[node_name] = mn
                 tier_nodes.append(mn)
             self._tiers.append(tier_nodes)
@@ -233,7 +261,76 @@ class InmoovLifecycleManager(Node):
                 f'Disabled by launch (not managed): {sorted(self._disabled_nodes)}')
 
     def start_activation(self):
-        threading.Thread(target=self._activate_all, daemon=True).start()
+        self._enqueue('ACTIVATE_ALL')
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Operation queue
+
+    def _enqueue(self, op: str, *args):
+        self._ops.put((op, args))
+
+    def _worker_loop(self):
+        handlers = {
+            'ACTIVATE_ALL': self._activate_all,
+            'ACTIVATE':     self._do_activate,
+            'DEACTIVATE':   self._do_deactivate,
+            'SLEEP':        self._do_sleep,
+            'WAKE':         self._do_wake,
+            'SHUTDOWN':     self._do_shutdown,
+            'RESTART_TIER': self._restart_tier,
+            'CASCADE':      self._cascade_deactivate,
+            'RECOVER':      self._recover_node,
+            'RECONCILE':    self._reconcile_node,
+        }
+        while True:
+            op, args = self._ops.get()
+            if op == '_STOP':
+                return
+            gen = self._next_gen()
+            if self._system_state == 'shutdown' and op != 'SHUTDOWN':
+                continue
+            try:
+                handlers[op](gen, *args)
+            except _Stale:
+                self.get_logger().info(f'{op}: pre-empted')
+            except Exception as e:
+                self.get_logger().error(f'{op} failed: {e}')
+            self._publish_status()
+
+    def _next_gen(self) -> int:
+        with self._gen_lock:
+            self._op_gen += 1
+            return self._op_gen
+
+    def _is_stale(self, gen: int) -> bool:
+        return gen != self._op_gen
+
+    def _check(self, gen: int):
+        if self._is_stale(gen):
+            raise _Stale()
+
+    def _sleep_unless_stale(self, sec: float, gen: int):
+        deadline = time.monotonic() + sec
+        while time.monotonic() < deadline:
+            self._check(gen)
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+    def _desired_active(self, mn: ManagedNode) -> bool:
+        """Should this node be ACTIVE given the current system state?"""
+        if self._system_state in ('shutdown', 'fault'):
+            return False
+        if self._system_state == 'deactivated' and mn.tier > 0:
+            return False
+        if self._sleep_mode and mn.name in self._sleep_nodes:
+            return False
+        return True
+
+    def _settled_state(self) -> str:
+        """System state once an operation completes normally."""
+        if any(mn.degraded and mn.degraded_reason not in (_REASON_ACTIVATION, _REASON_TIMEOUT)
+               for mn in self._all_nodes.values()):
+            return 'degraded'   # watchdog / cascade damage still outstanding
+        return 'sleep' if self._sleep_mode else 'active'
 
     # ──────────────────────────────────────────────────────────────────────────
     # Service clients
@@ -285,13 +382,19 @@ class InmoovLifecycleManager(Node):
             return None
         return future.result().current_state.id
 
-    def _configure_and_activate(self, mn: ManagedNode) -> bool:
+    def _configure_and_activate(self, mn: ManagedNode, gen: Optional[int] = None) -> bool:
+        """gen: stop before each transition if that operation is no longer current.
+        A transition already sent always runs to completion."""
         state = self._get_state(mn.name)
         if state == _STATE_ACTIVE:
             return True
         if state != _STATE_INACTIVE:
+            if gen is not None:
+                self._check(gen)
             if not self._send_transition(mn.name, _CONFIGURE):
                 return False
+        if gen is not None:
+            self._check(gen)
         if not self._send_transition(mn.name, _ACTIVATE):
             return False
         return self._get_state(mn.name) == _STATE_ACTIVE
@@ -301,6 +404,7 @@ class InmoovLifecycleManager(Node):
 
         An invalid transition (e.g. DEACTIVATE of an already INACTIVE node) makes
         rclpy raise inside the node's change_state service and kills the process.
+        Only the worker thread calls this, so two DEACTIVATEs can't race.
         """
         if self._get_state(node_name) != _STATE_ACTIVE:
             return True
@@ -316,38 +420,42 @@ class InmoovLifecycleManager(Node):
         if state == _STATE_UNCONFIGURED:
             self._send_transition(node_name, _SHUTDOWN)
 
-    def _activate_node_with_retry(self, mn: ManagedNode) -> bool:
+    def _activate_node_with_retry(self, mn: ManagedNode, gen: int) -> bool:
+        """Raises _Stale if the operation that asked for it is superseded."""
         for attempt in range(1, self._retry_count + 1):
+            self._check(gen)
             mn.attempts = attempt
             self.get_logger().info(f'{mn.name}: attempt {attempt}/{self._retry_count}...')
-            if self._configure_and_activate(mn):
+            if self._configure_and_activate(mn, gen):
                 self.get_logger().info(f'{mn.name}: ACTIVE ✓')
                 return True
             if attempt < self._retry_count:
                 wait = self._retry_interval * attempt
                 self.get_logger().warn(f'{mn.name}: failed, waiting {wait:.0f}s...')
-                time.sleep(wait)
+                self._sleep_unless_stale(wait, gen)
         return False
 
     # ──────────────────────────────────────────────────────────────────────────
     # System activation
 
-    def _activate_all(self):
+    def _activate_all(self, gen: int):
         self._system_state = 'starting'
         self._publish_status()
 
         for tier_idx, tier in enumerate(self._tiers):
+            self._check(gen)
             self.get_logger().info(f'═══ Tier {tier_idx}: activating {len(tier)} nodes ═══')
-            if not self._activate_tier(tier_idx, tier):
+            if not self._activate_tier(tier_idx, tier, gen):
                 self.get_logger().error(
                     f'Tier {tier_idx}: critical node failed activation — ABORT')
                 self._system_state = 'fault'
-                self._publish_status()
                 return
 
-        self._system_state = 'active'
+        self._system_state = self._settled_state()
         self.get_logger().info('══ System fully activated ══')
-        self._publish_status()
+        if self._sleep_mode:
+            # /robot_sleep arrived during startup — honour it now
+            self._deactivate_sleep_nodes()
 
         # Start the watchdog after full activation + startup_delay (once — ACTIVATE
         # after a fault re-runs this method)
@@ -355,26 +463,57 @@ class InmoovLifecycleManager(Node):
             self._watchdog_started = True
             threading.Thread(target=self._watchdog_start, daemon=True).start()
 
-    def _activate_tier(self, tier_idx: int, tier: list[ManagedNode]) -> bool:
-        """Parallel activation of a tier's nodes. False = critical failure."""
-        threads = []
+    def _activate_tier(self, tier_idx: int, tier: list[ManagedNode], gen: int) -> bool:
+        """Parallel activation of a tier's nodes under ONE deadline. False = critical failure.
+
+        A node still activating at the deadline is marked degraded('timeout') and
+        the tier moves on; its thread keeps going (or stops if the operation is
+        superseded) and then queues RECONCILE for that node.
+        """
+        results: dict[str, Optional[bool]] = {}
+        late: set[str] = set()
+        late_lock = threading.Lock()
 
         def activate_one(mn):
             try:
-                ok = self._activate_node_with_retry(mn)
+                ok = self._activate_node_with_retry(mn, gen)
+            except _Stale:
+                ok = None
             except Exception as e:
                 self.get_logger().error(f'{mn.name}: exception during activation: {e}')
                 ok = False
-            if not ok:
-                mn.degraded = True
-                mn.degraded_reason = _REASON_ACTIVATION
+            with late_lock:
+                results[mn.name] = ok
+                is_late = mn.name in late
+            if is_late:
+                self._enqueue('RECONCILE', mn)
 
+        threads = []
         for mn in tier:
             t = threading.Thread(target=activate_one, args=(mn,), daemon=True)
-            threads.append(t)
+            threads.append((mn, t))
             t.start()
-        for t in threads:
-            t.join(timeout=self._tier_timeout)
+        deadline = time.monotonic() + self._tier_timeout
+        for _, t in threads:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        stale = False
+        with late_lock:
+            for mn, _ in threads:
+                if mn.name not in results:
+                    late.add(mn.name)
+                    mn.degraded = True
+                    mn.degraded_reason = _REASON_TIMEOUT
+                    self.get_logger().warn(
+                        f'{mn.name}: still activating after the {self._tier_timeout:.0f}s '
+                        f'tier deadline — degraded(timeout), will reconcile when it finishes')
+                elif results[mn.name] is None:
+                    stale = True
+                elif not results[mn.name]:
+                    mn.degraded = True
+                    mn.degraded_reason = _REASON_ACTIVATION
+        if stale:
+            raise _Stale()
 
         degraded = [mn for mn in tier if mn.degraded]
         active   = [mn for mn in tier if not mn.degraded]
@@ -390,8 +529,25 @@ class InmoovLifecycleManager(Node):
         self._publish_status()
         return True
 
+    def _reconcile_node(self, gen: int, mn: ManagedNode):
+        """A late activation finished: bring the node to what the system wants now."""
+        state = self._get_state(mn.name)
+        want = self._desired_active(mn)
+        if state == _STATE_ACTIVE and not want:
+            self.get_logger().info(f'Reconcile: {mn.name} came up late but must be INACTIVE now')
+            self._deactivate_if_active(mn.name)
+        if mn.degraded_reason != _REASON_TIMEOUT:
+            return
+        if state == _STATE_ACTIVE:
+            mn.degraded = False
+            mn.degraded_reason = ''
+            self.get_logger().info(f'Reconcile: {mn.name} finished late — OK ✓')
+        else:
+            mn.degraded_reason = _REASON_ACTIVATION
+            self.get_logger().warn(f'Reconcile: {mn.name} finished late and is not ACTIVE')
+
     # ──────────────────────────────────────────────────────────────────────────
-    # Watchdog
+    # Watchdog (detection only — actions go through the queue)
 
     def _watchdog_start(self):
         """Waits startup_delay, then starts the watchdog loop."""
@@ -403,7 +559,7 @@ class InmoovLifecycleManager(Node):
             return
         self.get_logger().info('Watchdog active')
         while not self._watchdog_stop.is_set():
-            if self._system_state != 'deactivated':   # nodes are INACTIVE on purpose
+            if self._system_state not in ('deactivated', 'shutdown'):   # nodes are INACTIVE on purpose
                 self._watchdog_check_all()
             self._watchdog_stop.wait(timeout=self._watchdog_interval)
 
@@ -424,7 +580,7 @@ class InmoovLifecycleManager(Node):
                 state = self._get_state(mn.name, timeout_sec=2.0)
 
                 if not mn.degraded:
-                    # The node should be ACTIVE — any other state is suspicious
+                    # The node should be ACTIVE (or INACTIVE on purpose) — died otherwise
                     if state is None or state == _STATE_UNCONFIGURED:
                         cause = 'not responding' if state is None else 'in UNCONFIGURED (crash+respawn)'
                         self.get_logger().error(f'Watchdog: {mn.name} {cause} — degraded!')
@@ -432,11 +588,9 @@ class InmoovLifecycleManager(Node):
                         mn.degraded_reason = _REASON_WATCHDOG
                         self._publish_status()
                         if mn.critical:
-                            threading.Thread(
-                                target=self._cascade_deactivate,
-                                args=(tier_idx,), daemon=True).start()
-                        # Scenario B: process already alive → start recovery immediately
-                        if state == _STATE_UNCONFIGURED and not mn.recovering:
+                            self._enqueue('CASCADE', tier_idx)
+                        # Scenario B: process already alive → recovery right after the cascade
+                        if state == _STATE_UNCONFIGURED:
                             self._start_recovery(mn, tier_idx)
 
                 elif mn.degraded_reason == _REASON_WATCHDOG and not mn.recovering:
@@ -445,84 +599,72 @@ class InmoovLifecycleManager(Node):
                         self._start_recovery(mn, tier_idx)
 
     def _start_recovery(self, mn: ManagedNode, tier_idx: int):
-        """Starts recovery in the background if the limit hasn't been exhausted."""
+        """Queues recovery if the limit hasn't been exhausted."""
+        if mn.recovering:
+            return
         if mn.respawn_count >= self._max_respawn_count:
             self.get_logger().error(
                 f'Watchdog: {mn.name} reached max_respawn_count={self._max_respawn_count}')
             return
         mn.respawn_count += 1
+        mn.recovering = True
         self.get_logger().info(
-            f'Watchdog: {mn.name} starting recovery '
+            f'Watchdog: {mn.name} queueing recovery '
             f'(attempt {mn.respawn_count}/{self._max_respawn_count})')
-        threading.Thread(
-            target=self._recover_node, args=(mn, tier_idx), daemon=True).start()
+        self._enqueue('RECOVER', mn, tier_idx)
 
-    def _cascade_deactivate(self, failed_tier_idx: int):
+    def _cascade_deactivate(self, gen: int, failed_tier_idx: int):
         """Deactivates all tiers above failed_tier_idx (they depended on the failed node)."""
         self.get_logger().warn(
             f'Cascade deactivation: tiers {failed_tier_idx+1}…{len(self._tiers)-1}')
         for tier_idx in range(len(self._tiers) - 1, failed_tier_idx, -1):
-            tier = self._tiers[tier_idx]
-            active = [mn for mn in tier if not mn.degraded]
+            active = [mn for mn in self._tiers[tier_idx] if not mn.degraded]
             if not active:
                 continue
-            threads = [
-                threading.Thread(
-                    target=self._deactivate_if_active,
-                    args=(mn.name,),
-                    daemon=True,
-                )
-                for mn in active
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=self._trans_timeout)
+            self._parallel(self._deactivate_if_active, [mn.name for mn in active],
+                           self._trans_timeout)
             for mn in active:
                 mn.degraded = True
                 mn.degraded_reason = f'{_REASON_CASCADE}_{failed_tier_idx}'
         self._system_state = 'degraded'
-        self._publish_status()
 
-    def _recover_node(self, mn: ManagedNode, tier_idx: int):
-        """Re-activates a resurrected node; on success — cascades the dependent tiers back up."""
-        mn.recovering = True
+    def _recover_node(self, gen: int, mn: ManagedNode, tier_idx: int):
+        """Re-activates a resurrected node; on success — brings the cascaded tiers back up.
+
+        Runs after any CASCADE queued before it, so the cascade marks are final.
+        """
         mn.degraded = True  # keep degraded for the duration of the attempt
         try:
-            ok = self._activate_node_with_retry(mn)
+            ok = self._activate_node_with_retry(mn, gen)
             # Asleep (or DEACTIVATE'd meanwhile): the node must not stay ACTIVE —
             # bring it back up (configure) but leave it INACTIVE like its siblings.
-            if ok and ((self._sleep_mode and mn.name in _SLEEP_DEACTIVATE)
-                       or self._system_state == 'deactivated'):
+            if ok and not self._desired_active(mn):
                 self._deactivate_if_active(mn.name)
+        except Exception as e:
+            self.get_logger().error(f'Watchdog: {mn.name} recovery error: {e!r}')
+            ok = False
         finally:
             mn.recovering = False
-        if ok:
-            mn.degraded = False
-            mn.degraded_reason = ''
-            self.get_logger().info(f'Watchdog: {mn.name} successfully recovered ✓')
-            if mn.critical:
-                # Wait for _cascade_deactivate to finish (it starts in parallel).
-                # Without the pause, _cascade_recover could run before all
-                # tiers are marked 'cascade_N' and skip them via the early break.
-                time.sleep(3.0)
-                self._cascade_recover(tier_idx)
-        else:
+        if not ok:
             mn.degraded = True
             mn.degraded_reason = _REASON_WATCHDOG
             self.get_logger().error(f'Watchdog: {mn.name} failed to recover')
-        self._publish_status()
+            return
+        mn.degraded = False
+        mn.degraded_reason = ''
+        self.get_logger().info(f'Watchdog: {mn.name} successfully recovered ✓')
+        if mn.critical:
+            self._cascade_recover(gen, tier_idx)
+        elif self._system_state == 'degraded':
+            self._system_state = self._settled_state()
 
-    def _cascade_recover(self, recovered_tier_idx: int):
+    def _cascade_recover(self, gen: int, recovered_tier_idx: int):
         """After a critical node recovers — brings cascade-degraded tiers back up."""
         cascade_prefix = f'{_REASON_CASCADE}_{recovered_tier_idx}'
         for tier_idx in range(recovered_tier_idx + 1, len(self._tiers)):
-            tier = self._tiers[tier_idx]
-            to_recover = [mn for mn in tier if mn.degraded_reason == cascade_prefix]
+            to_recover = [mn for mn in self._tiers[tier_idx]
+                          if mn.degraded_reason == cascade_prefix]
             if not to_recover:
-                # This tier wasn't cascade-degraded — skip it, but keep going.
-                # (not break — due to a race with cascade_deactivate, some tiers may
-                #  get marked cascade_N later than when we check the first tier)
                 continue
             self.get_logger().info(
                 f'Cascade recovery of tier {tier_idx} ({len(to_recover)} nodes)...')
@@ -530,19 +672,16 @@ class InmoovLifecycleManager(Node):
                 mn.degraded = False
                 mn.degraded_reason = ''
                 mn.attempts = 0
-            self._activate_tier(tier_idx, to_recover)
+            self._activate_tier(tier_idx, to_recover, gen)
             if self._sleep_mode:   # asleep — SLEEP-set nodes go back to INACTIVE
                 for mn in to_recover:
-                    if mn.name in _SLEEP_DEACTIVATE:
+                    if mn.name in self._sleep_nodes:
                         self._deactivate_if_active(mn.name)
             self._publish_status()
 
-        # If all nodes have recovered — return system_state to 'active'
-        all_ok = all(not mn.degraded for tier in self._tiers for mn in tier)
-        if all_ok:
-            self._system_state = 'active'
+        self._system_state = self._settled_state()
+        if self._system_state != 'degraded':
             self.get_logger().info('Watchdog: full system recovery ✓')
-            self._publish_status()
 
     # ──────────────────────────────────────────────────────────────────────────
     # SLEEP / WAKE
@@ -551,30 +690,35 @@ class InmoovLifecycleManager(Node):
         if msg.data and not self._sleep_mode:
             self.get_logger().info('robot_sleep → SLEEP: deactivating vision')
             self._sleep_mode = True
-            threading.Thread(target=self._do_sleep, daemon=True).start()
+            self._enqueue('SLEEP')
         elif not msg.data and self._sleep_mode:
             self.get_logger().info('robot_sleep → WAKE: reactivating vision')
             self._sleep_mode = False
-            threading.Thread(target=self._do_wake, daemon=True).start()
+            self._enqueue('WAKE')
 
-    def _do_sleep(self):
-        if self._system_state == 'deactivated':
-            return   # _sleep_mode is remembered; ACTIVATE will honour it
-        self._system_state = 'sleep'
-        for name in _SLEEP_DEACTIVATE:
-            if name in self._all_nodes and not self._all_nodes[name].degraded:
-                self._deactivate_if_active(name)
-        self._publish_status()
+    def _deactivate_sleep_nodes(self):
+        names = [n for n in self._sleep_nodes
+                 if n in self._all_nodes and not self._all_nodes[n].degraded]
+        self._parallel(self._deactivate_if_active, names, self._trans_timeout)
 
-    def _do_wake(self):
-        if self._system_state == 'deactivated':
+    def _do_sleep(self, gen: int):
+        # _sleep_mode is the desired state; the queue may hold SLEEP, WAKE, SLEEP…
+        # so each op applies the CURRENT desire (a stale SLEEP after WAKE is a no-op).
+        if not self._sleep_mode or self._system_state in ('deactivated', 'starting', 'fault', 'idle'):
+            return   # ACTIVATE / the end of startup honours _sleep_mode
+        self._deactivate_sleep_nodes()
+        self._system_state = self._settled_state()
+
+    def _do_wake(self, gen: int):
+        if self._sleep_mode or self._system_state in ('deactivated', 'starting', 'fault', 'idle'):
             return
         self._system_state = 'waking'
-        for name in _SLEEP_DEACTIVATE:
-            if name in self._all_nodes and not self._all_nodes[name].degraded:
-                self._configure_and_activate(self._all_nodes[name])
-        self._system_state = 'active'
         self._publish_status()
+        names = [n for n in self._sleep_nodes
+                 if n in self._all_nodes and not self._all_nodes[n].degraded]
+        self._parallel(lambda n: self._configure_and_activate(self._all_nodes[n]),
+                       names, 2 * self._trans_timeout)
+        self._system_state = self._settled_state()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Control commands
@@ -584,120 +728,109 @@ class InmoovLifecycleManager(Node):
         self.get_logger().info(f'/lifecycle/command: {cmd}')
 
         if cmd == 'SHUTDOWN':
-            threading.Thread(target=self._do_shutdown, daemon=True).start()
-        elif cmd == 'ACTIVATE':
-            threading.Thread(target=self._do_activate, daemon=True).start()
-        elif cmd == 'DEACTIVATE':
-            threading.Thread(target=self._do_deactivate, daemon=True).start()
+            self._watchdog_stop.set()
+            self._next_gen()               # pre-empt the running operation
+            self._enqueue('SHUTDOWN')
+        elif cmd in ('ACTIVATE', 'DEACTIVATE'):
+            self._enqueue(cmd)
         elif cmd == 'SLEEP':
             self._sleep_mode = True
-            threading.Thread(target=self._do_sleep, daemon=True).start()
+            self._enqueue('SLEEP')
         elif cmd == 'WAKE':
             self._sleep_mode = False
-            threading.Thread(target=self._do_wake, daemon=True).start()
+            self._enqueue('WAKE')
         elif cmd.startswith('RESTART_TIER '):
             try:
-                tier_idx = int(cmd.split()[1])
-                threading.Thread(
-                    target=self._restart_tier, args=(tier_idx,), daemon=True).start()
+                self._enqueue('RESTART_TIER', int(cmd.split()[1]))
             except (IndexError, ValueError):
                 self.get_logger().error(f'Invalid format: {cmd}')
         else:
             self.get_logger().warn(f'Unknown command: {cmd}')
 
-    def _do_deactivate(self):
+    def _do_deactivate(self, gen: int):
         """DEACTIVATE: deactivates tiers N..1 (top-down); Foundation (tier 0) stays active."""
-        with self._lock:
-            if self._system_state in ('starting', 'waking', 'deactivated', 'shutdown'):
-                self.get_logger().warn(f'DEACTIVATE ignored in state {self._system_state}')
-                return
-            self._system_state = 'deactivated'
+        if self._system_state in ('deactivated', 'shutdown'):
+            self.get_logger().warn(f'DEACTIVATE ignored in state {self._system_state}')
+            return
+        self._system_state = 'deactivated'
         self._publish_status()
         for tier in reversed(self._tiers[1:]):
-            threads = [
-                threading.Thread(
-                    target=self._deactivate_if_active, args=(mn.name,), daemon=True)
-                for mn in tier if not mn.degraded
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=self._trans_timeout)
+            self._parallel(self._deactivate_if_active,
+                           [mn.name for mn in tier if not mn.degraded], self._trans_timeout)
         self.get_logger().info('DEACTIVATE done: only Foundation (tier 0) is active')
-        self._publish_status()
 
-    def _do_activate(self):
+    def _do_activate(self, gen: int):
         """ACTIVATE: brings the system (back) up.
 
         After DEACTIVATE — re-activates tiers 1..N (every node gets a fresh retry
         budget; SLEEP-set nodes stay inactive if the robot is asleep). After a fault
         or if the initial activation never ran — runs the full tier 0..N activation.
         """
-        with self._lock:
-            state = self._system_state
-            if state in ('starting', 'waking', 'shutdown'):
-                self.get_logger().warn(f'ACTIVATE ignored in state {state}')
-                return
-            if state not in ('deactivated', 'fault') and self._startup_timer is None \
-                    and self._watchdog_started:
-                self.get_logger().info(f'ACTIVATE: system already up ({state})')
-                return
-            self._system_state = 'starting'
+        state = self._system_state
+        if state == 'shutdown':
+            self.get_logger().warn('ACTIVATE ignored after SHUTDOWN')
+            return
+        if state not in ('deactivated', 'fault') and self._startup_timer is None \
+                and self._watchdog_started:
+            self.get_logger().info(f'ACTIVATE: system already up ({state})')
+            return
         if state != 'deactivated':
             if self._startup_timer is not None:
                 self.destroy_timer(self._startup_timer)
                 self._startup_timer = None
-            self._activate_all()
+            self._activate_all(gen)
             return
 
+        self._system_state = 'starting'
         self._publish_status()
         for tier_idx, tier in enumerate(self._tiers):
             if tier_idx == 0:
                 continue
             nodes = [mn for mn in tier
-                     if not (self._sleep_mode and mn.name in _SLEEP_DEACTIVATE)]
+                     if not (self._sleep_mode and mn.name in self._sleep_nodes)]
             for mn in nodes:
                 mn.degraded = False
                 mn.degraded_reason = ''
                 mn.attempts = 0
-            if not self._activate_tier(tier_idx, nodes):
+            if not self._activate_tier(tier_idx, nodes, gen):
                 self._system_state = 'fault'
-                self._publish_status()
                 return
-        self._system_state = 'sleep' if self._sleep_mode else 'active'
+        self._system_state = self._settled_state()
         self.get_logger().info('ACTIVATE done')
-        self._publish_status()
 
-    def _restart_tier(self, tier_idx: int):
+    def _restart_tier(self, gen: int, tier_idx: int):
         if tier_idx >= len(self._tiers):
             self.get_logger().error(f'Tier {tier_idx} does not exist')
             return
-        tier = self._tiers[tier_idx]
+        tier = [mn for mn in self._tiers[tier_idx] if self._desired_active(mn)]
         for mn in tier:
             mn.degraded = False
             mn.degraded_reason = ''
             mn.attempts = 0
         self.get_logger().info(f'Restarting tier {tier_idx}...')
-        self._activate_tier(tier_idx, tier)
+        self._activate_tier(tier_idx, tier, gen)
 
-    def _do_shutdown(self):
+    def _do_shutdown(self, gen: int):
         # Stop the watchdog before shutdown
         self._watchdog_stop.set()
         self._system_state = 'shutdown'
         self._publish_status()
         for tier in reversed(self._tiers):
-            self._shutdown_tier(tier)
+            self._parallel(self._shutdown_node, [mn.name for mn in tier],
+                           3 * self._trans_timeout)
 
-    def _shutdown_tier(self, tier: list[ManagedNode]):
-        """Parallel state-aware DEACTIVATE → CLEANUP → SHUTDOWN for the tier's nodes."""
-        threads = [
-            threading.Thread(target=self._shutdown_node, args=(mn.name,), daemon=True)
-            for mn in tier
-        ]
+    # ──────────────────────────────────────────────────────────────────────────
+    # Helpers
+
+    @staticmethod
+    def _parallel(fn, items: list, timeout: float):
+        """fn(item) for every item in parallel; waits up to `timeout` in total."""
+        threads = [threading.Thread(target=fn, args=(i,), daemon=True) for i in items]
         for t in threads:
             t.start()
+        deadline = time.monotonic() + timeout
         for t in threads:
-            t.join(timeout=3 * self._trans_timeout)
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
 
     # ──────────────────────────────────────────────────────────────────────────
     # Status
@@ -710,6 +843,7 @@ class InmoovLifecycleManager(Node):
             'sleep_mode':      self._sleep_mode,
             'degraded_nodes':  degraded_nodes,
             'recovering_nodes': recovering_nodes,
+            'pending_ops':     self._ops.qsize(),
             'tiers': [
                 {
                     'id': tier_idx,
@@ -728,7 +862,10 @@ class InmoovLifecycleManager(Node):
                 for tier_idx, tier in enumerate(self._tiers)
             ],
         }
-        self._status_pub.publish(String(data=json.dumps(status, ensure_ascii=False)))
+        try:
+            self._status_pub.publish(String(data=json.dumps(status, ensure_ascii=False)))
+        except Exception:
+            pass   # context already shut down
 
 
 def main(args=None):
