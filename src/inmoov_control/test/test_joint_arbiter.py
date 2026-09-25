@@ -157,3 +157,31 @@ def test_eye_mirror_and_right_eye_command(node):
     """Right-camera fallback publishes eye_lr_R: the left board applies it to eye_lr_L."""
     node._handle_cmd('head_tracker', JC.PRIORITY_HEAD_TRACKER, 0.5, False, _js(eye_lr_R=95))
     assert _deg(node, 'eye_lr_L') == 95
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regressions from the 2026-09-26 review
+
+def test_release_with_names_only(node):
+    """JointCommand.msg: positions are ignored on release — so they may be absent."""
+    node._handle_cmd('bt_command', JC.PRIORITY_BT_COMMAND, 8.0, False, _js(rothead=130))
+    rel = JointState()
+    rel.name = ['rothead']                     # no positions
+    node._handle_cmd('bt_command', 0, 0.0, True, rel)
+    assert 'rothead' not in node._arbiter.owners()
+
+
+def test_invalid_position_does_not_take_the_lease(node):
+    js = _js(rothead=120)
+    js.position = [float('nan')]
+    node._handle_cmd('calibration', JC.PRIORITY_CALIBRATION, 2.0, False, js)
+    assert 'rothead' not in node._arbiter.owners()
+    node._handle_cmd('head_tracker', JC.PRIORITY_HEAD_TRACKER, 0.5, False, _js(rothead=100))
+    assert _deg(node, 'rothead') == 100
+
+
+@pytest.mark.parametrize('lease', [float('nan'), float('inf'), -5.0, 1e9])
+def test_bad_lease_is_bounded(node, lease):
+    node._handle_cmd('calibration', JC.PRIORITY_CALIBRATION, lease, False, _js(neck=50))
+    owner = node._arbiter.owners().get('neck')
+    assert owner is None or owner['remaining_sec'] <= node._MAX_LEASE_SEC

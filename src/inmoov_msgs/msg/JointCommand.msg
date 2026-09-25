@@ -1,6 +1,7 @@
 # A servo command with arbitration metadata — published on /joint_cmd and
 # arbitrated per joint by inmoov_control's arduino_comm_node (JointArbiter).
 #
+# A non-finite position is dropped before arbitration (it takes no lease).
 # A command for a joint is applied if the joint has no owner, the owner's lease
 # expired, the owner is this same source, or this command's priority is higher.
 # With equal priority the current owner keeps the joint until its lease ends.
@@ -30,7 +31,8 @@ uint8 PRIORITY_LEGACY       = 0
 string source        # who sends it, e.g. 'head_tracker' — ownership is per source
 uint8 priority
 float32 lease_sec    # keep the joints this long after this command; 0 = write only, don't hold
-bool release         # drop this source's ownership of cmd.name (positions ignored)
+                     # (capped at 30 s; NaN/negative = 0)
+bool release         # drop this source's ownership of cmd.name (positions ignored, may be empty)
 
 # Positions in radians around each joint's center: rad = (deg - 90) * pi / 180.
 # velocity (rad/s) is optional; empty or 0 = the joint's default (firmware table) speed.

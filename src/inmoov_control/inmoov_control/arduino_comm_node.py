@@ -462,16 +462,30 @@ class ArduinoCommNode(LifecycleNode):
                 or self.EYE_SYNC.get(name, '') in self._body_map
                 or self.EYE_SYNC.get(name, '') in self._face_map)
 
+    # Longest lease a command may take (the BT's look override is ~8 s, scans ~10 s);
+    # a bigger / infinite value would lock the joint out for everyone else.
+    _MAX_LEASE_SEC = 30.0
+
     def _handle_cmd(self, source: str, priority: int, lease_sec: float,
                     release: bool, js: JointState) -> None:
+        if release:
+            # Positions are ignored on release (JointCommand.msg) — may be empty
+            with self._lock:
+                for name in js.name:
+                    if self._owns(name):
+                        self._arbiter.release(name, source)
+            return
+        lease_sec = (min(float(lease_sec), self._MAX_LEASE_SEC)
+                     if math.isfinite(lease_sec) and lease_sec > 0 else 0.0)
         accepted = JointState()
         with self._lock:
             vels = js.velocity
             for idx, (name, pos_rad) in enumerate(zip(js.name, js.position)):
                 if not self._owns(name):
                     continue
-                if release:
-                    self._arbiter.release(name, source)
+                # Validate BEFORE claiming: a command that can't move the joint
+                # must not lock it out for the other sources either
+                if not math.isfinite(pos_rad):
                     continue
                 ok, owner = self._arbiter.claim(name, source, priority, lease_sec)
                 if not ok:
@@ -485,9 +499,8 @@ class ArduinoCommNode(LifecycleNode):
                 mirror = self.EYE_SYNC.get(name)
                 if mirror:
                     self._apply_joint(mirror, pos_rad, vel)
-                if math.isfinite(pos_rad):
-                    accepted.name.append(name)
-                    accepted.position.append(pos_rad)
+                accepted.name.append(name)
+                accepted.position.append(pos_rad)
         if accepted.name and self._commanded_pub is not None:
             accepted.header.stamp = self.get_clock().now().to_msg()
             self._commanded_pub.publish(accepted)

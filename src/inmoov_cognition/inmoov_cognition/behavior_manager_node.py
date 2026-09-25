@@ -1402,8 +1402,7 @@ class BehaviorManagerNode(LifecycleNode):
     def release_joints(self, source: str, names) -> None:
         """Give up this source's leases (works while INACTIVE too — used on deactivate)."""
         js = JointState()
-        js.name     = list(names)
-        js.position = [0.0] * len(js.name)
+        js.name = list(names)   # positions are ignored on release
         self._joint_cmd_pub.publish(JointCommand(source=source, release=True, cmd=js))
 
     def add_deactivate_hook(self, fn) -> None:
