@@ -51,10 +51,12 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 from datetime import datetime
 
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String, Bool
@@ -62,8 +64,30 @@ from inmoov_msgs.srv import MemoryQuery
 
 from inmoov_memory.memory_manager import MemoryManager, strip_code_fence
 from inmoov_memory.reminder_db import ReminderDB
+from inmoov_memory.sqlite_util import connect, session
 
 logger = logging.getLogger(__name__)
+
+# Background work (episode summary, reminder extraction, Chroma reconcile) gets
+# this long to finish before the DBs are closed on cleanup/shutdown.
+_BG_JOIN_TIMEOUT_SEC = 20.0
+
+
+def as_embedding(raw, dim: int) -> np.ndarray:
+    """Validates a JSON embedding (length, finite, non-zero) and L2-normalizes it.
+
+    Raises ValueError — the /memory/query dispatcher turns it into an error reply,
+    so a malformed vector never reaches the DB or the caches.
+    """
+    emb = np.asarray(raw, dtype=np.float32)
+    if emb.ndim != 1 or emb.shape[0] != dim:
+        raise ValueError(f'embedding must have {dim} values, got shape {emb.shape}')
+    if not np.all(np.isfinite(emb)):
+        raise ValueError('embedding contains NaN/Inf')
+    norm = float(np.linalg.norm(emb))
+    if norm < 1e-8:
+        raise ValueError('embedding has zero norm')
+    return emb / norm
 
 
 class MemoryNode(LifecycleNode):
@@ -74,7 +98,8 @@ class MemoryNode(LifecycleNode):
         self._lock            = threading.Lock()
         self._gallery_cache: dict[int, np.ndarray] = {}
         self._voice_cache: dict[int, np.ndarray]   = {}
-        self._voice_emb_dim   = 192
+        self._voice_emb_dim   = 192   # ECAPA-TDNN
+        self._face_emb_dim    = 512   # InsightFace buffalo_l
         self._voice_gallery_cache: dict[int, list] = {}
         self._SV_GALLERY_MAX  = 10
         self._SV_REFRESH_DAYS = 7
@@ -88,6 +113,8 @@ class MemoryNode(LifecycleNode):
         self._tg_reminder_person_id = 5
         self._reminder_default_time = '07:00'
         self._sleeping        = False   # /robot_sleep latched state
+        self._bg_threads: list[threading.Thread] = []
+        self._bg_lock         = threading.Lock()
 
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
@@ -133,7 +160,7 @@ class MemoryNode(LifecycleNode):
         self._reminder_default_time = self.get_parameter('reminder_default_time').value
 
         # ── Social memory (SQLite) ────────────────────────────────────────
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db = connect(db_path, check_same_thread=False)
         self._init_social_db()
         self._load_gallery_cache()
         self._load_voice_cache()
@@ -154,6 +181,7 @@ class MemoryNode(LifecycleNode):
         )
         self.get_logger().info(
             f'MemoryManager: episodic={episodic_db} semantic={semantic_db}')
+        self._spawn_bg(self._reconcile_chroma)
 
         # ── Service — created in configure, available right after activation ─
         self.create_service(MemoryQuery, '/memory/query', self._handle)
@@ -212,6 +240,7 @@ class MemoryNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
+        self._join_bg()
         self._close_db()
         self._gallery_cache.clear()
         self._voice_cache.clear()
@@ -219,12 +248,46 @@ class MemoryNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state):
+        self._join_bg()
         self._close_db()
         return TransitionCallbackReturn.SUCCESS
 
     def on_error(self, state):
         self._close_db()
         return TransitionCallbackReturn.SUCCESS
+
+    # ── Background threads ─────────────────────────────────────────────
+
+    def _spawn_bg(self, target, *args):
+        """Starts a tracked daemon thread; _join_bg() waits for it before the DBs close."""
+        t = threading.Thread(target=target, args=args, daemon=True)
+        with self._bg_lock:
+            self._bg_threads = [x for x in self._bg_threads if x.is_alive()]
+            self._bg_threads.append(t)
+        t.start()
+
+    def _join_bg(self, timeout: float = _BG_JOIN_TIMEOUT_SEC):
+        with self._bg_lock:
+            threads = [t for t in self._bg_threads if t.is_alive()]
+        if threads:
+            self.get_logger().info(
+                f'Waiting for {len(threads)} background memory task(s) (≤{timeout:.0f}s)...')
+        deadline = time.monotonic() + timeout
+        for t in threads:
+            t.join(max(0.0, deadline - time.monotonic()))
+        left = sum(t.is_alive() for t in threads)
+        if left:
+            self.get_logger().warn(f'{left} background memory task(s) still running — abandoned')
+
+    def _reconcile_chroma(self):
+        try:
+            res = self._mm.semantic.reconcile_chroma()
+            if res['upserted'] or res['deleted']:
+                self.get_logger().info(
+                    f'Chroma reconcile: re-indexed {res["upserted"]}, '
+                    f'removed {res["deleted"]} stale')
+        except Exception as e:
+            self.get_logger().warn(f'Chroma reconcile failed: {e}')
 
     def _close_db(self):
         try:
@@ -428,11 +491,7 @@ class MemoryNode(LifecycleNode):
             participants = data.get('participants', [])
             if not transcript.strip():
                 return
-            threading.Thread(
-                target=self._run_after_conversation,
-                args=(transcript, participants),
-                daemon=True,
-            ).start()
+            self._spawn_bg(self._run_after_conversation, transcript, participants)
         except Exception as e:
             self.get_logger().warn(f'conversation_end_cb: {e}')
 
@@ -446,12 +505,8 @@ class MemoryNode(LifecycleNode):
             self.get_logger().error(f'after_conversation error: {e}')
         finally:
             self._publish_memory_context()
-        # Auto-extract reminders from the dialogue (in a separate thread, non-blocking)
-        threading.Thread(
-            target=self._extract_reminders,
-            args=(transcript, participants),
-            daemon=True,
-        ).start()
+        # Auto-extract reminders from the dialogue (same background thread)
+        self._extract_reminders(transcript, participants)
 
     # Keywords whose presence triggers an LLM call to extract reminders
     _REMINDER_KEYWORDS = [
@@ -473,6 +528,8 @@ class MemoryNode(LifecycleNode):
             return
 
         with self._lock:
+            if self._db is None:   # DB closed while we were queued
+                return
             row = self._db.execute(
                 'SELECT id FROM persons WHERE name=? LIMIT 1', (person_name,)
             ).fetchone()
@@ -871,10 +928,7 @@ class MemoryNode(LifecycleNode):
 
     def _save_person(self, req: dict) -> dict:
         name = req['name'].strip()
-        emb  = np.array(req['embedding'], dtype=np.float32)
-        norm = np.linalg.norm(emb)
-        if norm > 0:
-            emb /= norm
+        emb  = as_embedding(req['embedding'], self._face_emb_dim)
         now = datetime.now().isoformat()
         with self._lock:
             cur = self._db.execute(
@@ -889,8 +943,7 @@ class MemoryNode(LifecycleNode):
     def _update_embedding(self, req: dict) -> dict:
         pid   = req['person_id']
         alpha = float(req.get('alpha', 0.3))
-        new_emb = np.array(req['embedding'], dtype=np.float32)
-        new_emb /= np.linalg.norm(new_emb) + 1e-8
+        new_emb = as_embedding(req['embedding'], self._face_emb_dim)
         with self._lock:
             row = self._db.execute(
                 'SELECT embedding FROM persons WHERE id=?', (pid,)).fetchone()
@@ -974,8 +1027,7 @@ class MemoryNode(LifecycleNode):
         source     = req.get('source', 'auto')
         now        = datetime.now().isoformat()
 
-        emb = np.array(req['embedding'], dtype=np.float32)
-        emb /= np.linalg.norm(emb) + 1e-8
+        emb = as_embedding(req['embedding'], self._face_emb_dim)
 
         existing = self._gallery_cache.get(pid)
         if existing is not None and len(existing) > 0:
@@ -989,6 +1041,9 @@ class MemoryNode(LifecycleNode):
                 return {'added': False, 'reason': 'embedding_mismatch'}
 
         with self._lock:
+            # Person may have been merged away while face_gallery was saving the crop
+            if not self._db.execute('SELECT 1 FROM persons WHERE id=?', (pid,)).fetchone():
+                return {'added': False, 'reason': 'person_not_found'}
             self._db.execute(
                 'INSERT INTO person_gallery '
                 '(person_id, photo_path, embedding, quality, source, created_at) '
@@ -1088,6 +1143,8 @@ class MemoryNode(LifecycleNode):
         to_id   = req['to_id']
         GALLERY_LIMIT = 30
         VOICE_LIMIT   = self._SV_GALLERY_MAX
+        if from_id == to_id:
+            return {'error': f'merge_persons: from_id == to_id ({from_id})'}
 
         with self._lock:
             # Names before deletion — needed for the episodic DB and logs
@@ -1115,102 +1172,174 @@ class MemoryNode(LifecycleNode):
                                           f'слишком низкое ({sim:.2f}). Это точно один человек?'),
                         }
 
-            # ── Photo gallery: merge, respect the limit (keep the best by quality) ──
+            # ── Photo gallery: keep the best by quality within the limit ──
             all_photos = self._db.execute(
                 'SELECT id, person_id, photo_path, quality FROM person_gallery '
                 'WHERE person_id IN (?,?) ORDER BY quality DESC',
                 (from_id, to_id)
             ).fetchall()
-
-            to_count   = sum(1 for p in all_photos if p[1] == to_id)
-            available  = max(0, GALLERY_LIMIT - to_count)
+            to_count    = sum(1 for p in all_photos if p[1] == to_id)
+            available   = max(0, GALLERY_LIMIT - to_count)
             from_photos = [(p[0], p[2]) for p in all_photos if p[1] == from_id]
             to_transfer = from_photos[:available]
             to_discard  = from_photos[available:]
 
-            if to_transfer:
-                ids = tuple(p[0] for p in to_transfer)
-                ph  = ','.join('?' * len(ids))
-                self._db.execute(f'UPDATE person_gallery SET person_id=? WHERE id IN ({ph})',
-                                 (to_id, *ids))
-            for _, path in to_discard:
-                self._db.execute('DELETE FROM person_gallery WHERE photo_path=?', (path,))
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception:
-                    pass
+            # 1. Copy the kept photos out of the source folder (it's deleted in
+            #    step 3). A failure before the commit only leaves spare copies.
+            persons_dir = os.path.join(self._gallery_dir, 'persons')
+            from_dirs = [d for d in glob.glob(os.path.join(persons_dir, f'{from_id}_*'))
+                         if os.path.isdir(d)]
+            from_dirs_abs = {os.path.abspath(d) for d in from_dirs}
+            to_dir = self._person_gallery_dir(to_id, to_name)
+            copies = []   # (gallery row id, new path)
+            try:
+                for gid, path in to_transfer:
+                    if os.path.dirname(os.path.abspath(path)) not in from_dirs_abs:
+                        continue   # lives outside the doomed folder — path stays valid
+                    if not os.path.exists(path):
+                        continue
+                    dest = self._unique_path(to_dir, os.path.basename(path))
+                    shutil.copy2(path, dest)
+                    copies.append((gid, dest))
+            except OSError as e:
+                for _, dest in copies:
+                    self._remove_quietly(dest)
+                return {'error': f'merge_persons: copying photos failed: {e}'}
 
-            # ── Voice gallery: transfer up to free slots (newest first) ──
-            target_vc = self._db.execute(
-                'SELECT COUNT(*) FROM voice_gallery WHERE person_id=?', (to_id,)).fetchone()[0]
-            vslots = max(0, VOICE_LIMIT - target_vc)
-            voice_rows = self._db.execute(
-                'SELECT embedding, recorded_at FROM voice_gallery '
-                'WHERE person_id=? ORDER BY recorded_at DESC',
-                (from_id,)
-            ).fetchall()
-            for emb_blob, ts in voice_rows[:vslots]:
-                self._db.execute(
-                    'INSERT INTO voice_gallery (person_id, embedding, recorded_at) VALUES (?,?,?)',
-                    (to_id, emb_blob, ts))
-            self._db.execute('DELETE FROM voice_gallery WHERE person_id=?', (from_id,))
+            # 2. One transaction for every social-DB change
+            try:
+                with self._db:
+                    if to_transfer:
+                        ids = tuple(p[0] for p in to_transfer)
+                        ph  = ','.join('?' * len(ids))
+                        self._db.execute(
+                            f'UPDATE person_gallery SET person_id=? WHERE id IN ({ph})',
+                            (to_id, *ids))
+                    for gid, dest in copies:
+                        self._db.execute(
+                            'UPDATE person_gallery SET photo_path=? WHERE id=?', (dest, gid))
+                    for gid, _ in to_discard:
+                        self._db.execute('DELETE FROM person_gallery WHERE id=?', (gid,))
 
-            # ── Notes, meeting counter, delete the source ────────────────────
-            self._db.execute(
-                'INSERT OR IGNORE INTO person_notes (person_id, key, value) '
-                'SELECT ?, key, value FROM person_notes WHERE person_id=?', (to_id, from_id))
-            self._db.execute('DELETE FROM person_notes WHERE person_id=?', (from_id,))
-            self._db.execute(
-                'UPDATE persons SET meet_count=meet_count+'
-                '(SELECT COALESCE(meet_count,0) FROM persons WHERE id=?) WHERE id=?',
-                (from_id, to_id))
-            self._db.execute('DELETE FROM persons WHERE id=?', (from_id,))
-            self._db.commit()
+                    # Voice gallery: transfer up to free slots (newest first)
+                    target_vc = self._db.execute(
+                        'SELECT COUNT(*) FROM voice_gallery WHERE person_id=?', (to_id,)).fetchone()[0]
+                    vslots = max(0, VOICE_LIMIT - target_vc)
+                    voice_rows = self._db.execute(
+                        'SELECT embedding, recorded_at FROM voice_gallery '
+                        'WHERE person_id=? ORDER BY recorded_at DESC',
+                        (from_id,)
+                    ).fetchall()
+                    for emb_blob, ts in voice_rows[:vslots]:
+                        self._db.execute(
+                            'INSERT INTO voice_gallery (person_id, embedding, recorded_at) VALUES (?,?,?)',
+                            (to_id, emb_blob, ts))
+                    self._db.execute('DELETE FROM voice_gallery WHERE person_id=?', (from_id,))
 
-        # ── Update caches ────────────────────────────────────────────────
-        if from_id in self._gallery_cache:
-            old = self._gallery_cache.pop(from_id)
-            if to_id in self._gallery_cache:
-                self._gallery_cache[to_id] = np.vstack([self._gallery_cache[to_id], old])
-            else:
-                self._gallery_cache[to_id] = old
+                    # Notes, meeting counter, delete the source
+                    self._db.execute(
+                        'INSERT OR IGNORE INTO person_notes (person_id, key, value) '
+                        'SELECT ?, key, value FROM person_notes WHERE person_id=?', (to_id, from_id))
+                    self._db.execute('DELETE FROM person_notes WHERE person_id=?', (from_id,))
+                    self._db.execute(
+                        'UPDATE persons SET meet_count=meet_count+'
+                        '(SELECT COALESCE(meet_count,0) FROM persons WHERE id=?) WHERE id=?',
+                        (from_id, to_id))
+                    self._db.execute('DELETE FROM persons WHERE id=?', (from_id,))
+            except sqlite3.Error as e:
+                for _, dest in copies:
+                    self._remove_quietly(dest)
+                return {'error': f'merge_persons: DB update failed, nothing merged: {e}'}
 
-        if from_id in self._voice_gallery_cache:
-            src = self._voice_gallery_cache.pop(from_id)
-            dst = self._voice_gallery_cache.setdefault(to_id, [])
-            dst.extend(src)
-            dst.sort(key=lambda e: e.get('recorded_at', 0), reverse=True)
-            self._voice_gallery_cache[to_id] = dst[:VOICE_LIMIT]
+            # Caches straight from the committed DB (never out of sync with it)
+            self._gallery_cache.pop(from_id, None)
+            self._voice_cache.pop(from_id, None)
+            self._voice_gallery_cache.pop(from_id, None)
+            self._reload_person_caches(to_id)
 
-        # ── Source's physical directory ─────────────────────────────────
-        for d in glob.glob(os.path.join(self._gallery_dir, 'persons', f'{from_id}_*')):
-            if os.path.isdir(d):
-                shutil.rmtree(d, ignore_errors=True)
+        # 3. Committed — now the source files can go
+        for _, path in to_discard:
+            self._remove_quietly(path)
+        for d in from_dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
         # ── Episodic memory: rename the participant ──────────────────────
         try:
-            import sqlite3 as _sq
-            ep_conn = _sq.connect(self._episodic_db_path)
-            ep_cur  = ep_conn.cursor()
-            ep_cur.execute('SELECT id, participants FROM episodes')
-            for ep_id, parts_json in ep_cur.fetchall():
-                try:
-                    parts = _json.loads(parts_json) if parts_json else []
-                except Exception:
-                    continue
-                if from_name in parts:
-                    new_parts = [to_name if p == from_name else p for p in parts]
-                    ep_cur.execute('UPDATE episodes SET participants=? WHERE id=?',
-                                   (_json.dumps(new_parts, ensure_ascii=False), ep_id))
-            ep_conn.commit()
-            ep_conn.close()
+            with session(self._episodic_db_path) as ep_conn:
+                for ep_id, parts_json in ep_conn.execute(
+                        'SELECT id, participants FROM episodes').fetchall():
+                    try:
+                        parts = _json.loads(parts_json) if parts_json else []
+                    except Exception:
+                        continue
+                    if from_name in parts:
+                        new_parts = [to_name if p == from_name else p for p in parts]
+                        ep_conn.execute('UPDATE episodes SET participants=? WHERE id=?',
+                                        (_json.dumps(new_parts, ensure_ascii=False), ep_id))
         except Exception as e:
             self.get_logger().warn(f'merge_persons: episodic update failed: {e}')
 
         self.get_logger().info(f'merge_persons: {from_name}({from_id}) → {to_name}({to_id})')
         return {'merged': True, 'from_id': from_id, 'to_id': to_id,
                 'from_name': from_name, 'to_name': to_name}
+
+    def _person_gallery_dir(self, pid: int, name: str) -> str:
+        """Person's photo folder — same layout as face_gallery_node (persons/{id}_{name})."""
+        import glob, os
+        existing = [d for d in glob.glob(os.path.join(self._gallery_dir, 'persons', f'{pid}_*'))
+                    if os.path.isdir(d)]
+        if existing:
+            return existing[0]
+        d = os.path.join(self._gallery_dir, 'persons', f'{pid}_{(name or "unknown").replace(" ", "_")}')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _unique_path(directory: str, filename: str) -> str:
+        import os
+        stem, ext = os.path.splitext(filename)
+        dest, n = os.path.join(directory, filename), 1
+        while os.path.exists(dest):
+            dest = os.path.join(directory, f'{stem}_m{n}{ext}')
+            n += 1
+        return dest
+
+    @staticmethod
+    def _remove_quietly(path: str):
+        import os
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _reload_person_caches(self, pid: int):
+        """Rebuilds one person's face/voice caches from the DB. Called under self._lock."""
+        rows = self._db.execute(
+            'SELECT embedding FROM person_gallery WHERE person_id=?', (pid,)).fetchall()
+        embs = []
+        for (blob,) in rows:
+            emb = np.frombuffer(blob, dtype=np.float32).copy()
+            norm = np.linalg.norm(emb)
+            if norm > 0:
+                embs.append(emb / norm)
+        if embs:
+            self._gallery_cache[pid] = np.stack(embs)
+        else:
+            self._gallery_cache.pop(pid, None)
+
+        rows = self._db.execute(
+            'SELECT embedding, recorded_at FROM voice_gallery WHERE person_id=? '
+            'ORDER BY recorded_at ASC', (pid,)).fetchall()
+        entries = []
+        for blob, ts in rows:
+            emb = np.frombuffer(blob, dtype=np.float32).copy()
+            norm = np.linalg.norm(emb)
+            if emb.shape[0] == self._voice_emb_dim and norm > 0:
+                entries.append({'emb': emb / norm, 'recorded_at': float(ts)})
+        if entries:
+            self._voice_gallery_cache[pid] = entries
+        else:
+            self._voice_gallery_cache.pop(pid, None)
 
     def _lookup_by_name(self, req: dict) -> dict:
         """Looks up a person by exact name (case-insensitive)."""
@@ -1290,10 +1419,7 @@ class MemoryNode(LifecycleNode):
 
     def _save_voice_embedding(self, req: dict) -> dict:
         pid = req['person_id']
-        emb = np.array(req['embedding'], dtype=np.float32)
-        norm = np.linalg.norm(emb)
-        if norm > 0:
-            emb /= norm
+        emb = as_embedding(req['embedding'], self._voice_emb_dim)
         with self._lock:
             row = self._db.execute('SELECT id FROM persons WHERE id=?', (pid,)).fetchone()
             if not row:
@@ -1308,8 +1434,7 @@ class MemoryNode(LifecycleNode):
     def _update_voice_embedding(self, req: dict) -> dict:
         pid   = req['person_id']
         alpha = float(req.get('alpha', 0.3))
-        new_emb = np.array(req['embedding'], dtype=np.float32)
-        new_emb /= np.linalg.norm(new_emb) + 1e-8
+        new_emb = as_embedding(req['embedding'], self._voice_emb_dim)
         old_emb = self._voice_cache.get(pid)
         if old_emb is None:
             return self._save_voice_embedding(req)
@@ -1403,11 +1528,10 @@ class MemoryNode(LifecycleNode):
         """
         import time as _time
         pid         = req['person_id']
-        new_emb     = np.array(req['embedding'], dtype=np.float32)
-        norm        = np.linalg.norm(new_emb)
-        if norm < 1e-8:
-            return {'added': False, 'reason': 'zero_norm'}
-        new_emb /= norm
+        try:
+            new_emb = as_embedding(req['embedding'], self._voice_emb_dim)
+        except ValueError as e:
+            return {'added': False, 'reason': f'invalid_embedding: {e}'}
         recorded_at = float(req.get('timestamp', _time.time()))
 
         with self._lock:
@@ -1481,11 +1605,16 @@ def main():
     node = MemoryNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        # Ctrl-C / SIGINT from launch skips on_shutdown: let the last conversation's
+        # summary + reminder extraction finish before the DBs close.
+        node._join_bg()
+        node._close_db()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

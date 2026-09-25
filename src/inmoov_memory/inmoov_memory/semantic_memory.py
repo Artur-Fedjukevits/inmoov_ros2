@@ -15,6 +15,7 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -22,7 +23,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from inmoov_memory.sqlite_util import session
+
 logger = logging.getLogger(__name__)
+
+
+def _chroma_id(subject: str, predicate: str) -> str:
+    """Stable Chroma ID for a fact (independent of fact_id, which changes on UPDATE)."""
+    return hashlib.md5(f"{subject}::{predicate}".encode()).hexdigest()
+
+
+def _chroma_doc(subject: str, predicate: str, value: str) -> str:
+    return f"{subject} — {predicate}: {value}"
 
 
 class SemanticMemory:
@@ -56,10 +68,9 @@ class SemanticMemory:
         with self._conn() as conn:
             conn.executescript(self.CREATE_SQL)
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _conn(self):
+        """Short-lived connection (WAL, busy_timeout): commit + close on exit."""
+        return session(self.db_path, row_factory=sqlite3.Row)
 
     def _init_chroma(self) -> None:
         """Initializes ChromaDB. If it isn't installed — falls back to SQLite only."""
@@ -126,14 +137,10 @@ class SemanticMemory:
 
         # Sync with ChromaDB
         if self._chroma is not None:
-            doc_text = f"{subject} — {predicate}: {value}"
-            # Stable ID (independent of fact_id, which changes on UPDATE)
-            import hashlib
-            chroma_id = hashlib.md5(f"{subject}::{predicate}".encode()).hexdigest()
             try:
                 self._chroma.upsert(
-                    ids=[chroma_id],
-                    documents=[doc_text],
+                    ids=[_chroma_id(subject, predicate)],
+                    documents=[_chroma_doc(subject, predicate, value)],
                     metadatas=[{
                         "category": category,
                         "subject": subject,
@@ -255,10 +262,50 @@ class SemanticMemory:
             )
             deleted = cur.rowcount > 0
         if self._chroma is not None:
-            import hashlib
-            chroma_id = hashlib.md5(f"{subject}::{predicate}".encode()).hexdigest()
             try:
-                self._chroma.delete(ids=[chroma_id])
+                self._chroma.delete(ids=[_chroma_id(subject, predicate)])
             except Exception as exc:
                 logger.warning("ChromaDB delete failed (%s::%s): %s", subject, predicate, exc)
         return deleted
+
+    # ------------------------------------------------------------------
+    # SQLite → ChromaDB reconciliation
+    # ------------------------------------------------------------------
+
+    def reconcile_chroma(self) -> dict:
+        """Brings the Chroma index in line with SQLite (the source of truth).
+
+        save_fact/delete_fact write SQLite first and only log a Chroma failure, so
+        the index can miss facts, hold stale values or keep deleted facts. Facts
+        whose vector is missing or whose metadata differs are re-upserted; Chroma
+        IDs with no SQLite fact are deleted. Unchanged facts aren't re-embedded.
+        """
+        if self._chroma is None:
+            return {"upserted": 0, "deleted": 0}
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, category, subject, predicate, value FROM facts").fetchall()
+        wanted = {}
+        for r in rows:
+            wanted[_chroma_id(r["subject"], r["predicate"])] = {
+                "category": r["category"], "subject": r["subject"],
+                "predicate": r["predicate"], "value": r["value"], "fact_id": r["id"],
+            }
+
+        have = self._chroma.get(include=["metadatas"])
+        indexed = dict(zip(have["ids"], have["metadatas"]))
+
+        stale = [cid for cid, meta in wanted.items() if indexed.get(cid) != meta]
+        extra = [cid for cid in indexed if cid not in wanted]
+
+        for i in range(0, len(stale), 100):
+            batch = stale[i:i + 100]
+            self._chroma.upsert(
+                ids=batch,
+                documents=[_chroma_doc(wanted[c]["subject"], wanted[c]["predicate"],
+                                       wanted[c]["value"]) for c in batch],
+                metadatas=[wanted[c] for c in batch],
+            )
+        if extra:
+            self._chroma.delete(ids=extra)
+        return {"upserted": len(stale), "deleted": len(extra)}

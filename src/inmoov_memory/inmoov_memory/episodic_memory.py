@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from inmoov_memory.sqlite_util import session
+
 
 class EpisodicMemory:
     """Short-term episodic memory backed by SQLite."""
@@ -50,10 +52,9 @@ class EpisodicMemory:
         with self._conn() as conn:
             conn.executescript(self.CREATE_SQL)
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _conn(self):
+        """Short-lived connection (WAL, busy_timeout): commit + close on exit."""
+        return session(self.db_path, row_factory=sqlite3.Row)
 
     # ------------------------------------------------------------------
     # Writing

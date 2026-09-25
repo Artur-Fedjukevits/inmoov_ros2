@@ -20,14 +20,15 @@ Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
-import sqlite3
 import threading
 from datetime import datetime
+
+from inmoov_memory.sqlite_util import connect
 
 
 class ReminderDB:
     def __init__(self, db_path: str):
-        self._db   = sqlite3.connect(db_path, check_same_thread=False)
+        self._db   = connect(db_path, check_same_thread=False)
         self._lock = threading.Lock()
         self._init_db()
 
