@@ -1,0 +1,10 @@
+# Python runtime dependencies of inmoov_voice without a rosdep key (pip).
+# numpy / scipy / requests / pyaudio are declared in package.xml. torch is pip-only on
+# purpose: the apt python3-torch is old and would sit next to the CPU wheel.
+# Versions: what is in use on the author's machine.
+torch>=2.4             # 2.10.0+cpu — Silero VAD, speechbrain
+                      #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+sounddevice>=0.5      # 0.5.5  — tts_node playback, audio_source_node
+speechbrain>=1.0      # 1.1.0  — voice_detector (ECAPA-TDNN speaker verification), voice_emotion_node
+onnx-asr>=0.12        # 0.12.0 — parakeet_stt_node (Parakeet-TDT)
+openwakeword>=0.6     # 0.6.0  — openwakeword_node

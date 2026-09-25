@@ -1,0 +1,5 @@
+# Python runtime dependencies of inmoov_cognition without a rosdep key (pip).
+# numpy / opencv / psutil / requests / py_trees / websocket-client are declared
+# in package.xml as rosdep keys.
+# Versions: what is in use on the author's machine.
+python-telegram-bot>=22,<23   # 22.7  — telegram_bridge_node (async Application API)

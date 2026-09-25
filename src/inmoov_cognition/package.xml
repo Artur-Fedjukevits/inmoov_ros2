@@ -14,6 +14,12 @@
   <depend>inmoov_msgs</depend>
   <depend>inmoov_memory</depend>
   <exec_depend>python3-websocket</exec_depend>
+  <depend>sensor_msgs</depend>
+  <exec_depend>py_trees</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-psutil</exec_depend>
+  <exec_depend>python3-requests</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

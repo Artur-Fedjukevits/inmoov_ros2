@@ -11,6 +11,11 @@
   <depend>std_msgs</depend>
   <depend>action_msgs</depend>
   <depend>inmoov_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-requests</exec_depend>
+  <exec_depend>python3-pyaudio</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

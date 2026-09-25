@@ -1,0 +1,7 @@
+# Python runtime dependencies of inmoov_memory without a rosdep key (pip).
+# numpy is declared in package.xml.
+# Versions: what is in use on the author's machine.
+chromadb>=1.0         # 1.5.9 — semantic memory vector index (optional: SQLite-only without it)
+# scripts/rebuild_gallery.py only:
+opencv-python>=4.8    # 4.13
+insightface==0.7.3

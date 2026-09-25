@@ -86,13 +86,24 @@ those sections before relying on a given node).
 
 ## Build
 
-Standard `colcon` workspace:
+Standard `colcon` workspace. System / ROS dependencies come from each
+package's `package.xml` (rosdep); Python packages without a rosdep key are
+listed in the packages' `requirements.txt`:
 
 ```bash
 cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -y
+pip install -r src/inmoov_voice/requirements.txt \
+            -r src/inmoov_vision/requirements.txt \
+            -r src/inmoov_cognition/requirements.txt \
+            -r src/inmoov_memory/requirements.txt
 colcon build
 source install/setup.bash
 ```
+
+Tests (no hardware needed, after building and sourcing): `tools/run_tests.sh`
+— runs every package's unit tests (skips the ament style linters and the
+scripts that need a real Arduino); see each package's README for what they cover.
 
 Bring up the whole robot (see `inmoov_bringup/README.md` for tier details
 and launch arguments):
