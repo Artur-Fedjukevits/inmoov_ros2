@@ -214,3 +214,62 @@ def test_shutdown_preempts_retry_loop(rigs):
     assert time.monotonic() - t0 < 3.0
     wait_for(lambda: r.state('a') == FINALIZED and r.state('broken') == FINALIZED,
              msg='nodes shut down')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regressions from the 2026-09-26 review: the requested mode must win over
+# late transitions, queued recoveries and queued activations.
+
+def test_shutdown_during_slow_activation_leaves_nothing_active(rigs):
+    # Tier deadline shorter than the activation → 'slow' becomes a late node
+    # (8 s > the 5 s get_state timeout: shutdown can't even read its state meanwhile)
+    r = rigs([['a', 'slow']], node_kwargs={'slow': {'activate_delay': 8.0}},
+             tier_advance_timeout_sec=0.5)
+    r.mgr.start_activation()
+    wait_for(lambda: r.mn('slow').degraded_reason == 'timeout', msg='slow node late')
+    r.mgr._command_cb(String(data='SHUTDOWN'))
+    wait_for(lambda: r.state('slow') in (FINALIZED, UNCONFIGURED, INACTIVE) and
+             r.state('a') == FINALIZED, timeout=40,
+             msg='both nodes shut down, the late one too')
+    time.sleep(1.0)
+    assert r.state('slow') != ACTIVE
+
+
+def test_queued_recovery_respects_manual_deactivate(rigs):
+    r = rigs([['base'], ['top']], critical=['base'])
+    r.mgr.start_activation()
+    wait_for(lambda: r.mgr._system_state == 'active')
+
+    # DEACTIVATE is queued first; the crash's CASCADE + RECOVER land behind it
+    r.mgr._enqueue('DEACTIVATE')
+    r.nodes['base'].trigger_deactivate()
+    r.nodes['base'].trigger_cleanup()
+    base = r.mn('base')
+    base.degraded, base.degraded_reason = True, 'watchdog'
+    r.mgr._enqueue('CASCADE', 0)
+    r.mgr._start_recovery(base, 0)
+
+    wait_for(lambda: r.mgr._ops.empty() and not base.recovering, timeout=20, msg='queue drained')
+    time.sleep(0.5)
+    assert r.state('base') == ACTIVE              # Foundation recovered (tier 0 stays up)
+    assert r.state('top') == INACTIVE             # …but DEACTIVATE is honoured
+    assert r.mgr._system_state == 'deactivated'
+
+
+def test_shutdown_drops_queued_activation(rigs):
+    r = rigs([['a'], ['b']])
+    r.mgr.start_activation()
+    wait_for(lambda: r.mgr._system_state == 'active')
+    r.mgr._enqueue('DEACTIVATE')
+    wait_for(lambda: r.state('b') == INACTIVE)
+
+    ran = []
+    orig_sleep = r.mgr._do_sleep
+    r.mgr._do_sleep = lambda gen: (time.sleep(1.0), orig_sleep(gen))   # keep the worker busy
+    orig_activate = r.mgr._do_activate
+    r.mgr._do_activate = lambda gen: (ran.append('ACTIVATE'), orig_activate(gen))
+    r.mgr._enqueue('SLEEP')
+    r.mgr._enqueue('ACTIVATE')                    # queued before the shutdown request…
+    r.mgr._command_cb(String(data='SHUTDOWN'))    # …must not run after it
+    wait_for(lambda: r.state('a') == FINALIZED and r.state('b') == FINALIZED, timeout=20)
+    assert ran == []

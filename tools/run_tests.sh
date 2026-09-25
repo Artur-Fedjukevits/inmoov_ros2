@@ -6,6 +6,9 @@
 # same-named test modules in different packages would clash in one session.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Own DDS domain: tests must not see (or disturb) a robot running on this machine
+# — e.g. its latched /robot_sleep would put the lifecycle tests' manager to sleep.
+export ROS_DOMAIN_ID="${INMOOV_TEST_DOMAIN_ID:-87}"
 
 status=0
 for dir in src/*/test; do
