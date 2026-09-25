@@ -1864,17 +1864,9 @@ class LLMNode(LifecycleNode):
                         args = json.loads(args)
                     args = dict(args)
                     st   = args.pop('speak_text', None)  # TTS meta-parameter
-                    self.get_logger().info(f'Tool call [{source}]: {fn}({args})')
-                    _tt = time.time()
-                    if fn in denied:
-                        # Not offered to the model for this source — refuse a hallucinated call
-                        st  = None
-                        res = {'success': False,
-                               'error': f'{fn} недоступен для запросов из {source}'}
-                    else:
-                        res = self._execute_tool(fn, args)
-                    self._audit.record(source, fn, args, res, time.time() - _tt)
-                    self.get_logger().info(f'Tool result: {res}')
+                    res, allowed = self._run_tool(fn, args, source, denied)
+                    if not allowed:
+                        st = None
                     return fn, st, res, tc['id']
 
                 with concurrent.futures.ThreadPoolExecutor(
@@ -2014,11 +2006,9 @@ class LLMNode(LifecycleNode):
                                 args2 = json.loads(args2)
                             args2 = dict(args2)
                             st2 = args2.pop('speak_text', None)
-                            if st2 and st2.strip():
+                            res2, allowed2 = self._run_tool(fn2, args2, source, denied, 'R2')
+                            if allowed2 and st2 and st2.strip():
                                 _r2_speak.append(st2.strip())
-                            self.get_logger().info(f'Tool call R2: {fn2}({args2})')
-                            res2 = self._execute_tool(fn2, args2)
-                            self.get_logger().info(f'Tool result R2: {res2}')
                             _tool_results2.append({
                                 'role': 'tool', 'tool_call_id': tc['id'],
                                 'content': json.dumps(res2, ensure_ascii=False),
@@ -2163,6 +2153,24 @@ class LLMNode(LifecycleNode):
         threading.Thread(target=self._query_llm, args=(text,), daemon=True).start()
 
     # ── Executing tool calls ────────────────────────────────────────────
+
+    def _run_tool(self, fn: str, args: dict, source: str, denied: frozenset,
+                  stage: str = 'R1') -> tuple[dict, bool]:
+        """The ONLY way tools are executed: per-source policy, execution, audit.
+
+        Returns (result, allowed). A tool denied for this source (not offered to
+        the model — e.g. Telegram can't move the robot) is refused, not run.
+        """
+        self.get_logger().info(f'Tool call {stage} [{source}]: {fn}({args})')
+        t0 = time.time()
+        allowed = fn not in denied
+        if allowed:
+            res = self._execute_tool(fn, args)
+        else:
+            res = {'success': False, 'error': f'{fn} недоступен для запросов из {source}'}
+        self._audit.record(source, fn, args, res, time.time() - t0)
+        self.get_logger().info(f'Tool result {stage}: {res}')
+        return res, allowed
 
     def _execute_tool(self, fn_name: str, args: dict) -> dict:
         if fn_name == 'get_weather':

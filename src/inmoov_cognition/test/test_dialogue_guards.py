@@ -188,3 +188,37 @@ def test_bridge_push_ack():
     TelegramBridgeNode._telegram_push_cb(stub, String(data=json.dumps({'text': 'hi', 'id': 'reminder:8'})))
     assert json.loads(pub.msgs[-1].data) == {'id': 'reminder:8', 'ok': False,
                                              'error': 'no allowed_chat_id'}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# One execution path for tools (review 2026-09-26: round 2 bypassed policy/audit)
+
+def test_run_tool_enforces_policy_and_audits(tmp_path):
+    executed = []
+    stub = types.SimpleNamespace(
+        _execute_tool=lambda fn, args: executed.append(fn) or {'success': True},
+        _audit=ToolAuditLog(str(tmp_path / 'a.jsonl')),
+        get_logger=lambda: types.SimpleNamespace(info=lambda *a: None))
+    res, ok = LLMNode._run_tool(stub, 'items_control', {'name': 'Lamp'}, 'telegram',
+                                frozenset({'items_control'}), 'R2')
+    assert ok is False and res['success'] is False and executed == []
+    res, ok = LLMNode._run_tool(stub, 'get_weather', {}, 'voice', frozenset(), 'R2')
+    assert ok is True and executed == ['get_weather']
+    lines = [json.loads(x) for x in (tmp_path / 'a.jsonl').read_text().splitlines()]
+    assert [(e['tool'], e['ok']) for e in lines] == [('items_control', False), ('get_weather', True)]
+
+
+def test_tools_execute_only_through_run_tool():
+    """Structural guard: any new call site must go through _run_tool (policy + audit)."""
+    import ast
+    import inspect
+    import inmoov_cognition.llm_node as m
+    tree = ast.parse(inspect.getsource(m))
+    offenders = []
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef) and fn.name != '_run_tool':
+            for n in ast.walk(fn):
+                if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                        and n.func.attr == '_execute_tool'):
+                    offenders.append(f'{fn.name}:{n.lineno}')
+    assert offenders == []
