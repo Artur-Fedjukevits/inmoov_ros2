@@ -119,6 +119,18 @@ class SetBB(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
+class CheckFn(py_trees.behaviour.Behaviour):
+    """Condition leaf: SUCCESS if fn() is truthy (for state that lives on the node, not in the BB)."""
+
+    def __init__(self, name: str, fn):
+        super().__init__(name)
+        self._fn = fn
+
+    def update(self) -> py_trees.common.Status:
+        return (py_trees.common.Status.SUCCESS if self._fn()
+                else py_trees.common.Status.FAILURE)
+
+
 class AlwaysRunning(py_trees.behaviour.Behaviour):
     """Blocks the subtree — returns RUNNING forever."""
 
@@ -752,11 +764,13 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
                 # re-ticks right after our SUCCESS — ignore it, the scan already
                 # finished normally.
                 return
-            # A real preempt: SocialBranch has taken over control (a face was found).
+            # A real preempt: SocialBranch has taken over control (a face was found),
+            # or the NoActiveDialogue gate closed (a dialogue is in progress).
             # Hand the head to vision_head_tracker, leave face_detection enabled.
             self._node.release_joints('bt_scan', ('rothead', 'neck'))
             self._node.enable_head_tracker(True)
-            self._node.get_logger().info('PIRScan: interrupted (face found) — head_tracker enabled')
+            self._node.get_logger().info(
+                'PIRScan: interrupted (face found / dialogue) — head_tracker enabled')
 
 
 class SoundScanBehaviour(py_trees.behaviour.Behaviour):
@@ -1223,6 +1237,11 @@ def build_tree(node: Node, tavily_key: str) -> py_trees.behaviour.Behaviour:
         'PIRScanBranch', memory=False, children=[
             CheckBB('IsPIRScanActive', '/pir/scan_active',
                     check_fn=lambda v: v is True),
+            # Never scan over an ongoing dialogue — person_present alone is not
+            # enough (see BehaviorManagerNode.is_dialogue_active). A scan already
+            # running is preempted here too: terminate(INVALID) hands the head
+            # back to head_tracker.
+            CheckFn('NoActiveDialogue', node.pir_scan_allowed),
             PIRScanBehaviour(node),
         ]
     )
@@ -1277,6 +1296,14 @@ class BehaviorManagerNode(LifecycleNode):
     # by the user). The window is chosen with a margin over the turn time
     # (~60°/1.0rad/s ≈ 1s) + the typical PIR/Arduino heartbeat delay.
     _PIR_SELF_MOTION_BLANK_SEC = 2.5
+    # How long after the last voice exchange (LLM reply / wake word) a dialogue
+    # still counts as active for the PIR gate (is_dialogue_active). Needed because
+    # /social/person_present is NOT reliable mid-dialogue: with an unrecognized
+    # face identity_manager keeps sending person_present=False @ 2Hz and
+    # overwrites the voice-presence True from _llm_response_cb. Live bug
+    # 2026-09-26: PIRScan started while head_tracker was following the speaker,
+    # and the head went back to rest.
+    _DIALOGUE_ACTIVE_HOLD_SEC = 30.0
 
     def __init__(self):
         super().__init__('behavior_manager_node')
@@ -1285,6 +1312,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._pir_next_scan_at     = 0.0
         self._pir_prev_state       = False
         self._last_own_torso_move_mono = float('-inf')
+        self._last_dialogue_mono   = float('-inf')  # see is_dialogue_active
 
         # Cache of the last /sound_direction and /human_detected for SoundScanBehaviour
         # (it reads them via getattr(node, ...), not via a topic subscription in the behaviour itself)
@@ -1491,6 +1519,29 @@ class BehaviorManagerNode(LifecycleNode):
         })
         self._face_search_status_pub.publish(msg)
 
+    def is_dialogue_active(self) -> bool:
+        """A dialogue is in progress: head_tracker holds a face, an LLM reply is
+        pending/being spoken, or the last voice exchange was recent. Deliberately
+        independent of /social/person_present (see _DIALOGUE_ACTIVE_HOLD_SEC)."""
+        if self._face_locked:
+            return True
+        try:
+            if self._bb.llm.has_content or self._bb.social.person_present:
+                return True
+        except Exception:
+            pass
+        return time.monotonic() - self._last_dialogue_mono < self._DIALOGUE_ACTIVE_HOLD_SEC
+
+    def pir_scan_allowed(self) -> bool:
+        """BT gate for PIRScanBranch. During a dialogue also drops a pending
+        /pir/scan_active, so a stale request doesn't fire after the dialogue ends."""
+        if not self.is_dialogue_active():
+            return True
+        if self._bb.pir.scan_active:
+            self._bb.pir.scan_active = False
+            self.get_logger().info('PIR: scan request dropped — dialogue in progress')
+        return False
+
     def _face_locked_cb(self, msg: Bool):
         was_locked = self._face_locked
         self._face_locked = msg.data
@@ -1624,6 +1675,7 @@ class BehaviorManagerNode(LifecycleNode):
             self._bb.llm.text or streamed
         )
         if self._bb.llm.has_content and not via_telegram:
+            self._last_dialogue_mono = time.monotonic()
             # Voice = confirmation of presence: allow DialogueBranch even without a face.
             # Telegram requests do not set person_present — the person is not physically present.
             was_present = self._bb.social.person_present
@@ -1796,6 +1848,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._bb.llm.emotion     = 'neutral'
         self._bb.llm.voice_style = ''
         self._reset_face_search()  # the person left — the face-search session is over
+        self._last_dialogue_mono = float('-inf')  # dialogue over — PIR may scan again
         self.get_logger().info('Farewell: person_present=False, vision turned off')
 
     def _robot_sleep_cb(self, msg: Bool):
@@ -1848,6 +1901,7 @@ class BehaviorManagerNode(LifecycleNode):
             return
         if self._bb.robot.sleep:
             return  # sleep mode is handled via /robot_sleep False
+        self._last_dialogue_mono = time.monotonic()
         try:
             person_present = self._bb.social.person_present
         except Exception:
@@ -1903,6 +1957,9 @@ class BehaviorManagerNode(LifecycleNode):
         # SoundScan._found(), and the head thrashed between two command sources.
         if person_present or self._bb.pir.scan_active or self._bb.sound.scan_active \
                 or self._human_detected:
+            return
+        if self.is_dialogue_active():
+            self.get_logger().debug('PIR: motion during an active dialogue — ignoring')
             return
         now = time.monotonic()
         if now - self._last_own_torso_move_mono < self._PIR_SELF_MOTION_BLANK_SEC:
