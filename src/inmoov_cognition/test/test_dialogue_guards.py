@@ -16,10 +16,12 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from inmoov_cognition import llm_node  # noqa: E402
 from inmoov_cognition.dialogue_guards import (  # noqa: E402
     PendingUtterance, ToolAuditLog, filter_tools, parse_tool_list)
 from inmoov_cognition.llm_node import LLMNode, TOOLS  # noqa: E402
@@ -122,7 +124,7 @@ def _stub():
     s = types.SimpleNamespace(
         _lock=threading.Lock(), _introducing=False, _processing=False,
         _pending=PendingUtterance(), _direction_hint_pub=_Pub(), _tts_cancel_pub=_Pub(),
-        _addressed_to_robot=lambda text: True,
+        _addressing_reason=lambda text: 'gaze',
         get_logger=lambda: types.SimpleNamespace(
             info=lambda *a, **k: None, debug=lambda *a, **k: None, warn=lambda *a, **k: None),
         _queried=queried,
@@ -168,6 +170,73 @@ def test_queued_command_dropped_when_introducing(monkeypatch):
     s._introducing = True
     LLMNode._dispatch_pending(s)
     assert s._queried == [] and s._processing is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Addressee gate: name anywhere / gaze now / wake word while no face
+
+def _gate(looking=None, ctx_age=0.1, since_wake=1e6):
+    now = time.monotonic()
+    return types.SimpleNamespace(
+        _lock=threading.Lock(), _looking_at_robot=looking,
+        _social_ctx_ts=now - ctx_age, _wake_ts=now - since_wake, wake_grace_sec=30.0,
+        _ROBOT_NAMES=LLMNode._ROBOT_NAMES,
+        _ROBOT_NAMES_FIRST_WORD=LLMNode._ROBOT_NAMES_FIRST_WORD,
+        _GAZE_CTX_STALE_SEC=LLMNode._GAZE_CTX_STALE_SEC,
+    )
+
+
+def test_gate_name_anywhere():
+    r = LLMNode._addressing_reason
+    assert r(_gate(False), 'Ясно, Леня, спасибо давай пока.') == 'name'
+    assert r(_gate(False), 'Лена, который час?') == 'name'
+    assert r(_gate(False), 'скажи Лене, что я позвоню') is None
+    assert r(_gate(False), 'мне лень туда идти') is None
+
+
+def test_gate_gaze_must_be_true_and_fresh():
+    r = LLMNode._addressing_reason
+    assert r(_gate(True), 'который час') == 'gaze'
+    assert r(_gate(False), 'который час') is None
+    assert r(_gate(True, ctx_age=5.0), 'который час') is None   # identity_manager silent
+
+
+def test_gate_wake_grace_only_without_face():
+    r = LLMNode._addressing_reason
+    assert r(_gate(None, since_wake=10), 'включи свет') == 'wake'
+    assert r(_gate(None, since_wake=60), 'иди домой') is None     # walked away mid-dialogue
+    assert r(_gate(False, since_wake=5), 'иди домой') is None     # face found, looking away
+
+
+def test_social_ctx_none_overwrites_stale_true():
+    s = types.SimpleNamespace(_lock=threading.Lock(), _looking_at_robot=True, _social_ctx_ts=0.0)
+    LLMNode._social_context_cb(s, String(data=json.dumps({'looking_at_robot': None})))
+    assert s._looking_at_robot is None
+
+
+def test_ignore_marker_never_reaches_tts():
+    sent = []
+    s = types.SimpleNamespace(
+        _lock=threading.Lock(), _voice_style={'emotion': ''}, _tg_req_id='',
+        timeout_sec=1.0, _send_tts_chunk=lambda text, style: sent.append(text),
+        get_logger=lambda: types.SimpleNamespace(
+            info=lambda *a, **k: None, debug=lambda *a, **k: None, warn=lambda *a, **k: None),
+    )
+    deltas = ['[ig', 'nore', ']', ' Ладно, я тут ни при чём. Иду домой.']
+    s._stream_llm = lambda payload, t: iter(
+        [(d, False, None) for d in deltas] + [('', True, None)])
+    content, _ = LLMNode._stream_with_tts(s, {})
+    assert llm_node._is_not_addressed(content) and sent == []
+
+    deltas = ['Сейчас десять часов вечера. ', 'Что-нибудь ещё?']
+    content, _ = LLMNode._stream_with_tts(s, {})
+    assert sent and not llm_node._is_not_addressed(content)
+
+
+def test_addressing_block():
+    assert llm_node._build_addressing_block(None) == ''
+    assert '[ignore]' not in llm_node._build_addressing_block('name')
+    assert '[ignore]' in llm_node._build_addressing_block('gaze')
 
 
 # ─────────────────────────────────────────────────────────────────────────────

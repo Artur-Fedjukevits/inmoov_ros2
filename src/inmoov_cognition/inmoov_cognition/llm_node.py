@@ -24,6 +24,7 @@ Tools:
 
 Topics:
   /voice_command   (in)  String — text from Whisper STT
+  /wake_detected   (in)  Bool   — wake word; opens the addressee gate while no face is in view
   /llm_response    (out) String JSON {text, voice_instruct} → BT Blackboard
   /robot_events    (out) String JSON — physical commands (move/arm/head/sleep/search) → BT
   /search_result   (in)  String — search result from behavior_manager
@@ -615,6 +616,15 @@ _ECHO_QUESTION_RE = re.compile(
     r'^(?:Почему|Почём|Почем|О\s+чём|Зачем|По\s+поводу)\b.{0,120}\?\s*',
     re.IGNORECASE | re.UNICODE,
 )
+# What the LLM answers instead of a reply when a voice utterance that got past
+# the addressee gate still clearly wasn't meant for the robot (a phone call,
+# talking to someone else in the room) — see _build_addressing_block/_query_llm.
+_NOT_ADDRESSED_MARKER = '[ignore]'
+
+
+def _is_not_addressed(text: str) -> bool:
+    return text.lstrip().startswith(_NOT_ADDRESSED_MARKER)
+
 # Qwen3 sometimes switches to Chinese on creative tasks — strip ideographs from TTS chunks
 _CJK_RE = re.compile(
     '[⺀-⿿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿'
@@ -942,9 +952,40 @@ def _build_face_search_block(face_search_ctx: dict | None) -> str:
     return '\n' + ''.join(parts) if parts else ''
 
 
+def _build_addressing_block(addressing: str | None) -> str:
+    """Why the current voice utterance was let through the addressee gate.
+
+    addressing: 'name' / 'gaze' / 'wake' / '' (reason unknown, e.g. a queued
+    phrase), None — not a voice request (Telegram): no block at all.
+    Everything except 'name' also gets the [ignore] rule: the gate can't tell a
+    phone call held while facing the robot from a question to it — the LLM can.
+    """
+    if addressing is None:
+        return ''
+    if addressing == 'name':
+        return '\nАдресность: к тебе обратились по имени — реплика точно тебе, отвечай.\n'
+    why = {
+        'gaze': 'собеседник смотрит тебе в глаза',
+        'wake': 'реплика прозвучала сразу после «Эй, Лёня», лицо ещё не найдено',
+    }.get(addressing, 'причина неизвестна')
+    return (
+        f'\nАдресность ({why}): микрофон слышит всё вокруг, и реплика могла быть '
+        f'сказана НЕ тебе — кусок телефонного разговора, человек говорит с кем-то '
+        f'другим в комнате (спорит, отчитывает, обращается к другому человеку, '
+        f'говорит о том, что к тебе не относится), обрывок фразы без вопроса или '
+        f'просьбы к тебе. Если реплика явно не обращена к тебе — не отвечай и не '
+        f'вызывай инструменты, выведи ровно {_NOT_ADDRESSED_MARKER} и больше ничего. '
+        f'Если хочется ответить «я не совсем понял», «я тут ни при чём», «о ком ты '
+        f'говоришь?» — это почти всегда значит, что говорили не тебе → '
+        f'{_NOT_ADDRESSED_MARKER}. Если же реплика продолжает ваш разговор (ответ на '
+        f'твой вопрос, уточнение) или это понятная просьба/вопрос к тебе — отвечай как обычно.\n'
+    )
+
+
 def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
                         memory_context: str = '', scene_ctx: dict | None = None,
-                        face_search_ctx: dict | None = None) -> str:
+                        face_search_ctx: dict | None = None,
+                        addressing: str | None = None) -> str:
     """Builds the system prompt with the device schema and the interlocutor's context.
 
     oh_schema — JSON string with the OpenHAB schema (name/label/type/options, no state).
@@ -953,6 +994,8 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
     scene_ctx — scene summary from scene_manager_node (objects + people around).
     face_search_ctx — face-search status from behavior_manager_node
                        (/behavior/face_search_status), see _build_face_search_block.
+    addressing — why a voice utterance passed the addressee gate, see
+                 _build_addressing_block (None for Telegram).
     """
     if person_ctx:
         name       = person_ctx.get('name') or 'Незнакомец'
@@ -1021,6 +1064,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
     memory_block      = f'\n{memory_context}\n' if memory_context else ''
     scene_block       = _build_scene_block(scene_ctx)
     face_search_block = _build_face_search_block(face_search_ctx)
+    addressing_block  = _build_addressing_block(addressing)
 
     # IMPORTANT: the whole DYNAMIC block (person_block/memory_block/scene_block —
     # time, interlocutor, recent events, surrounding scene — changes on EVERY
@@ -1066,7 +1110,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
 - Если цель команды широкая или неточная ("выключи везде", "выключи весь свет", "выключи всё", "во всём доме") — это означает ВСЕ устройства группы AllLights (для света) или All_Heaters (для отопления). СНАЧАЛА вызови search_openhab_items(group_filter=AllLights, state_filter="ON") чтобы найти включённые устройства, ЗАТЕМ вызови items_control для КАЖДОГО найденного. Не отвечай текстом вместо этой последовательности вызовов.
 
 {devices_block}
-{person_block}{memory_block}{scene_block}{face_search_block}"""
+{person_block}{memory_block}{scene_block}{face_search_block}{addressing_block}"""
 
 
 _RU_WEEKDAY = {
@@ -1183,10 +1227,11 @@ class LLMNode(LifecycleNode):
         # Voice style (+ synchronized facial expression for the duration of speech,
         # see tts_node) — buffered by set_voice_style, included in /llm_response
         self._voice_style    = {'emotion': ''}
-        # Interlocutor's gaze: True/False/None (None = no data from the detector)
-        # Used to filter out speech not addressed to the robot.
+        # Interlocutor's gaze: True/False/None (None = no face / no data from the detector)
+        # Used to filter out speech not addressed to the robot, see _addressing_reason.
         self._looking_at_robot: bool | None = None
-        self._person_present_in_ctx: bool   = False
+        self._social_ctx_ts: float = 0.0   # monotonic time of the last /social_context
+        self._wake_ts:       float = 0.0   # monotonic time of the last wake word
 
         # web_search sync: a background thread waits for the result from BM
         self._search_event          = threading.Event()
@@ -1466,6 +1511,7 @@ class LLMNode(LifecycleNode):
         content_parts: list[str]  = []
         api_tool_calls: list      = []
         tool_call_detected        = False
+        not_addressed             = False
         first_chunk_sent          = False
         chunk_buf: list[str]      = []  # sentences waiting to be sent as one TTS request
         chunk_chars                = 0
@@ -1510,7 +1556,16 @@ class LLMNode(LifecycleNode):
                     chunk_chars = 0
                     self.get_logger().debug('Streaming: tool call — TTS stopped')
 
-            if not tool_call_detected:
+            # The [ignore] answer (see _build_addressing_block) must never reach TTS:
+            # while the start of the response could still turn into the marker — wait.
+            head = buf.lstrip()
+            if not first_chunk_sent and not not_addressed:
+                if _is_not_addressed(head):
+                    not_addressed = True
+                elif _NOT_ADDRESSED_MARKER.startswith(head):
+                    continue
+
+            if not tool_call_detected and not not_addressed:
                 while True:
                     m = _SENT_SPLIT_RE.search(buf, _MIN_SENT_CHARS)
                     if not m and len(buf) >= _MAX_CHUNK_CHARS:
@@ -1536,7 +1591,10 @@ class LLMNode(LifecycleNode):
         # NOTE: with stream:False the loop above breaks immediately (done=True), so
         #   tool_call_detected is always False and api_tool_calls is the only signal of
         #   API tool calls. Text tool calls (ᐈ/xml format) end up here too.
-        if buf.strip() and (not tool_call_detected or tg_req_id) and not api_tool_calls:
+        if not first_chunk_sent and _is_not_addressed(buf):
+            not_addressed = True
+        if buf.strip() and (not tool_call_detected or tg_req_id) and not api_tool_calls \
+                and not not_addressed:
             tail = buf.strip()
             has_text_tool_call = bool(
                 _TEXT_TOOL_CALL_RE.search(tail) or _TOOLS_BLOCK_RE.search(tail)
@@ -1630,50 +1688,65 @@ class LLMNode(LifecycleNode):
         if msg.data and history_snapshot:
             self._publish_conversation_end(history_snapshot, person_ctx)
 
-    # Robot-name variants that Whisper might recognize (lowercase).
-    # If the phrase starts with one of these words — consider it addressed to the robot
-    # regardless of gaze direction.
+    # Robot-name forms as STT writes them (lowercase) — anywhere in the phrase
+    # ("Ясно, Лёня, спасибо"). 'лень' is deliberately absent (laziness).
     _ROBOT_NAMES = frozenset({
-        'лёня', 'леня', 'лена', 'лёне', 'лене', 'лёню', 'леню', 'лёной',
+        'лёня', 'леня', 'лёне', 'лёню', 'леню', 'лёной',
         'лёнечка', 'ленечка', 'лёнь', 'лёней', 'леней',
-        'эй',  # "Эй, Лёня" ("Hey, Lyonya") — the first word is enough
     })
+    # Real female names STT also writes for "Лёня" — only count as the first word
+    # (vocative), otherwise any phone chat about a Лена would pass the gate.
+    _ROBOT_NAMES_FIRST_WORD = frozenset({'лена', 'лене'})
+    _GAZE_CTX_STALE_SEC = 2.0   # /social_context comes @ 2 Hz
 
-    def _addressed_to_robot(self, text: str) -> bool:
-        """True if the text is addressed to the robot: looking it in the eye OR starts with its name.
+    def _addressing_reason(self, text: str) -> str | None:
+        """Why a voice utterance counts as addressed to the robot, None if it doesn't.
 
-        The gate is disabled only when there is no active dialogue (person_present=False) —
-        those are commands after the wake word with no person in frame, no name is expected there.
-        If a person is in frame (present=True) but looking_at_robot=None (the tracker gave
-        no gaze data) — that is NOT a reason to let everything through: we treat it as
-        looking=False and require the name at the start of the phrase.
+        'name' — the robot's name anywhere in the phrase;
+        'gaze' — the interlocutor is looking the robot in the eye right now;
+        'wake' — no face in view yet and the wake word fired < wake_grace_sec ago
+                 (the start of a dialogue, before the head found the face).
+        Everything else — a face looking away, or no face and no recent wake word
+        (person walked off mid-dialogue) — is not the robot's business.
         """
+        words = re.findall(r'[а-яё]+', text.lower())
+        if self._ROBOT_NAMES.intersection(words) or (
+                words and words[0] in self._ROBOT_NAMES_FIRST_WORD):
+            return 'name'
+        now = time.monotonic()
         with self._lock:
             looking = self._looking_at_robot
-            present = self._person_present_in_ctx
-
-        # No active dialogue (nobody in frame) → don't filter
-        if not present:
-            return True
+            if now - self._social_ctx_ts > self._GAZE_CTX_STALE_SEC:
+                looking = None      # identity_manager asleep/silent — no gaze data
+            since_wake = now - self._wake_ts
         if looking:
-            return True
-        # Not looking at the camera or no gaze data — check the name (first 3 words)
-        first_words = {w.strip('.,!?-—') for w in text.lower().split()[:3]}
-        if first_words & self._ROBOT_NAMES:
-            return True
-        return False
+            return 'gaze'
+        if looking is None and since_wake < self.wake_grace_sec:
+            return 'wake'
+        return None
+
+    def _wake_cb(self, msg: Bool):
+        if msg.data:
+            with self._lock:
+                self._wake_ts = time.monotonic()
 
     def command_callback(self, msg: String):
         text = msg.data.strip()
         if not text:
             return  # voice_detector publishes an empty string on silence — ignore it
 
-        # Addressee filter: if the person isn't looking at the robot and the name wasn't spoken — ignore.
-        # Runs before the lock: _addressed_to_robot has its own lock.
-        if not self._addressed_to_robot(text):
+        # Addressee filter: no name, not looking at the robot, not right after the
+        # wake word — ignore.
+        # Runs before the lock: _addressing_reason takes it itself.
+        addressing = self._addressing_reason(text)
+        if addressing is None:
+            with self._lock:
+                looking = self._looking_at_robot
             self.get_logger().info(
-                f'LLM: speech not addressed to the robot (gaze=False) — skipping: "{text[:60]}"')
+                f'LLM: speech not addressed to the robot (gaze={looking}, no name, '
+                f'no recent wake word) — skipping: "{text[:60]}"')
             return
+        self.get_logger().info(f'LLM: addressed to the robot ({addressing})')
 
         # Parsing the voice direction hint — independent of, and before, the LLM request
         # (doesn't block/slow down the response). Published on EVERY addressed
@@ -1701,7 +1774,8 @@ class LLMNode(LifecycleNode):
         _cancel.data = True
         self._tts_cancel_pub.publish(_cancel)
         threading.Thread(
-            target=self._query_llm, args=(text,), daemon=True,
+            target=self._query_llm, args=(text,), kwargs={'addressing': addressing},
+            daemon=True,
         ).start()
 
     def _telegram_ask_cb(self, msg: String):
@@ -1755,8 +1829,11 @@ class LLMNode(LifecycleNode):
     # ── Main LLM request ────────────────────────────────────────────────
 
     def _query_llm(self, user_text: str, person_ctx_override: dict | None = None,
-                    image_b64: str | None = None, source: str = 'voice'):
+                    image_b64: str | None = None, source: str = 'voice',
+                    addressing: str = ''):
         _t0 = time.time()
+        if source != 'voice':
+            addressing = None   # no addressee question outside voice
         self._queried_since_activate = True
         denied = self._tg_denied_tools if source == 'telegram' else frozenset()
         tools  = filter_tools(TOOLS, denied)
@@ -1778,7 +1855,8 @@ class LLMNode(LifecycleNode):
                 face_search_ctx   = self._face_search_status
 
             system_prompt = build_system_prompt(
-                oh_schema, person_ctx, memory_context, scene_ctx, face_search_ctx)
+                oh_schema, person_ctx, memory_context, scene_ctx, face_search_ctx,
+                addressing)
             if scene_ctx:
                 _scene_age = time.time() - scene_ctx.get('updated_at', 0)
                 _scene_labels = [o['label'] for o in scene_ctx.get('objects', [])]
@@ -2111,6 +2189,14 @@ class LLMNode(LifecycleNode):
                             else:
                                 self.get_logger().warn('Empty final LLM response — staying silent')
 
+            elif addressing is not None and _is_not_addressed(response_msg.get('content', '')):
+                # The LLM judged the utterance as not meant for the robot: say nothing,
+                # drop the user turn from history and don't publish /llm_response
+                # (it would refresh the BM's voice presence and keep the dialogue alive).
+                self.history.pop()
+                self.get_logger().info(
+                    f'LLM: {_NOT_ADDRESSED_MARKER} — utterance judged not addressed to the '
+                    f'robot ({time.time()-_t0:.1f}s): "{user_text[:60]}"')
             else:
                 text = response_msg.get('content', '').strip()
                 self.history.append({'role': 'assistant', 'content': text})
@@ -2700,11 +2786,12 @@ class LLMNode(LifecycleNode):
         try:
             data = json.loads(msg.data)
             with self._lock:
-                # looking_at_robot: True/False from identity_manager, None if no data
+                # looking_at_robot: True/False from identity_manager, None if no face in
+                # view right now. None must overwrite: a stale True would keep the gate
+                # open after the person turned away or left.
                 raw = data.get('looking_at_robot')
-                if raw is not None:
-                    self._looking_at_robot = bool(raw)
-                self._person_present_in_ctx = bool(data.get('person_present', False))
+                self._looking_at_robot = None if raw is None else bool(raw)
+                self._social_ctx_ts    = time.monotonic()
         except Exception:
             pass
 
@@ -3051,6 +3138,10 @@ class LLMNode(LifecycleNode):
         self._dp('telegram_tool_denylist', 'robot_control,look_direction,merge_persons')
         # JSONL audit of every tool call ('' = off)
         self._dp('tool_audit_log',      '~/.ros/inmoov_tool_audit.jsonl')
+        # Addressee gate: how long after the wake word speech counts as addressed
+        # while no face is in view (see _addressing_reason). Covers the first
+        # phrase (recording alone can take up to max_phrase_sec=20s) plus a quick follow-up.
+        self._dp('wake_grace_sec',      30.0)
 
         # A separate vision model (look_and_describe/look_direction) — accepts
         # 2-4 base64 images in one request, an OpenAI-compatible /v1/chat/completions.
@@ -3086,6 +3177,7 @@ class LLMNode(LifecycleNode):
         self._tg_denied_tools  = parse_tool_list(
             self.get_parameter('telegram_tool_denylist').value)
         self._audit            = ToolAuditLog(self.get_parameter('tool_audit_log').value)
+        self.wake_grace_sec    = self.get_parameter('wake_grace_sec').value
         self._active_url       = self.llm_url
 
         _latched = QoSProfile(
@@ -3108,6 +3200,7 @@ class LLMNode(LifecycleNode):
                                   self._eye_camera_cb, _CAMERA_QOS)
         self.create_subscription(CompressedImage, '/camera/eye_right/compressed',
                                   self._eye_camera_right_cb, _CAMERA_QOS)
+        self.create_subscription(Bool,   'wake_detected',   self._wake_cb,                 10)
         self.create_subscription(Bool,   '/introducing',    self._introducing_cb,          10)
         self.create_subscription(Bool,   '/go_idle',        self._go_idle_cb,              10)
         self.create_subscription(Bool,   '/robot_sleep',    self._robot_sleep_cb,          _latched)

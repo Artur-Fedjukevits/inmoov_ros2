@@ -60,6 +60,7 @@ class State:
 class IdentityManagerNode(LifecycleNode):
     _SV_SESSION_MAX = 3      # max number of voice recordings per INTERACTING session
     _SV_SESSION_GAP = 120.0  # minimum interval between recordings (sec)
+    _GAZE_STALE_SEC = 1.5    # no primary-track kps for longer → gaze unknown (None)
 
     def __init__(self):
         super().__init__('identity_manager_node')
@@ -106,6 +107,10 @@ class IdentityManagerNode(LifecycleNode):
         # A sliding window of the last 15 values is kept (~1.5s @ 10Hz detection).
         self._frontal_scores: collections.deque = collections.deque(maxlen=15)
         self._looking_at_robot: bool = True  # default True until data is available
+        # When the primary track last gave kps. Older than _GAZE_STALE_SEC → the face
+        # is gone: /social_context reports looking_at_robot=None instead of the last
+        # verdict (a stale True kept the llm_node addressee gate open after leaving).
+        self._gaze_ts: float = 0.0
 
         # Voice fingerprint of the current session (from voice_detector via /voice_embedding)
         self._session_voice_emb: list | None = None
@@ -296,6 +301,12 @@ class IdentityManagerNode(LifecycleNode):
                             eye_dist    = abs(kps[1][0] - kps[0][0])
                             nose_offset = abs(kps[2][0] - eye_mid_x)
                             yaw_proxy   = nose_offset / max(eye_dist, 1.0)
+                            now = time.monotonic()
+                            if now - self._gaze_ts > self._GAZE_STALE_SEC:
+                                # The face is back after a gap — don't let the old
+                                # window vote for the new look
+                                self._frontal_scores.clear()
+                            self._gaze_ts = now
                             self._frontal_scores.append(yaw_proxy)
                             if len(self._frontal_scores) >= 3:
                                 frontal_fraction = sum(
@@ -1532,7 +1543,8 @@ class IdentityManagerNode(LifecycleNode):
             emotion         = self._last_emotion or 'neutral'
             intro           = (state == State.INTRODUCING)
             looking         = self._looking_at_robot
-            has_face        = bool(self._frontal_scores)
+            has_face        = (len(self._frontal_scores) >= 3
+                               and time.monotonic() - self._gaze_ts <= self._GAZE_STALE_SEC)
 
         person_present = state != State.IDLE
         ctx = {
@@ -1544,7 +1556,8 @@ class IdentityManagerNode(LifecycleNode):
             'state':             state,
             'introducing':       intro,
             # True if the interlocutor is looking the robot in the eye (yaw-proxy < 30% of
-            # inter-eye dist, >50% of frames over the last ~1.5s). None if the track has no kps / no data.
+            # inter-eye dist, >50% of frames over the last ~1.5s). None if no face kps in the
+            # last _GAZE_STALE_SEC (face gone / no data) or fewer than 3 frames yet.
             'looking_at_robot':  looking if has_face else None,
             # One-shot flags (reset after the first publish)
             'should_greet':      self._should_greet,
