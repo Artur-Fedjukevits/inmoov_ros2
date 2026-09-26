@@ -37,11 +37,9 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import collections
-import faulthandler
 import json
 import math
 import os
-import sys
 import threading
 import time
 import serial
@@ -64,11 +62,7 @@ from .protocol import (
 _RECONNECT_MIN_SEC = 2.0    # first reopen attempt after a serial error
 _RECONNECT_MAX_SEC = 30.0   # back-off cap
 _STATE_RESEND_SEC  = 2.0    # periodic re-send of sleep flag + speeds
-# If the 50 Hz TX timer doesn't run for this long, faulthandler dumps every thread's
-# stack to stderr — from a native thread, so it works even when the process is frozen
-# with the GIL held. Forensics for the ~1.5 s host stalls that trip the firmware
-# failsafe (fires well before the firmware's 1.5 s). 0 = off.
-_STALL_DUMP_SEC    = 0.8
+_TX_PERIOD_SEC     = 0.02   # 50 Hz servo stream = the firmware failsafe's heartbeat
 
 
 def deg_to_rad(deg: float, center: float = 90.0) -> float:
@@ -154,7 +148,7 @@ class ArduinoCommNode(LifecycleNode):
         self._parser     = FrameParser()
         self._running    = False   # RX thread stop flag
         self._rx_thread  = None
-        self._tx_timer   = None
+        self._tx_thread  = None    # 50 Hz TX loop (own thread, not an rclpy timer)
         self._last_state_resend = 0.0
 
         # Subscription/publisher handles (set in on_configure, destroyed in on_cleanup)
@@ -170,7 +164,7 @@ class ArduinoCommNode(LifecycleNode):
         self._diag           = None
         self._failsafe       = False   # last CMD_STATUS from the firmware
         self._last_rx_t      = 0.0     # monotonic time of the last RX frame
-        # Link timing trace for failsafe forensics: (monotonic, text) of TX timer
+        # Link timing trace for failsafe forensics: (monotonic, text) of TX loop
         # stalls, slow write/flush and RX gaps, dumped when the firmware reports a
         # failsafe — tells a stalled host from a stalled / frame-dropping board.
         self._link_trace: collections.deque = collections.deque(maxlen=64)
@@ -238,33 +232,26 @@ class ArduinoCommNode(LifecycleNode):
                 p.on_deactivate(state)
             return TransitionCallbackReturn.FAILURE
 
-        self._tx_timer = self.create_timer(0.02, self._send_servos)
         self._owners_timer = self.create_timer(1.0, self._publish_owners)
 
         self._running   = True
+        self._last_tx_t = self._last_rx_t = 0.0   # no stale gap from before a deactivate
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thread.start()
+        # The heartbeat runs in its own thread: an rclpy timer ticked late by up to
+        # 1.8 s under the executor (host-loss failsafe with the host fine)
+        self._tx_thread = threading.Thread(target=self._tx_loop, daemon=True)
+        self._tx_thread.start()
 
         self.get_logger().info(
             f'{self.get_name()} active | port={self._serial_port}')
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
-        # The TX timer stops here — disarm its stall trap first
-        faulthandler.cancel_dump_traceback_later()
-        # Send servos to rest position
+        # Threads first: the rest frame must not interleave with a TX-loop frame
+        self._stop_threads()
         self._send_rest_positions()
 
-        # Stop the RX thread
-        self._running = False
-        if self._rx_thread and self._rx_thread.is_alive():
-            self._rx_thread.join(timeout=2.0)
-        self._rx_thread = None
-
-        # Stop the TX timer
-        if self._tx_timer:
-            self.destroy_timer(self._tx_timer)
-            self._tx_timer = None
         if self._owners_timer:
             self.destroy_timer(self._owners_timer)
             self._owners_timer = None
@@ -289,15 +276,22 @@ class ArduinoCommNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state):
-        faulthandler.cancel_dump_traceback_later()
+        self._stop_threads()
         self._send_rest_positions()
         self._close_serial()
         return TransitionCallbackReturn.SUCCESS
 
     def on_error(self, state):
-        faulthandler.cancel_dump_traceback_later()
+        self._stop_threads()
         self._close_serial()
         return TransitionCallbackReturn.SUCCESS
+
+    def _stop_threads(self):
+        self._running = False
+        for t in (self._rx_thread, self._tx_thread):
+            if t and t.is_alive() and t is not threading.current_thread():
+                t.join(timeout=2.0)
+        self._rx_thread = self._tx_thread = None
 
     def _send_rest_positions(self):
         rest_body = [rest for _, _, rest in self.BODY_JOINTS]
@@ -432,7 +426,7 @@ class ArduinoCommNode(LifecycleNode):
                 self.get_logger().error(
                     'Arduino entered host-loss FAILSAFE (no servo frames for 1.5 s) '
                     '— returning to rest | host side, last 5 s: '
-                    + ('; '.join(recent) if recent else 'TX timer and writes on time, no RX gaps'))
+                    + ('; '.join(recent) if recent else 'TX loop and writes on time, no RX gaps'))
             else:
                 self.get_logger().warn('Arduino left failsafe — servo frames resumed')
             if self._failsafe_pub:
@@ -561,17 +555,28 @@ class ArduinoCommNode(LifecycleNode):
     # TX: send servo packet at 50 Hz
     # -----------------------------------------------------------------------
 
+    def _tx_loop(self) -> None:
+        next_t = time.monotonic()
+        try:
+            while self._running:
+                self._send_servos()
+                next_t += _TX_PERIOD_SEC
+                delay = next_t - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    next_t = time.monotonic()   # late: don't burst to catch up
+        except Exception as e:
+            self.get_logger().error(f'TX thread crashed: {e}', exc_info=True)
+
     def _send_servos(self) -> None:
-        if _STALL_DUMP_SEC > 0:
-            # Re-arm on every tick: fires only when the NEXT tick is late
-            faulthandler.dump_traceback_later(_STALL_DUMP_SEC, file=sys.stderr)
         ser = self._ser
         if ser is None or not ser.is_open:
             return
 
         now = time.monotonic()
         if self._last_tx_t and now - self._last_tx_t > 0.3:
-            self._link_trace.append((now, f'TX timer stalled {now - self._last_tx_t:.2f}s'))
+            self._link_trace.append((now, f'TX loop stalled {now - self._last_tx_t:.2f}s'))
         self._last_tx_t = now
         with self._lock:
             if now - self._last_state_resend >= _STATE_RESEND_SEC:

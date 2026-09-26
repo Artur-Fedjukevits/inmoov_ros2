@@ -43,7 +43,7 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import rclpy
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor
 from .arduino_comm_node import ArduinoCommNode
 
 DEFAULT_PORT = '/dev/serial/by-path/pci-0000:c6:00.3-usb-0:5:1.0-port0'
@@ -98,7 +98,7 @@ def main(args=None):
     known, _ = parser.parse_known_args()
 
     node = ArduinoRightNode(serial_port=known.port)
-    executor = MultiThreadedExecutor()
+    executor = SingleThreadedExecutor()
     executor.add_node(node)
     try:
         executor.spin()
