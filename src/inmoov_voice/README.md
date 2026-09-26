@@ -283,7 +283,7 @@ short, empty result, exception) an **empty string** is still published, so
 | Name | Type | Default | Meaning |
 |---|---|---|---|
 | `model_name` | string | `nemo-parakeet-tdt-0.6b-v3` | Model name passed to `onnx_asr.load_model`. |
-| `quantization` | string | `int8` | Quantization variant. |
+| `quantization` | string | `''` | Quantization variant; `''` = full precision (int8 lost quiet / far-field Russian speech). |
 | `language` | string | `ru` | Passed to `recognize(..., language=...)`. |
 | `pnc` | bool | `True` | Punctuation and capitalization. |
 | `min_audio_sec` | double | `0.8` | Shorter audio is not transcribed. |

@@ -46,7 +46,10 @@ class ParakeetSTTNode(LifecycleNode):
 
     def on_configure(self, state):
         self._dp('model_name',    'nemo-parakeet-tdt-0.6b-v3')
-        self._dp('quantization',  'int8')
+        # '' = full-precision model. int8 returned empty text for quiet / far-field
+        # Russian speech that the full model transcribes correctly (live 2026-09-26),
+        # for only +10-40 ms per phrase.
+        self._dp('quantization',  '')
         self._dp('language',      'ru')
         self._dp('pnc',           True)   # punctuation & capitalization
         self._dp('min_audio_sec', 0.8)
@@ -63,7 +66,8 @@ class ParakeetSTTNode(LifecycleNode):
             f'Loading Parakeet ({self.model_name}, quant={self.quantization})...')
         t0 = time.perf_counter()
         import onnx_asr
-        self._model = onnx_asr.load_model(self.model_name, quantization=self.quantization)
+        self._model = onnx_asr.load_model(self.model_name,
+                                          quantization=self.quantization or None)
         self.get_logger().info(
             f'Parakeet model ready in {time.perf_counter() - t0:.1f}s')
 

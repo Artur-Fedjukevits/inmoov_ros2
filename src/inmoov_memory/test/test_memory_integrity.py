@@ -329,3 +329,24 @@ def test_foreign_ack_ignored(node, tmp_path):
     _ack(node, f'reminder:{rid}', True)               # never sent by us
     _ack(node, 'openhab:42', True)
     assert not _delivered(node, rid)
+
+
+def test_voice_gallery_replacement_keeps_cache_and_db_in_sync(node):
+    """Migrated entries share one recorded_at; replacing the oldest used to drop all of
+    them from the cache but only one DB row (found live 2026-09-26: cache 10, DB 15)."""
+    _add_person(node, 1, 'Артур', n_photos=0, n_voice=0, seed=1)
+    base = _vec(7, VOICE_DIM)
+    for i in range(10):   # 6 entries share a timestamp, all older than 7 days
+        v = base + 0.05 * _vec(100 + i, VOICE_DIM)
+        node._db.execute('INSERT INTO voice_gallery (person_id, embedding, recorded_at) VALUES (?,?,?)',
+                         (1, (v / np.linalg.norm(v)).astype(np.float32).tobytes(),
+                          1000.0 if i < 6 else 2000.0 + i))
+    node._db.commit()
+    node._load_voice_gallery_cache()
+    for k in range(3):
+        v = base + 0.05 * _vec(200 + k, VOICE_DIM)
+        res = node._add_voice_to_gallery({'person_id': 1, 'embedding': v.tolist()})
+        assert res['added'] and res['count'] == 10, res
+    db_ids = {r[0] for r in node._db.execute('SELECT id FROM voice_gallery WHERE person_id=1')}
+    assert len(db_ids) == 10
+    assert {e['id'] for e in node._voice_gallery_cache[1]} == db_ids

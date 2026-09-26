@@ -434,12 +434,13 @@ class MemoryNode(LifecycleNode):
         try:
             with self._lock:
                 rows = self._db.execute(
-                    'SELECT person_id, embedding, recorded_at FROM voice_gallery ORDER BY recorded_at ASC'
+                    'SELECT person_id, embedding, recorded_at, id FROM voice_gallery '
+                    'ORDER BY recorded_at ASC, id ASC'
                 ).fetchall()
         except sqlite3.OperationalError:
             rows = []
         self._voice_gallery_cache = {}
-        for pid, blob, ts in rows:
+        for pid, blob, ts, row_id in rows:
             emb = np.frombuffer(blob, dtype=np.float32).copy()
             if emb.shape[0] != self._voice_emb_dim:
                 continue
@@ -447,7 +448,7 @@ class MemoryNode(LifecycleNode):
             if norm > 0:
                 emb /= norm
             self._voice_gallery_cache.setdefault(pid, []).append(
-                {'emb': emb, 'recorded_at': float(ts)}
+                {'emb': emb, 'recorded_at': float(ts), 'id': row_id}
             )
         total = sum(len(v) for v in self._voice_gallery_cache.values())
         self.get_logger().info(
@@ -1362,14 +1363,14 @@ class MemoryNode(LifecycleNode):
             self._gallery_cache.pop(pid, None)
 
         rows = self._db.execute(
-            'SELECT embedding, recorded_at FROM voice_gallery WHERE person_id=? '
-            'ORDER BY recorded_at ASC', (pid,)).fetchall()
+            'SELECT embedding, recorded_at, id FROM voice_gallery WHERE person_id=? '
+            'ORDER BY recorded_at ASC, id ASC', (pid,)).fetchall()
         entries = []
-        for blob, ts in rows:
+        for blob, ts, row_id in rows:
             emb = np.frombuffer(blob, dtype=np.float32).copy()
             norm = np.linalg.norm(emb)
             if emb.shape[0] == self._voice_emb_dim and norm > 0:
-                entries.append({'emb': emb / norm, 'recorded_at': float(ts)})
+                entries.append({'emb': emb / norm, 'recorded_at': float(ts), 'id': row_id})
         if entries:
             self._voice_gallery_cache[pid] = entries
         else:
@@ -1589,12 +1590,12 @@ class MemoryNode(LifecycleNode):
                                 'centroid_sim': sim}
 
             if len(entries) < self._SV_GALLERY_MAX:
-                self._db.execute(
+                cur = self._db.execute(
                     'INSERT INTO voice_gallery (person_id, embedding, recorded_at) VALUES (?,?,?)',
                     (pid, new_emb.tobytes(), recorded_at))
                 self._db.commit()
                 self._voice_gallery_cache.setdefault(pid, []).append(
-                    {'emb': new_emb, 'recorded_at': recorded_at})
+                    {'emb': new_emb, 'recorded_at': recorded_at, 'id': cur.lastrowid})
                 self.get_logger().info(
                     f'Voice gallery [{pid}]: entry added '
                     f'({len(self._voice_gallery_cache[pid])}/{self._SV_GALLERY_MAX})')
@@ -1607,21 +1608,18 @@ class MemoryNode(LifecycleNode):
                 return {'added': False, 'reason': 'gallery_full_and_fresh',
                         'oldest_age_days': round(age_days, 1)}
 
-            # Remove the oldest entry, add the new one
-            # Find the row id to delete
-            row = self._db.execute(
-                'SELECT id FROM voice_gallery WHERE person_id=? ORDER BY recorded_at ASC LIMIT 1',
-                (pid,)).fetchone()
-            if row:
-                self._db.execute('DELETE FROM voice_gallery WHERE id=?', (row[0],))
-            self._db.execute(
+            # Replace exactly the oldest entry — by row id: several entries may share
+            # a recorded_at (migrated ones all have the same one), and dropping them all
+            # from the cache while deleting one DB row left cache and DB out of sync.
+            self._db.execute('DELETE FROM voice_gallery WHERE id=?', (oldest['id'],))
+            cur = self._db.execute(
                 'INSERT INTO voice_gallery (person_id, embedding, recorded_at) VALUES (?,?,?)',
                 (pid, new_emb.tobytes(), recorded_at))
             self._db.commit()
 
             # Update the cache
-            entries = [e for e in entries if e['recorded_at'] != oldest['recorded_at']]
-            entries.append({'emb': new_emb, 'recorded_at': recorded_at})
+            entries = [e for e in entries if e is not oldest]
+            entries.append({'emb': new_emb, 'recorded_at': recorded_at, 'id': cur.lastrowid})
             self._voice_gallery_cache[pid] = entries
             self.get_logger().info(
                 f'Voice gallery [{pid}]: replaced oldest entry '
