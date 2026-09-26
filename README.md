@@ -119,6 +119,9 @@ and launch arguments):
 ros2 launch inmoov_bringup inmoov.launch.py
 ```
 
+On the robot the stack runs as a systemd user service — unit, start scripts and
+install steps are in [`tools/systemd/`](tools/systemd/README.md).
+
 This is the only launch file of the stack (all nodes are lifecycle nodes
 driven by `lifecycle_manager`); `vision:=false` / `telegram:=true` toggle the
 optional parts. Single nodes can be run with `ros2 run` and transitioned with

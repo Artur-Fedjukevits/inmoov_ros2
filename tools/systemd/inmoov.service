@@ -1,0 +1,63 @@
+# inmoov.service — systemd USER unit that runs the whole robot stack.
+# Install: see tools/systemd/README.md. Copy of the unit running on the robot
+# (~/.config/systemd/user/inmoov.service), with %h instead of the home path.
+#
+# Author: Artur Fedjukevits
+# Assisted by: Claude Code (Anthropic)
+# License: GNU General Public License v3.0 (see repository root LICENSE)
+
+[Unit]
+Description=InMoov Robot Full Stack
+# Сеть нужна для vLLM/TTS на 192.168.10.118
+# PipeWire должен быть готов раньше нас (Jabra sink нужен audio_source + tts)
+After=network-online.target pipewire.service wireplumber.service pipewire-pulse.service
+Wants=network-online.target pipewire.service wireplumber.service pipewire-pulse.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/inmoov.env
+
+# Аварийный предохранитель (инцидент 2026-08-07: busy-retry петля в
+# PortAudio/ALSA при сбое PipeWire съела все 16 ядер + завалила journald,
+# из-за чего зависла вся машина, включая SSH). Даже если в коде всплывёт
+# новый баг того же рода, система не должна вставать колом целиком —
+# оставляем системе/SSH гарантированный запас CPU и RAM.
+#
+# Инцидент 2026-08-15: 1200% (12/16 потоков) оказался слишком тесен для
+# легитимного пика нагрузки — burst при приветствии (2x face_detection на
+# CPU + запись фото в галерею + распознавание) регулярно превышал лимит,
+# и cgroup CFS throttling замораживал ВЕСЬ cgroup разом, включая tts_node
+# с открытым аудио-потоком → слышимые XRun/хрип. Подтверждено:
+# cpu.stat nr_throttled=2312/8443 периодов (27%), throttled_usec=714.7с
+# за ~14 минут работы. 1400% оставляет те же 2 потока для OS/SSH (как и
+# было задумано), но даёт легитимному burst-пику больше запаса.
+# 2026-09-26: CPUQuota (CFS bandwidth throttling) replaced by CPUAffinity. When the
+# group used up its quota in a period the kernel froze EVERY process of the service
+# at once — first TTS crackle (above), then false Arduino host-loss failsafes: the
+# arduino node's TX timer AND RX thread stalled together for ~1.6 s (27x in a day).
+# Pinning to CPUs 0-13 keeps 2 hardware threads for the OS/SSH (the runaway-thread
+# guard from 2026-08-07) without ever freezing the stack; inside those 14 CPUs the
+# normal scheduler shares time, so light nodes get their slice in milliseconds.
+CPUAffinity=0-13
+MemoryHigh=18G
+MemoryMax=22G
+
+# Ждём пока PipeWire поднимет Jabra sink (до 30с)
+# Выход 0 всегда — lifecycle_manager сам обнаружит проблему через on_activate
+ExecStartPre=%h/ros2_ws/tools/systemd/inmoov_pipewire_wait.sh
+
+ExecStart=%h/ros2_ws/tools/systemd/inmoov_start.sh
+
+# Перезапуск через 15с при любом падении (кроме явного systemctl stop)
+Restart=on-failure
+RestartSec=15
+
+# Lifecycle nodes завершаются корректно через on_deactivate/on_shutdown
+TimeoutStopSec=30
+
+# Логи через journald — смотреть: journalctl --user -u inmoov -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
