@@ -10,11 +10,12 @@ Subscribes:
 
 Publishes:
   wake_detected (Bool)    — True on activation (debounced)
-  wake_score    (Float32) — raw model score for every chunk, for tuning/diagnostics
+  wake_score    (Float32) — raw model score for every 80 ms frame, for tuning/diagnostics
 
 Parameters:
   model_path    (str)   — path to the custom .onnx wake word model
-  threshold     (float) — activation score threshold (default 0.2)
+  threshold     (float) — activation score threshold (default 0.9)
+  patience      (int)   — consecutive 80 ms frames >= threshold required to activate (default 2)
   debounce_sec  (float) — minimum interval between two activations (default 1.5)
 
 Author: Artur Fedjukevits
@@ -31,14 +32,19 @@ from std_msgs.msg import Bool, Float32, Float32MultiArray
 import numpy as np
 from openwakeword.model import Model
 
+FRAME_SAMPLES = 1280   # openWakeWord computes one score per 80 ms at 16 kHz
+
 
 class WakeWordNode(LifecycleNode):
     def __init__(self):
         super().__init__('wakeword_node')
         self.model            = None
         self.model_key        = None
-        self.threshold        = 0.2
+        self.threshold        = 0.9
+        self.patience         = 2
         self.debounce_sec     = 1.5
+        self._frames_above    = 0     # consecutive frames with score >= threshold
+        self._buf             = np.zeros(0, dtype=np.int16)
         self.last_activation  = 0.0
         self.activation_count = 0
         self.wake_pub         = None
@@ -55,11 +61,13 @@ class WakeWordNode(LifecycleNode):
             'model_path',
             os.path.expanduser('~/openWakeWord/my_custom_model/ey_lyonya.onnx')
         )
-        self._dp('threshold',    0.2)
+        self._dp('threshold',    0.9)
+        self._dp('patience',     2)
         self._dp('debounce_sec', 1.5)
 
         model_path        = self.get_parameter('model_path').value
         self.threshold    = self.get_parameter('threshold').value
+        self.patience     = max(1, int(self.get_parameter('patience').value))
         self.debounce_sec = self.get_parameter('debounce_sec').value
 
         self.wake_pub  = self.create_lifecycle_publisher(Bool,    'wake_detected', 10)
@@ -73,7 +81,8 @@ class WakeWordNode(LifecycleNode):
         self.model_key = None
         self.create_subscription(Float32MultiArray, 'raw_audio', self._audio_callback, 20)
         self.get_logger().info(
-            f"Wake word ready (threshold={self.threshold}, debounce={self.debounce_sec}s)")
+            f"Wake word ready (threshold={self.threshold}, patience={self.patience}, "
+            f"debounce={self.debounce_sec}s)")
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
@@ -84,6 +93,8 @@ class WakeWordNode(LifecycleNode):
 
     def on_deactivate(self, state):
         self._active = False
+        self._buf = np.zeros(0, dtype=np.int16)
+        self._frames_above = 0
         self.wake_pub.on_deactivate(state)
         self.score_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
@@ -104,7 +115,16 @@ class WakeWordNode(LifecycleNode):
         # float32 [-1, 1] → int16 (openWakeWord expects int16)
         audio = (np.array(msg.data, dtype=np.float32) * 32768.0).astype(np.int16)
 
-        prediction = self.model.predict(audio)
+        # Feed the model exactly one 80 ms frame per predict() call, so that
+        # `patience` counts real model frames. With smaller chunks (e.g. 512)
+        # predict() just repeats the previous score.
+        self._buf = np.concatenate((self._buf, audio))
+        while len(self._buf) >= FRAME_SAMPLES:
+            frame, self._buf = self._buf[:FRAME_SAMPLES], self._buf[FRAME_SAMPLES:]
+            self._process_frame(frame)
+
+    def _process_frame(self, frame: np.ndarray):
+        prediction = self.model.predict(frame)
 
         # Determine the model key on the first call
         if self.model_key is None and prediction:
@@ -119,11 +139,14 @@ class WakeWordNode(LifecycleNode):
         score_msg.data = score
         self.score_pub.publish(score_msg)
 
+        self._frames_above = self._frames_above + 1 if score >= self.threshold else 0
+
         now = time.time()
 
-        if score >= self.threshold and (now - self.last_activation) >= self.debounce_sec:
+        if self._frames_above >= self.patience and (now - self.last_activation) >= self.debounce_sec:
             self.last_activation  = now
             self.activation_count += 1
+            self._frames_above    = 0
             wake_msg = Bool()
             wake_msg.data = True
             self.wake_pub.publish(wake_msg)

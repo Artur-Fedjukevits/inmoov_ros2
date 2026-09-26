@@ -153,7 +153,8 @@ the first model key returned is used as the score.
 | Name | Type | Default | Meaning |
 |---|---|---|---|
 | `model_path` | string | `/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx` | Path to the custom `.onnx` model. **Machine-specific default — override it.** |
-| `threshold` | double | `0.2` | Activation score threshold (launch default `wakeword_threshold` is the same). |
+| `threshold` | double | `0.9` | Activation score threshold (launch default `wakeword_threshold` is the same). |
+| `patience` | int | `2` | Consecutive 80 ms model frames with score ≥ `threshold` required to activate (launch arg `wakeword_patience`). Cuts single-frame spikes from TV/speech. |
 | `debounce_sec` | double | `1.5` | Minimum time between two activations. |
 
 **Topics**
@@ -162,7 +163,7 @@ the first model key returned is used as the score.
 |---|---|---|---|
 | `raw_audio` | `std_msgs/Float32MultiArray` | subscribe (depth 20) | 16 kHz float32. |
 | `wake_detected` | `std_msgs/Bool` | publish (lifecycle, depth 10) | `True` on activation (debounced). |
-| `wake_score` | `std_msgs/Float32` | publish (lifecycle, depth 10) | Raw model score for every chunk; for tuning. |
+| `wake_score` | `std_msgs/Float32` | publish (lifecycle, depth 10) | Raw model score for every 80 ms frame; for tuning. |
 
 The model is loaded in `on_configure`. The `raw_audio` subscription is created
 there too, but the callback skips inference until the node is *activated*.
@@ -190,20 +191,24 @@ embeddings, RMS-normalised to 0.05 before embedding).
   `silence_duration_sec` of silence, or is force-finished at `max_phrase_sec`.
   If no speech starts within `no_speech_timeout_sec` the node goes back to
   wake-word mode (unless it should keep listening, see below).
-- *Speaker verification* (when enabled and the encoder loaded): speech is
-  accumulated in `sv_segment_sec` segments. The first segment of a session
-  seeds a per-session gallery (up to 10 embeddings, one new entry at most every
-  30 s, oldest replaced first). Later segments are compared with the gallery
-  using the **maximum** cosine similarity; segments below the threshold are
-  dropped as a foreign voice (TV, other people). The threshold is
-  progressive: `sv_threshold` for a full segment, decreasing linearly to
-  `sv_threshold - 0.15` at 0.5 s (the ECAPA minimum; shorter audio is not
-  embedded), never below 0.20. The silence counter is reset only when a
-  segment is accepted, so a foreign voice cannot stretch the recording to
-  `max_phrase_sec`. New embeddings are published on `/voice_embedding` for the
-  identity manager to store; the gallery can be preloaded from the database
-  through `/voice_anchor` (an anchor for a *different* `person_id` replaces the
-  live gallery).
+- *Speaker verification* (when enabled and the encoder loaded) is decided per
+  **phrase**: the phrase is recorded exactly as without SV, then one ECAPA-TDNN
+  embedding of all its speech is compared with the current speaker's reference
+  (the gallery preloaded from the database via `/voice_anchor`, or the session's
+  own accepted phrases; maximum cosine similarity). Below `sv_threshold` the
+  phrase is dropped as a whole (another person, the TV). Phrases with less than
+  `sv_min_speech_sec` of speech are not judged (a name, «да»). During an
+  introduction (`/introducing`) phrases are accepted unchecked and the new
+  person's voice becomes the reference. Without a database anchor the first
+  judged phrase seeds the reference as *unconfirmed*; two rejections in a row
+  while unconfirmed re-seed it, so a seed made of noise can't lock the owner
+  out. Accepted phrases are added to the session gallery (up to 10, at most one
+  every 10 s) and published on `/voice_embedding` for the identity manager.
+  `sv_debug_dir` keeps every judged phrase as a WAV named with the verdict and
+  similarity, for tuning the threshold. (Until 2026-09-26 SV judged 1 s
+  segments: on this microphone those embeddings matched the owner's own voice
+  at 0.0–0.4, rejected the owner, cut phrases to fragments for STT and made
+  introductions loop.)
 - *Phrase accepted* when the buffer is longer than `min_phrase_sec` **and**
   the accepted speech is at least `min_speech_sec` (`min_speech_sec_introducing`
   while `/introducing` is true, so short answers like a name are not dropped).
@@ -239,8 +244,9 @@ embeddings, RMS-normalised to 0.05 before embedding).
 | `no_speech_timeout_sec` | double | `8.0` | Give up if no speech starts within this time after activation. |
 | `pipeline_timeout_sec` | double | `90.0` | Clears the "waiting for STT" state after this long. |
 | `speaker_verification` | bool | `True` | Enable ECAPA-TDNN filtering; disabled automatically if the model fails to load. |
-| `sv_threshold` | double | `0.55` | Cosine-similarity threshold for a full segment. |
-| `sv_segment_sec` | double | `1.0` | Length of the segments that are verified. |
+| `sv_threshold` | double | `0.35` | Phrase-level cosine-similarity threshold. |
+| `sv_min_speech_sec` | double | `1.2` | Phrases with less speech are not judged. |
+| `sv_debug_dir` | string | `''` | Save every judged phrase as WAV (launch default `~/inmoov_sv_debug`). |
 | `sv_savedir` | string | `~/.cache/speechbrain/spkrec-ecapa-voxceleb` | Local directory for the ECAPA-TDNN model. |
 
 **Topics**

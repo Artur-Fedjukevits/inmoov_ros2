@@ -190,7 +190,8 @@ Servers / LLM:
 
 Wake word:
 - `wakeword_model` (default `/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx`)
-- `wakeword_threshold` (default `0.2`)
+- `wakeword_threshold` (default `0.9`)
+- `wakeword_patience` (default `2`; consecutive 80 ms frames above the threshold)
 
 Audio:
 - `audio_device_index` (default `-1`), `audio_device_name` (default `pulse`), `output_device_name` (default `''`)
@@ -199,7 +200,7 @@ Audio:
 
 VAD / speaker verification:
 - `vad_threshold` (`0.4`), `silence_duration_sec` (`2.5`), `pipeline_timeout_sec` (`45.0`)
-- `speaker_verification` (`true`), `sv_threshold` (`0.55`), `sv_segment_sec` (`1.0`)
+- `speaker_verification` (`true`), `sv_threshold` (`0.35`, phrase-level), `sv_min_speech_sec` (`1.2`), `sv_debug_dir` (`~/inmoov_sv_debug`, WAVs of judged phrases for tuning)
 
 Tavily:
 - `tavily_api_key` (default from env `TAVILY_API_KEY`)

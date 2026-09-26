@@ -121,7 +121,8 @@ def generate_launch_description():
 
         # Wake word
         DeclareLaunchArgument('wakeword_model', default_value=robot['wakeword_model']),
-        DeclareLaunchArgument('wakeword_threshold', default_value='0.2'),
+        DeclareLaunchArgument('wakeword_threshold', default_value='0.9'),
+        DeclareLaunchArgument('wakeword_patience',  default_value='2'),
 
         # Audio
         DeclareLaunchArgument('audio_device_index', default_value='-1'),
@@ -135,8 +136,12 @@ def generate_launch_description():
         DeclareLaunchArgument('silence_duration_sec',   default_value='2.5'),
         DeclareLaunchArgument('pipeline_timeout_sec',   default_value='45.0'),
         DeclareLaunchArgument('speaker_verification',   default_value='true'),
-        DeclareLaunchArgument('sv_threshold',           default_value='0.55'),
-        DeclareLaunchArgument('sv_segment_sec',         default_value='1.0'),
+        # Phrase-level SV (see voice_detector_node): cosine threshold for a whole phrase,
+        # minimum speech to judge, and a folder that keeps every judged phrase as WAV
+        # (for tuning the threshold on real data; '' = off)
+        DeclareLaunchArgument('sv_threshold',           default_value='0.35'),
+        DeclareLaunchArgument('sv_min_speech_sec',      default_value='1.2'),
+        DeclareLaunchArgument('sv_debug_dir',           default_value=os.path.expanduser('~/inmoov_sv_debug')),
 
         # Tavily
         DeclareLaunchArgument('tavily_api_key',
@@ -308,6 +313,7 @@ def generate_launch_description():
         parameters=[{
             'model_path':   LaunchConfiguration('wakeword_model'),
             'threshold':    LaunchConfiguration('wakeword_threshold'),
+            'patience':     LaunchConfiguration('wakeword_patience'),
             'debounce_sec': 1.5,
         }],
     )
@@ -330,7 +336,8 @@ def generate_launch_description():
             'no_speech_timeout_sec': 8.0,
             'speaker_verification':  LaunchConfiguration('speaker_verification'),
             'sv_threshold':          LaunchConfiguration('sv_threshold'),
-            'sv_segment_sec':        LaunchConfiguration('sv_segment_sec'),
+            'sv_min_speech_sec':     LaunchConfiguration('sv_min_speech_sec'),
+            'sv_debug_dir':          LaunchConfiguration('sv_debug_dir'),
         }],
     )
 

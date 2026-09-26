@@ -30,7 +30,19 @@ Parameters:
   sample_rate (16000), vad_threshold (0.4), silence_duration_sec (2.5),
   min_phrase_sec (0.3), min_speech_sec (1.0), min_speech_sec_introducing (0.4),
   max_phrase_sec (20.0), no_speech_timeout_sec (8.0), pipeline_timeout_sec (90.0),
-  speaker_verification (True), sv_threshold (0.55), sv_segment_sec (1.0)
+  speaker_verification (True), sv_threshold (0.35), sv_min_speech_sec (1.2), sv_debug_dir ('')
+
+Speaker verification is decided per PHRASE, not per 1 s segment: the whole
+phrase is recorded as without SV, then one ECAPA embedding of all its speech is
+compared with the current speaker's reference (the DB anchor, or the session's
+own phrases). A phrase from someone else (another person, the TV) is dropped as
+a whole. 1 s embeddings were too noisy on this mic (the owner's own segments
+matched each other at 0.0-0.4) — they rejected the owner, cut phrases down to
+fragments for STT and made introductions loop forever (live 2026-09-26).
+  - introducing: accepted unchecked — the new person's answers become the reference
+  - speech shorter than sv_min_speech_sec: accepted (too short to judge: «да», a name)
+  - no reference yet: the phrase becomes an UNCONFIRMED seed; 2 rejections in a
+    row while unconfirmed → re-seed (a seed of noise can't lock the owner out)
 
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
@@ -80,8 +92,9 @@ class VoiceDetectorNode(LifecycleNode):
         self._dp('no_speech_timeout_sec', 8.0)
         self._dp('pipeline_timeout_sec',  90.0)
         self._dp('speaker_verification',  True)
-        self._dp('sv_threshold',          0.55)
-        self._dp('sv_segment_sec',        1.0)
+        self._dp('sv_threshold',          0.35)   # phrase-level cosine similarity
+        self._dp('sv_min_speech_sec',     1.2)    # shorter phrases are not judged
+        self._dp('sv_debug_dir',          '')     # save every judged phrase as WAV (tuning)
         self._dp('sv_savedir',
                  os.path.expanduser('~/.cache/speechbrain/spkrec-ecapa-voxceleb'))
 
@@ -96,7 +109,8 @@ class VoiceDetectorNode(LifecycleNode):
         silence_duration_sec   = self.get_parameter('silence_duration_sec').value
         self._sv_enabled       = self.get_parameter('speaker_verification').value
         self._sv_threshold     = self.get_parameter('sv_threshold').value
-        self._sv_seg_sec       = self.get_parameter('sv_segment_sec').value
+        self._sv_min_speech_sec = self.get_parameter('sv_min_speech_sec').value
+        self._sv_debug_dir     = os.path.expanduser(self.get_parameter('sv_debug_dir').value)
 
         # ── Subscriptions ─────────────────────────────────────────────────
         self.create_subscription(Bool,            'wake_detected',   self.wake_callback,          10)
@@ -143,7 +157,8 @@ class VoiceDetectorNode(LifecycleNode):
                 )
                 self.get_logger().info(
                     f'Speaker Verification enabled (ECAPA-TDNN, 192D, '
-                    f'threshold={self._sv_threshold}, segment={self._sv_seg_sec}s)')
+                    f'phrase-level, threshold={self._sv_threshold}, '
+                    f'min speech {self._sv_min_speech_sec}s)')
             except Exception as e:
                 self._sv_enabled = False
                 self.get_logger().warn(f'ECAPA-TDNN not loaded: {e}')
@@ -159,23 +174,21 @@ class VoiceDetectorNode(LifecycleNode):
         self._onset_buf         = collections.deque()
         self._onset_secs        = 0.4
         self._onset_maxlen      = None
-        self._sv_buf            = []
-        self._sv_seg_samples    = 0
+        self._speech_audio      = []   # VAD-positive chunks of the current phrase (SV input)
         self._sv_gallery        = []
         self._sv_gallery_times  = []
         self._sv_anchor_person_id = None  # whose anchor is currently in _sv_gallery (None = live session without a DB anchor)
         self._SV_GALLERY_MAX    = 10
         self._sv_last_gallery_add      = 0.0
-        self._SV_GALLERY_ADD_INTERVAL  = 30.0
-        # Live seed guard: without a DB anchor the FIRST full segment becomes the
-        # session's reference. If it was noise / the robot's own voice, everything
-        # after it is rejected (live 2026-09-26: similarity ~0.05). A live seed stays
-        # "unconfirmed" until a later segment matches it; N rejections in a row while
-        # unconfirmed → the seed is dropped and the current segment re-seeds.
-        # DB anchors and confirmed seeds are never dropped this way (a TV can't evict you).
+        self._SV_GALLERY_ADD_INTERVAL  = 10.0   # phrase-level: learn from most phrases
+        # Live seed guard: without a DB anchor the FIRST judged phrase becomes the
+        # session's reference. A live seed stays "unconfirmed" until a later phrase
+        # matches it; N rejections in a row while unconfirmed → the seed is dropped
+        # and the current phrase re-seeds. DB anchors and confirmed seeds are never
+        # dropped this way (a TV can't evict the owner).
         self._sv_seed_unconfirmed      = False
         self._sv_seed_rejects          = 0
-        self._SV_SEED_MAX_REJECTS      = 3
+        self._SV_SEED_MAX_REJECTS      = 2   # phrases
         self._introducing       = False
         self.is_active          = False
         self.audio_buffer       = []
@@ -227,7 +240,7 @@ class VoiceDetectorNode(LifecycleNode):
         self._cancel_relisten()
         self.is_active = False
         self.audio_buffer = []
-        self._sv_buf.clear()
+        self._speech_audio.clear()
         self._pre_roll_buffer.clear()
         self.publisher_.on_deactivate(state)
         self._voice_emb_pub.on_deactivate(state)
@@ -307,12 +320,9 @@ class VoiceDetectorNode(LifecycleNode):
             self.silence_counter = 0
             self.activation_time = time.time()
             self._last_wake_time = time.time()
-            self._sv_buf.clear()
+            self._speech_audio.clear()
             if not person_active:
-                self._sv_gallery.clear()
-                self._sv_gallery_times.clear()
-                self._sv_anchor_person_id = None
-                self._sv_last_gallery_add = 0.0
+                self._sv_reset_reference()
             return
 
         speech_chunks = self._take_pre_roll_speech()
@@ -320,16 +330,14 @@ class VoiceDetectorNode(LifecycleNode):
         self.get_logger().info('Woke up! Listening for a command...')
         self.is_active       = True
         self.audio_buffer    = speech_chunks
+        self._speech_audio   = list(speech_chunks)
         self.silence_counter = 0
         self.speech_chunks   = 0
         self.activation_time = time.time()
         self._last_wake_time = time.time()
-        self._sv_buf.clear()
+        self._speech_audio.clear()
         if not person_active:
-            self._sv_gallery.clear()
-            self._sv_gallery_times.clear()
-            self._sv_anchor_person_id = None
-            self._sv_last_gallery_add = 0.0
+            self._sv_reset_reference()
 
     def _stt_done_callback(self, msg: String):
         if self._stt_sent_time <= 0.0:
@@ -366,15 +374,17 @@ class VoiceDetectorNode(LifecycleNode):
             self.silence_counter = 0
             self.speech_chunks   = 0
             self.is_active       = False
-            self._sv_buf.clear()
-        self._sv_gallery.clear()
-        self._sv_gallery_times.clear()
-        self._sv_anchor_person_id = None
-        self._sv_last_gallery_add = 0.0
+            self._speech_audio.clear()
+        self._sv_reset_reference()
         self._introducing = False
         self.get_logger().info('go_idle: stopping recording, back to the wake word')
 
     def _introducing_cb(self, msg: Bool):
+        if msg.data and not self._introducing:
+            # A new person: their answers must not be judged against whoever spoke
+            # before — they become the reference (see _sv_check_phrase)
+            self._sv_reset_reference()
+            self.get_logger().info('SV: introduction started — reference reset for the new person')
         self._introducing = msg.data
         if not msg.data and self._stt_sent_time > 0.0:
             self.get_logger().info('INTRODUCING finished — resetting the pipeline timeout')
@@ -388,12 +398,9 @@ class VoiceDetectorNode(LifecycleNode):
                 self.audio_buffer    = []
                 self.silence_counter = 0
                 self.is_active       = False
-                self._sv_buf.clear()
+                self._speech_audio.clear()
             self._stt_sent_time = 0.0
-            self._sv_gallery.clear()
-            self._sv_gallery_times.clear()
-            self._sv_anchor_person_id = None
-            self._sv_last_gallery_add = 0.0
+            self._sv_reset_reference()
             self._introducing = False
             self.get_logger().info('Sleep mode: auto-activation disabled')
         else:
@@ -415,36 +422,17 @@ class VoiceDetectorNode(LifecycleNode):
             self.silence_counter = 0
             self.speech_chunks   = 0
             self.activation_time = time.time()
-            self._sv_buf.clear()
+            self._speech_audio   = []
             # The gallery is NOT reset — it lives for the whole session. Reset only on go_idle / robot_sleep.
 
             if speech_chunks:
+                # Kept unchecked here: SV judges the whole phrase at its end
                 dur = len(speech_chunks) * (self._chunk_size or 512) / self.rate
-                if self._sv_enabled and self._sv_encoder and self._sv_gallery:
-                    audio_seg = np.concatenate(speech_chunks)
-                    emb = self._sv_embed(audio_seg)
-                    if emb is None:
-                        self.audio_buffer = speech_chunks
-                        self.speech_chunks = len(speech_chunks)
-                        self.get_logger().info(
-                            f'Activation + pre-roll: captured {dur:.2f}s of speech (SV: too short)')
-                    else:
-                        sim = self._sv_sim(emb)
-                        if sim >= self._sv_threshold:
-                            self.audio_buffer = speech_chunks
-                            self.speech_chunks = len(speech_chunks)
-                            self.get_logger().info(
-                                f'Activation + pre-roll: captured {dur:.2f}s of speech '
-                                f'(SV sim={sim:.2f}, gallery={len(self._sv_gallery)})')
-                        else:
-                            self.get_logger().warn(
-                                f'Activation: pre-roll dropped as a foreign voice '
-                                f'(sim={sim:.2f}, gallery={len(self._sv_gallery)})')
-                else:
-                    self.audio_buffer = speech_chunks
-                    self.speech_chunks = len(speech_chunks)
-                    self.get_logger().info(
-                        f'Activation + pre-roll: captured {dur:.2f}s of speech before activation')
+                self.audio_buffer  = speech_chunks
+                self._speech_audio = list(speech_chunks)
+                self.speech_chunks = len(speech_chunks)
+                self.get_logger().info(
+                    f'Activation + pre-roll: captured {dur:.2f}s of speech before activation')
 
     def _is_person_present(self) -> bool:
         now = time.time()
@@ -481,7 +469,7 @@ class VoiceDetectorNode(LifecycleNode):
                 self.silence_counter = 0
                 self.speech_chunks   = 0
                 self.is_active       = False
-                self._sv_buf.clear()
+                self._speech_audio.clear()
                 # The gallery is NOT reset — the next utterance is filtered against the same gallery
         else:
             if was_speaking and not self.is_active:
@@ -632,116 +620,85 @@ class VoiceDetectorNode(LifecycleNode):
         self._sv_seed_unconfirmed = True
         self._sv_seed_rejects = 0
 
-    def _sv_threshold_for(self, seg_sec: float) -> float:
-        """Progressive SV threshold: grows linearly with the segment length.
+    def _sv_reset_reference(self) -> None:
+        """Forget the current speaker (gallery, DB anchor, seed state)."""
+        self._sv_gallery.clear()
+        self._sv_gallery_times.clear()
+        self._sv_anchor_person_id = None
+        self._sv_last_gallery_add = 0.0
+        self._sv_seed_unconfirmed = False
+        self._sv_seed_rejects = 0
 
-        Short segments give a less reliable ECAPA-TDNN embedding — so we lower the threshold.
-        0.5s (ECAPA minimum) → sv_threshold - 0.15
-        sv_seg_sec (full segment) → sv_threshold
-        Beyond sv_seg_sec — sv_threshold (clipped).
-        """
-        _SV_MIN_SEC   = 0.5   # minimum for ECAPA-TDNN
-        _SV_MAX_DELTA = 0.15  # maximum threshold reduction for short segments
-        span = max(0.01, self._sv_seg_sec - _SV_MIN_SEC)
-        ratio = min(1.0, max(0.0, (seg_sec - _SV_MIN_SEC) / span))
-        return max(0.20, self._sv_threshold - _SV_MAX_DELTA * (1.0 - ratio))
-
-    def _sv_decide(self, log_reject: bool = True) -> bool:
-        """Decide on the accumulated _sv_buf: compare it with the gallery or add the first entry.
-
-        Returns True if the segment was accepted (voice_buffer extended), False if rejected.
-        silence_counter is reset to 0 ONLY on acceptance — so that a foreign voice (TV etc.)
-        doesn't keep the silence counter from accumulating and doesn't stretch the recording
-        up to max_phrase_sec.
-        """
-        if not self._sv_buf:
-            return False
-        audio_seg = np.concatenate(self._sv_buf)
-        emb = self._sv_embed(audio_seg)
-
+    def _sv_check_phrase(self, speech: np.ndarray) -> 'tuple[bool, str]':
+        """Phrase-level speaker check of the phrase's speech. Returns (accept, log line)."""
+        if not self._sv_enabled or self._sv_encoder is None:
+            return True, ''
+        sec = len(speech) / self.rate
+        emb = self._sv_embed(speech)
         if emb is None:
+            return True, ''
+
+        if self._introducing:
+            # A new person answers (their name…): accept, and learn their voice
             if self._sv_gallery:
-                # The gallery is set — reject a too-short segment so that the
-                # pre-roll of a foreign voice doesn't end up in audio_buffer.
-                self._sv_buf.clear()
-                return False
-            # The gallery is empty (introduction / first session) — accept without checking.
-            self.silence_counter = 0
-            self.audio_buffer.extend(self._sv_buf)
-            self.speech_chunks += len(self._sv_buf)
-            self._sv_buf.clear()
-            return True
+                self._sv_add_to_gallery(emb)
+            else:
+                self._sv_seed(emb)
+                self._sv_seed_unconfirmed = False   # introduction = who we talk to now
+                self._publish_voice_emb(emb)
+            self._sv_debug_save(speech, 'intro', None)
+            return True, f'SV: introducing — phrase accepted unchecked ({sec:.1f}s speech), voice learned'
+
+        if sec < self._sv_min_speech_sec:
+            self._sv_debug_save(speech, 'short', None)
+            return True, f'SV: {sec:.1f}s of speech — too short to judge, accepted'
 
         if not self._sv_gallery:
-            if not log_reject:
-                # Tail with an empty gallery: accept it, but do NOT set the gallery —
-                # a full sv_seg_sec segment is needed for the first reliable entry.
-                self.silence_counter = 0
-                self.audio_buffer.extend(self._sv_buf)
-                self.speech_chunks += len(self._sv_buf)
-                # In IDLE we publish the embedding so identity_manager can try to
-                # recognize the voice — the gallery is not set, identification only.
-                # Check _person_present directly: None (startup) and False (IDLE) — publish;
-                # True (INTERACTING/RECOGNIZING) — skip.
-                if self._person_present is not True:
-                    self._publish_voice_emb(emb)
-                self._sv_buf.clear()
-                return True
-            # First full segment — set the first entry in the gallery (unconfirmed seed)
             self._sv_seed(emb)
-            self.silence_counter = 0
-            self.audio_buffer.extend(self._sv_buf)
-            self.speech_chunks += len(self._sv_buf)
-            self.get_logger().info(
-                f'SV: first gallery entry (1/{self._SV_GALLERY_MAX}, ECAPA-TDNN) — '
-                f'unconfirmed until a later segment matches it')
-            self._publish_voice_emb(emb)
-        else:
-            seg_sec = len(audio_seg) / self.rate
-            thresh  = self._sv_threshold_for(seg_sec)
-            sim     = self._sv_sim(emb)
-            reseeded = False
-            if sim < thresh and self._sv_seed_unconfirmed:
-                self._sv_seed_rejects += 1
-                if self._sv_seed_rejects >= self._SV_SEED_MAX_REJECTS:
-                    self.get_logger().warn(
-                        f'SV: live seed never matched — {self._sv_seed_rejects} segments '
-                        f'rejected in a row (last similarity={sim:.2f}); dropping it as noise '
-                        f'and re-seeding from the current segment')
-                    self._sv_seed(emb)   # the current segment is the new (unconfirmed) seed
-                    reseeded = True
-            if sim >= thresh or reseeded:
-                if self._sv_seed_unconfirmed and not reseeded:
-                    self.get_logger().info(f'SV: live seed confirmed (similarity={sim:.2f})')
-                    self._sv_seed_unconfirmed = False
-                    self._sv_seed_rejects = 0
-                self.silence_counter = 0
-                self.audio_buffer.extend(self._sv_buf)
-                self.speech_chunks += len(self._sv_buf)
-                # Add to the gallery during introduction or if there is room
-                if self._introducing or len(self._sv_gallery) < self._SV_GALLERY_MAX:
-                    self._sv_add_to_gallery(emb)
-                if not log_reject:
-                    self.get_logger().info(
-                        f'SV: tail accepted ({seg_sec:.1f}s, '
-                        f'similarity={sim:.2f} >= threshold={thresh:.2f})')
-                self._sv_buf.clear()
-                return True
-            else:
-                if log_reject:
-                    self.get_logger().warn(
-                        f'SV: foreign voice rejected ({seg_sec:.1f}s, '
-                        f'similarity={sim:.2f} < threshold={thresh:.2f})'
-                    )
-                else:
-                    self.get_logger().info(
-                        f'SV: tail rejected ({seg_sec:.1f}s, '
-                        f'similarity={sim:.2f} < threshold={thresh:.2f})'
-                    )
-                self._sv_buf.clear()
-                return False
-        self._sv_buf.clear()
-        return True  # first gallery entry — accepted
+            self._publish_voice_emb(emb)   # lets identity_manager try to recognise the voice
+            self._sv_debug_save(speech, 'seed', None)
+            return True, (f'SV: first phrase of the session ({sec:.1f}s) — the reference '
+                          f'(unconfirmed until the next phrase matches it)')
+
+        sim = self._sv_sim(emb)
+        if sim >= self._sv_threshold:
+            confirmed = self._sv_seed_unconfirmed
+            self._sv_seed_unconfirmed = False
+            self._sv_seed_rejects = 0
+            self._sv_add_to_gallery(emb)
+            self._sv_debug_save(speech, 'accept', sim)
+            return True, (f'SV: phrase accepted (similarity={sim:.2f} >= {self._sv_threshold:.2f}'
+                          f'{", reference confirmed" if confirmed else ""})')
+
+        if self._sv_seed_unconfirmed:
+            self._sv_seed_rejects += 1
+            if self._sv_seed_rejects >= self._SV_SEED_MAX_REJECTS:
+                self._sv_seed(emb)
+                self._publish_voice_emb(emb)
+                self._sv_debug_save(speech, 'reseed', sim)
+                return True, (f'SV: the unconfirmed reference never matched '
+                              f'({self._SV_SEED_MAX_REJECTS} phrases, last similarity={sim:.2f}) '
+                              f'— re-seeded from this phrase, accepted')
+        self._sv_debug_save(speech, 'reject', sim)
+        return False, (f'SV: phrase rejected — not the current speaker '
+                       f'(similarity={sim:.2f} < {self._sv_threshold:.2f}, {sec:.1f}s speech)')
+
+    def _sv_debug_save(self, speech: np.ndarray, verdict: str, sim) -> None:
+        """sv_debug_dir set → keep every judged phrase as WAV for threshold tuning."""
+        if not self._sv_debug_dir:
+            return
+        try:
+            import wave
+            os.makedirs(self._sv_debug_dir, exist_ok=True)
+            name = time.strftime('%Y%m%d_%H%M%S') + f'_{verdict}' + (
+                f'_{sim:.2f}' if sim is not None else '') + '.wav'
+            with wave.open(os.path.join(self._sv_debug_dir, name), 'wb') as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(self.rate)
+                w.writeframes((np.clip(speech, -1, 1) * 32767).astype(np.int16).tobytes())
+        except OSError as e:
+            self.get_logger().warn(f'SV debug save failed: {e}')
 
     # ── Main audio callback ───────────────────────────────────────────────
 
@@ -757,7 +714,6 @@ class VoiceDetectorNode(LifecycleNode):
             self._max_chunks        = int(self.max_phrase_sec * chunks_per_sec)
             self._pre_roll_maxlen   = int(self._pre_roll_secs * chunks_per_sec)
             self._onset_maxlen      = max(1, int(self._onset_secs * chunks_per_sec))
-            self._sv_seg_samples    = int(self._sv_seg_sec * self.rate)
             self.get_logger().info(
                 f'chunk_size={self._chunk_size} '
                 f'silence_threshold={self._silence_threshold} chunks'
@@ -788,7 +744,7 @@ class VoiceDetectorNode(LifecycleNode):
             ).item()
 
         # Timeout waiting for the first word
-        if not self.audio_buffer and not self._sv_buf:
+        if not self.audio_buffer:
             if (time.time() - self.activation_time) > self.no_speech_timeout:
                 if self._should_keep_listening() and not self._sleeping:
                     self.activation_time = time.time()
@@ -799,33 +755,16 @@ class VoiceDetectorNode(LifecycleNode):
                 return
 
         if confidence > self.vad_threshold:
-            if self._sv_enabled and self._sv_encoder:
-                # SV mode: silence_counter is NOT reset here.
-                # The reset happens inside _sv_decide only when a segment is accepted.
-                # This guarantees that a foreign voice (TV, other people) doesn't zero
-                # the silence counter and doesn't stretch the recording to max_phrase_sec.
-                if not self.audio_buffer and not self._sv_buf and self._onset_buf:
-                    self._sv_buf.extend(self._onset_buf)
-                    self._onset_buf.clear()
-                self._sv_buf.append(audio_float32)
-                # If enough has accumulated — make the decision
-                sv_samples = sum(len(c) for c in self._sv_buf)
-                if sv_samples >= self._sv_seg_samples:
-                    self._sv_decide(log_reject=True)
-            else:
-                # Without SV: classic behavior
-                self.silence_counter = 0
-                if not self.audio_buffer and self._onset_buf:
-                    self.audio_buffer.extend(self._onset_buf)
-                    self._onset_buf.clear()
-                self.audio_buffer.append(audio_float32)
-                self.speech_chunks += 1
+            self.silence_counter = 0
+            if not self.audio_buffer and self._onset_buf:
+                self.audio_buffer.extend(self._onset_buf)
+                self._onset_buf.clear()
+            self.audio_buffer.append(audio_float32)
+            self._speech_audio.append(audio_float32)
+            self.speech_chunks += 1
 
         else:
-            if self.audio_buffer or self._sv_buf:
-                # Silence after speech — first flush the partially filled sv_buf
-                if self._sv_buf:
-                    self._sv_decide(log_reject=False)
+            if self.audio_buffer:
                 self.audio_buffer.append(audio_float32)
                 self.silence_counter += 1
 
@@ -845,10 +784,6 @@ class VoiceDetectorNode(LifecycleNode):
     # ── Finishing the recording ───────────────────────────────────────────
 
     def _finish_recording(self, reason: str = 'silence'):
-        # Flush the unfinished SV segment before sending
-        if self._sv_buf:
-            self._sv_decide(log_reject=False)
-
         # During an introduction, short answers are expected (a name, "Ника", "да") —
         # the minimum speech length threshold is lowered so they aren't dropped.
         effective_min_speech_sec = (
@@ -858,7 +793,18 @@ class VoiceDetectorNode(LifecycleNode):
         min_speech_chunks = int(effective_min_speech_sec * self.rate / self._chunk_size)
         speech_sec        = self.speech_chunks * self._chunk_size / self.rate
 
-        if len(self.audio_buffer) > min_chunks and self.speech_chunks >= min_speech_chunks:
+        long_enough = (len(self.audio_buffer) > min_chunks
+                       and self.speech_chunks >= min_speech_chunks)
+        sv_ok = True
+        if long_enough and self._speech_audio:
+            sv_ok, sv_log = self._sv_check_phrase(np.concatenate(self._speech_audio))
+            if sv_log:
+                (self.get_logger().info if sv_ok else self.get_logger().warn)(sv_log)
+
+        if long_enough and not sv_ok:
+            if self._should_keep_listening() and not self._sleeping:
+                self._schedule_relisten(0.5)
+        elif long_enough:
             full_audio = np.concatenate(self.audio_buffer)
             duration   = len(full_audio) / self.rate
 
@@ -889,7 +835,7 @@ class VoiceDetectorNode(LifecycleNode):
         self.speech_chunks   = 0
         self.is_active       = False
         self._onset_buf.clear()
-        self._sv_buf.clear()
+        self._speech_audio.clear()
         # The gallery is NOT reset — it lives for the whole session until go_idle / robot_sleep
 
     def _publish(self, audio: np.ndarray):
