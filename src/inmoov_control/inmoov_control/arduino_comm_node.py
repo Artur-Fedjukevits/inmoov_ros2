@@ -37,9 +37,11 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import collections
+import faulthandler
 import json
 import math
 import os
+import sys
 import threading
 import time
 import serial
@@ -62,6 +64,11 @@ from .protocol import (
 _RECONNECT_MIN_SEC = 2.0    # first reopen attempt after a serial error
 _RECONNECT_MAX_SEC = 30.0   # back-off cap
 _STATE_RESEND_SEC  = 2.0    # periodic re-send of sleep flag + speeds
+# If the 50 Hz TX timer doesn't run for this long, faulthandler dumps every thread's
+# stack to stderr — from a native thread, so it works even when the process is frozen
+# with the GIL held. Forensics for the ~1.5 s host stalls that trip the firmware
+# failsafe (fires well before the firmware's 1.5 s). 0 = off.
+_STALL_DUMP_SEC    = 0.8
 
 
 def deg_to_rad(deg: float, center: float = 90.0) -> float:
@@ -243,6 +250,8 @@ class ArduinoCommNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
+        # The TX timer stops here — disarm its stall trap first
+        faulthandler.cancel_dump_traceback_later()
         # Send servos to rest position
         self._send_rest_positions()
 
@@ -280,11 +289,13 @@ class ArduinoCommNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_shutdown(self, state):
+        faulthandler.cancel_dump_traceback_later()
         self._send_rest_positions()
         self._close_serial()
         return TransitionCallbackReturn.SUCCESS
 
     def on_error(self, state):
+        faulthandler.cancel_dump_traceback_later()
         self._close_serial()
         return TransitionCallbackReturn.SUCCESS
 
@@ -551,6 +562,9 @@ class ArduinoCommNode(LifecycleNode):
     # -----------------------------------------------------------------------
 
     def _send_servos(self) -> None:
+        if _STALL_DUMP_SEC > 0:
+            # Re-arm on every tick: fires only when the NEXT tick is late
+            faulthandler.dump_traceback_later(_STALL_DUMP_SEC, file=sys.stderr)
         ser = self._ser
         if ser is None or not ser.is_open:
             return
