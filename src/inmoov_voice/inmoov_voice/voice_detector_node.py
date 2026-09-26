@@ -798,8 +798,11 @@ class VoiceDetectorNode(LifecycleNode):
         sv_ok = True
         if long_enough and self._speech_audio:
             sv_ok, sv_log = self._sv_check_phrase(np.concatenate(self._speech_audio))
-            if sv_log:
-                (self.get_logger().info if sv_ok else self.get_logger().warn)(sv_log)
+            # rclpy pins a severity per call site: info/warn must be separate lines
+            if sv_log and sv_ok:
+                self.get_logger().info(sv_log)
+            elif sv_log:
+                self.get_logger().warn(sv_log)
 
         if long_enough and not sv_ok:
             if self._should_keep_listening() and not self._sleeping:
