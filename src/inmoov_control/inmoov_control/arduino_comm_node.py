@@ -36,6 +36,7 @@ Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
+import collections
 import json
 import math
 import os
@@ -162,6 +163,11 @@ class ArduinoCommNode(LifecycleNode):
         self._diag           = None
         self._failsafe       = False   # last CMD_STATUS from the firmware
         self._last_rx_t      = 0.0     # monotonic time of the last RX frame
+        # Link timing trace for failsafe forensics: (monotonic, text) of TX timer
+        # stalls, slow write/flush and RX gaps, dumped when the firmware reports a
+        # failsafe — tells a stalled host from a stalled / frame-dropping board.
+        self._link_trace: collections.deque = collections.deque(maxlen=64)
+        self._last_tx_t      = 0.0
 
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
@@ -376,7 +382,11 @@ class ArduinoCommNode(LifecycleNode):
                 if not chunk:
                     continue
 
-                self._last_rx_t = time.monotonic()
+                now_rx = time.monotonic()
+                if self._last_rx_t and now_rx - self._last_rx_t > 0.5 and not self._sleeping:
+                    self._link_trace.append(
+                        (now_rx, f'RX gap {now_rx - self._last_rx_t:.2f}s'))
+                self._last_rx_t = now_rx
                 self._parser.push(chunk)
                 for cmd, data in self._parser.frames:
                     self._handle_rx(cmd, data)
@@ -405,9 +415,13 @@ class ArduinoCommNode(LifecycleNode):
             active = bool(data[0])
             self._failsafe = active
             if active:
+                now = time.monotonic()
+                recent = [f'{text} ({now - t:.1f}s ago)' for t, text in self._link_trace
+                          if now - t < 5.0]
                 self.get_logger().error(
                     'Arduino entered host-loss FAILSAFE (no servo frames for 1.5 s) '
-                    '— returning to rest')
+                    '— returning to rest | host side, last 5 s: '
+                    + ('; '.join(recent) if recent else 'TX timer and writes on time, no RX gaps'))
             else:
                 self.get_logger().warn('Arduino left failsafe — servo frames resumed')
             if self._failsafe_pub:
@@ -542,6 +556,9 @@ class ArduinoCommNode(LifecycleNode):
             return
 
         now = time.monotonic()
+        if self._last_tx_t and now - self._last_tx_t > 0.3:
+            self._link_trace.append((now, f'TX timer stalled {now - self._last_tx_t:.2f}s'))
+        self._last_tx_t = now
         with self._lock:
             if now - self._last_state_resend >= _STATE_RESEND_SEC:
                 # Periodic resync (see module docstring) — idempotent in firmware
@@ -571,6 +588,9 @@ class ArduinoCommNode(LifecycleNode):
             frame = build_set_servos(body + face)
             ser.write(frame)
             ser.flush()
+            dt = time.monotonic() - now
+            if dt > 0.2:
+                self._link_trace.append((time.monotonic(), f'write/flush blocked {dt:.2f}s'))
         except (serial.SerialException, OSError, TypeError) as e:
             self._link_lost(f'write: {e}')
 
