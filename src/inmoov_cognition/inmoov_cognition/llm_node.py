@@ -1688,15 +1688,23 @@ class LLMNode(LifecycleNode):
         if msg.data and history_snapshot:
             self._publish_conversation_end(history_snapshot, person_ctx)
 
-    # Robot-name forms as STT writes them (lowercase) — anywhere in the phrase
-    # ("Ясно, Лёня, спасибо"). 'лень' is deliberately absent (laziness).
+    # Robot-name forms (lowercase), anywhere in the phrase ("Ясно, Лёня, спасибо").
+    # Besides the real forms — what Parakeet actually writes for "Лёня" from a
+    # far-field mic (live logs + a noisy TTS test 2026-09-26).
     _ROBOT_NAMES = frozenset({
-        'лёня', 'леня', 'лёне', 'лёню', 'леню', 'лёной',
+        'лёня', 'леня', 'лёне', 'лёню', 'леню', 'лёной', 'леной',
         'лёнечка', 'ленечка', 'лёнь', 'лёней', 'леней',
+        'лен', 'лён', 'ленин', 'леоня', 'леона', 'леля', 'лёля', 'лёль', 'лення',
+        'люня', 'ляня', 'легин', 'кленечка', 'лёночка', 'юленя',
+        'лена', 'лене', 'лену',   # no Лена in the household
     })
-    # Real female names STT also writes for "Лёня" — only count as the first word
-    # (vocative), otherwise any phone chat about a Лена would pass the gate.
-    _ROBOT_NAMES_FIRST_WORD = frozenset({'лена', 'лене'})
+    # Real words/names STT also writes for "Лёня" — only count in the vocative
+    # position (first word, or set off by a comma: "Да, Лень, это я"), otherwise
+    # "мне лень" or a phone chat about a Юля would pass.
+    _ROBOT_NAMES_FIRST_WORD = frozenset({'лень', 'юля', 'юлі'})
+    # Parakeet has no token for some "ё" contexts and emits <unk>: "Л<unk>ня".
+    # A short word starting with "л" around an <unk> is taken as the name.
+    _UNK_NAME_RE = re.compile(r'^л[а-яё]?\*[а-яё]{0,3}$')
     _GAZE_CTX_STALE_SEC = 2.0   # /social_context comes @ 2 Hz
 
     def _addressing_reason(self, text: str) -> str | None:
@@ -1709,9 +1717,12 @@ class LLMNode(LifecycleNode):
         Everything else — a face looking away, or no face and no recent wake word
         (person walked off mid-dialogue) — is not the robot's business.
         """
-        words = re.findall(r'[а-яё]+', text.lower())
-        if self._ROBOT_NAMES.intersection(words) or (
-                words and words[0] in self._ROBOT_NAMES_FIRST_WORD):
+        low   = text.lower().replace('<unk>', '*')
+        words = re.findall(r'[а-яёі*]+', low)
+        vocative = set(words[:1]) | set(re.findall(r'[,.!?]\s*([а-яёі]+)\s*[,.!?]', low))
+        if (self._ROBOT_NAMES.intersection(words)
+                or self._ROBOT_NAMES_FIRST_WORD.intersection(vocative)
+                or any(self._UNK_NAME_RE.match(w) for w in words)):
             return 'name'
         now = time.monotonic()
         with self._lock:

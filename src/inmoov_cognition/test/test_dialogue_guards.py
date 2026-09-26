@@ -182,6 +182,7 @@ def _gate(looking=None, ctx_age=0.1, since_wake=1e6):
         _social_ctx_ts=now - ctx_age, _wake_ts=now - since_wake, wake_grace_sec=30.0,
         _ROBOT_NAMES=LLMNode._ROBOT_NAMES,
         _ROBOT_NAMES_FIRST_WORD=LLMNode._ROBOT_NAMES_FIRST_WORD,
+        _UNK_NAME_RE=LLMNode._UNK_NAME_RE,
         _GAZE_CTX_STALE_SEC=LLMNode._GAZE_CTX_STALE_SEC,
     )
 
@@ -190,8 +191,17 @@ def test_gate_name_anywhere():
     r = LLMNode._addressing_reason
     assert r(_gate(False), 'Ясно, Леня, спасибо давай пока.') == 'name'
     assert r(_gate(False), 'Лена, который час?') == 'name'
-    assert r(_gate(False), 'скажи Лене, что я позвоню') is None
+    assert r(_gate(False), 'скажи Лене, что я позвоню') == 'name'   # no Лена at home
     assert r(_gate(False), 'мне лень туда идти') is None
+    # What Parakeet actually writes for "Лёня"
+    for text in ('Ты глухой? Леона, ты глухой?', 'Л<unk>ня, посмотри налево.',
+                 'Молодец, Ленин.', 'Лень, ты глухой?', 'Слушай, лення, напомни',
+                 'Привет, Леоня!', 'Легин, сколько сейчас время?', 'Юля, повернись',
+                 'Да, Лень, это я.'):
+        assert r(_gate(False), text) == 'name', text
+    assert r(_gate(False), 'позови Юлю ужинать') is None
+    assert r(_gate(False), 'мне лень, давай завтра') is None
+    assert r(_gate(False), 'там <unk> что-то') is None
 
 
 def test_gate_gaze_must_be_true_and_fresh():
