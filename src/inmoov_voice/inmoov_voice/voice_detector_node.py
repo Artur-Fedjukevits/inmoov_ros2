@@ -167,6 +167,15 @@ class VoiceDetectorNode(LifecycleNode):
         self._SV_GALLERY_MAX    = 10
         self._sv_last_gallery_add      = 0.0
         self._SV_GALLERY_ADD_INTERVAL  = 30.0
+        # Live seed guard: without a DB anchor the FIRST full segment becomes the
+        # session's reference. If it was noise / the robot's own voice, everything
+        # after it is rejected (live 2026-09-26: similarity ~0.05). A live seed stays
+        # "unconfirmed" until a later segment matches it; N rejections in a row while
+        # unconfirmed → the seed is dropped and the current segment re-seeds.
+        # DB anchors and confirmed seeds are never dropped this way (a TV can't evict you).
+        self._sv_seed_unconfirmed      = False
+        self._sv_seed_rejects          = 0
+        self._SV_SEED_MAX_REJECTS      = 3
         self._introducing       = False
         self.is_active          = False
         self.audio_buffer       = []
@@ -515,6 +524,7 @@ class VoiceDetectorNode(LifecycleNode):
             self._sv_gallery.clear()
             self._sv_gallery_times.clear()
         self._sv_anchor_person_id = anchor_person_id
+        self._sv_seed_unconfirmed = False   # a DB gallery is trusted, not a live guess
         try:
             gallery = data.get('gallery', [])
             if not gallery:
@@ -613,6 +623,15 @@ class VoiceDetectorNode(LifecycleNode):
         })
         self._voice_emb_pub.publish(emb_msg)
 
+    def _sv_seed(self, emb: np.ndarray) -> None:
+        """(Re)starts the live gallery from one segment, as an unconfirmed seed."""
+        now = time.time()
+        self._sv_gallery = [emb]
+        self._sv_gallery_times = [now]
+        self._sv_last_gallery_add = now
+        self._sv_seed_unconfirmed = True
+        self._sv_seed_rejects = 0
+
     def _sv_threshold_for(self, seg_sec: float) -> float:
         """Progressive SV threshold: grows linearly with the segment length.
 
@@ -668,21 +687,34 @@ class VoiceDetectorNode(LifecycleNode):
                     self._publish_voice_emb(emb)
                 self._sv_buf.clear()
                 return True
-            # First full segment — set the first entry in the gallery
-            self._sv_gallery.append(emb)
-            self._sv_gallery_times.append(time.time())
-            self._sv_last_gallery_add = time.time()
+            # First full segment — set the first entry in the gallery (unconfirmed seed)
+            self._sv_seed(emb)
             self.silence_counter = 0
             self.audio_buffer.extend(self._sv_buf)
             self.speech_chunks += len(self._sv_buf)
             self.get_logger().info(
-                f'SV: first gallery entry (1/{self._SV_GALLERY_MAX}, ECAPA-TDNN)')
+                f'SV: first gallery entry (1/{self._SV_GALLERY_MAX}, ECAPA-TDNN) — '
+                f'unconfirmed until a later segment matches it')
             self._publish_voice_emb(emb)
         else:
             seg_sec = len(audio_seg) / self.rate
             thresh  = self._sv_threshold_for(seg_sec)
             sim     = self._sv_sim(emb)
-            if sim >= thresh:
+            reseeded = False
+            if sim < thresh and self._sv_seed_unconfirmed:
+                self._sv_seed_rejects += 1
+                if self._sv_seed_rejects >= self._SV_SEED_MAX_REJECTS:
+                    self.get_logger().warn(
+                        f'SV: live seed never matched — {self._sv_seed_rejects} segments '
+                        f'rejected in a row (last similarity={sim:.2f}); dropping it as noise '
+                        f'and re-seeding from the current segment')
+                    self._sv_seed(emb)   # the current segment is the new (unconfirmed) seed
+                    reseeded = True
+            if sim >= thresh or reseeded:
+                if self._sv_seed_unconfirmed and not reseeded:
+                    self.get_logger().info(f'SV: live seed confirmed (similarity={sim:.2f})')
+                    self._sv_seed_unconfirmed = False
+                    self._sv_seed_rejects = 0
                 self.silence_counter = 0
                 self.audio_buffer.extend(self._sv_buf)
                 self.speech_chunks += len(self._sv_buf)
