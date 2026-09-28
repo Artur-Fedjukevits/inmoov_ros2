@@ -129,8 +129,8 @@ How the estimate is built (`scripts/claude_compute_inertia.py`):
 - The density is fitted so the robot sums to 16.12 kg — it comes out at
   ~20% of solid PLA, plausible for infill plus the empty space inside the
   hulls. COM and tensor come from the hull geometry.
-- Sanity checks: torso 5.75 kg, forearm 1.06 kg, whole head 1.42 kg, hand
-  with fingers 232 g, fingertip 2.7 g. Kinematic-only links without
+- Sanity checks: torso 5.76 kg, forearm 1.06 kg, whole head 1.42 kg, hand
+  with fingers 218 g, fingertip 2.7 g. Kinematic-only links without
   geometry get 1 g / 1e-9 kg·m².
 
 To adapt it to your own build, edit the weights/servo table in
