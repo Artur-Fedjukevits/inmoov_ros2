@@ -10,24 +10,31 @@ are adapted from that same repo's `launch/joint_preview.launch.py` and
 `launch/rviz_standalone.launch.py`. Both are GPL-3.0 (see `LICENSE`,
 `package.xml`).
 
-Used here purely as a **visual/kinematic reference in RViz2** — to compare
+Used here mainly as a **visual/kinematic reference in RViz2** — to compare
 link geometry and joint topology against the physical robot.
 
-This workspace does not use `ros2_control` or Gazebo — the real robot is
-driven by `inmoov_control` over the Arduino Mega protocol
-(`inmoov_control/protocol.py`).
+This workspace does not use `ros2_control`, MoveIt or Gazebo — the real
+robot is driven by `inmoov_control` over the Arduino Mega protocol
+(`inmoov_control/protocol.py`). The model does carry collision geometry,
+estimated mass/inertia and a self-collision SRDF, so it is ready to be
+loaded into MoveIt or a simulator.
 
 ## Model
 
 - **`description/inmoov_i2.urdf.xacro`** — root link `stand_link`. Full-body
   joint tree: torso → neck → head, both arms → hands (59 revolute joints,
-  all with `<limit>`; 3 fixed joints for origin markers). 317 OBJ visual
-  meshes + 12 STL collision meshes under `meshes/` (top-level, matching the
-  `package://inmoov_description/meshes/…` URIs baked into the URDF) —
-  torso, arms, neck, head expression, and fingers all have visual coverage.
-  Collision geometry: STL mesh hulls for head/jaw, thumbs, wrists, and
-  torso; primitive `<box>`/`<cylinder>` for the rest of the fingers, elbows,
-  shoulders, and neck (31 primitives total).
+  all with `<limit>`, 18 finger joints driven by `<mimic>`; 3 fixed joints
+  for origin markers). 317 OBJ visual meshes + 8 STL collision meshes under
+  `meshes/` (top-level, matching the `package://inmoov_description/meshes/…`
+  URIs baked into the URDF) — torso, arms, neck, head expression, and
+  fingers all have visual coverage. Collision geometry: STL meshes for the
+  stand, thumbs, forearms and lower torso (hips); everything else is
+  primitive `<box>`/`<cylinder>` (head, jaw, upper torso, shoulders, wrists,
+  neck, fingers — 36 primitives).
+- **Mass and inertia** — every link carries an estimated mass, center of
+  mass and full inertia tensor in SI units (see Mass and inertia below).
+- **`description/inmoov_i2.srdf`** — self-collision matrix for MoveIt (see
+  Self-collisions below).
 
 ### Scale
 
@@ -51,11 +58,16 @@ Later exports also corrected several joints' rotation axes (elbow/shoulder/
 wrist/neck) and added the neck's second DOF — unrelated to the assembly
 issue, just ongoing model refinement.
 
+### Regenerating from a LinkForge export
+
 After a fresh LinkForge export (raw, unscaled, Windows-style `meshes\...`
-paths), regenerate the xacro with:
+paths), sync the export's `meshes/` into the package (`--delete` drops
+meshes the new export no longer has) and regenerate the xacro with **one
+command**:
 
 ```bash
-python3 scripts/xacrify_scale.py path/to/fresh_export.urdf description/inmoov_i2.urdf.xacro
+rsync -a --delete path/to/export/meshes/ meshes/
+python3 scripts/xacrify_scale.py path/to/export/inmoov_i1.urdf description/inmoov_i2.urdf.xacro
 ```
 
 This rewrites `meshes\name.obj` → `package://inmoov_description/meshes/name.obj`,
@@ -65,8 +77,93 @@ and wraps `<box size>` / `<cylinder radius,length>` / `<sphere radius>`
 collision primitives the same way (an early version of the script missed
 these — primitive collisions came out ~8x too big, since the `<origin>`
 around them was scaled but their own size wasn't; fixed 2026-09-17).
+Finally it replaces every `<inertial>` with the estimate from
+`scripts/inertia_estimate.json` (see Mass and inertia below).
+
+Options:
+- `--inertia FILE.json` — use a different mass/inertia estimate
+- `--no-inertia` — keep LinkForge's own inertia instead, scaled by
+  `model_scale²` (inertia is mass × length²); LinkForge computes it from
+  the collision shapes with placeholder masses, so this is only a fallback
+
 `properties.xacro` is untouched by this — hand-maintained, only edit it if
 `model_scale` itself needs recalibrating against the physical robot.
+
+## Mass and inertia
+
+Inertial data is **not** taken from the Blender/LinkForge export: LinkForge
+rounds to 6 decimal places, which zeroes out (or makes physically invalid —
+triangle inequality) the tensor of a fingertip (~3·10⁻⁷ kg·m²), and Gazebo
+rejects such a model. Instead it is estimated from the visual meshes and
+kept in a separate, editable table:
+
+- `scripts/inertia_estimate.json` — per link: mass, COM, full 3×3 tensor
+  (with cross terms), in SI units in the URDF link frame
+- `scripts/inertia_estimate.csv` — the same as a human-readable table
+
+How the estimate is built (`scripts/claude_compute_inertia.py`):
+
+- Total weight on the scales is 23.0 kg including the stand. The stand
+  (`stand_link`) is IKEA OLOV 1.34 kg + MALSKÄR 5.54 kg = 6.88 kg (catalog
+  weight, MALSKÄR incl. packaging, so the real value is slightly lower),
+  leaving 16.12 kg for the robot itself.
+- Each visual sub-mesh is replaced by its convex hull. Link mass =
+  density × hull volume + the servos mounted in that link (≈2.5 kg total:
+  HS-805BB in torso and arms, MG996R in forearms and neck, small servos in
+  the head; see `SERVOS` in the script).
+- The density is fitted so the robot sums to 16.12 kg — it comes out at
+  ~20% of solid PLA, plausible for infill plus the empty space inside the
+  hulls. COM and tensor come from the hull geometry.
+- Sanity checks: torso 5.75 kg, forearm 1.06 kg, whole head 1.42 kg, hand
+  with fingers 232 g, fingertip 2.7 g. Kinematic-only links without
+  geometry get 1 g / 1e-9 kg·m².
+
+To adapt it to your own build, edit the weights/servo table in
+`claude_compute_inertia.py` (or the JSON directly), then recompute and
+re-apply to the existing xacro:
+
+```bash
+pip install trimesh        # only needed for the recomputation
+python3 scripts/claude_compute_inertia.py
+python3 scripts/apply_inertia.py description/inmoov_i2.urdf.xacro scripts/inertia_estimate.json
+```
+
+`claude_compute_inertia.py` reads the visual meshes from the current xacro
+and `meshes/`, so if the geometry changed, run `xacrify_scale.py` first.
+`trimesh` is not needed to build, launch or display the model.
+
+## Self-collisions (SRDF)
+
+`description/inmoov_i2.srdf` holds only `<disable_collisions>` entries (no
+planning groups yet); its robot name `inmoov_i1` must match the URDF's.
+228 of the 903 pairs of links with collision geometry are disabled:
+
+- 42 `Adjacent` — neighbours in the kinematic tree (links without
+  collision geometry collapsed);
+- 1 `Default` — `torso_bottom_link`/`torso_y_link`, adjacent through
+  `torso_z` and touching in the zero pose;
+- 3 `User` — head/jaw nested in the neck assembly;
+- 182 `User` — all pairs within each hand (fingers closing into a fist is
+  normal contact, limited by the hand mechanics).
+
+Every other pair is checked. The zero pose is collision-free.
+
+`scripts/selfcoll.py` samples random poses within the joint limits and
+classifies every pair (adjacent / touching in zero pose / always / never /
+sometimes colliding) into `selfcoll_result.json` in the current directory;
+the SRDF entries are picked from it by hand. Needs `trimesh` and
+`python-fcl`:
+
+```bash
+pip install trimesh python-fcl
+xacro description/inmoov_i2.urdf.xacro > /tmp/inmoov.urdf
+python3 scripts/selfcoll.py /tmp/inmoov.urdf 20000
+```
+
+To inspect the matrix visually, load the URDF + SRDF into the MoveIt Setup
+Assistant (Self-Collisions tab); with a temporary planning group containing
+all joints, the Robot Poses tab highlights colliding links while you move
+the sliders.
 
 ## Usage
 
@@ -92,16 +189,23 @@ for when something else already publishes `/robot_description` and
 
 - `description/inmoov_i2.urdf.xacro` — the model (entry point)
 - `description/properties.xacro` — `model_scale` (see Scale above)
-- `meshes/*.obj`, `*.mtl` — visual meshes; `meshes/*.stl` — collision mesh
-  hulls (head/jaw, thumbs, wrists, torso — the rest of the collisions are
+- `description/inmoov_i2.srdf` — self-collision matrix for MoveIt (see
+  Self-collisions above)
+- `meshes/*.obj`, `*.mtl` — visual meshes; `meshes/*.stl` — collision
+  meshes (stand, thumbs, forearms, lower torso — the rest of the collisions are
   `<box>`/`<cylinder>` primitives, no mesh file)
 - `config/inmoov_rviz.rviz` — RViz layout (visual + collision overlay)
 - `scripts/xacrify_scale.py` — regenerates `inmoov_i2.urdf.xacro` from a
-  fresh raw LinkForge export (see Scale above); handles `.obj`/`.stl`
-  `<mesh>` tags and `<box>`/`<cylinder>`/`<sphere>` primitives alike
+  fresh raw LinkForge export, inertia included (see Regenerating above)
+- `scripts/apply_inertia.py` — re-applies `inertia_estimate.json` to an
+  existing xacro (also used by `xacrify_scale.py`)
+- `scripts/claude_compute_inertia.py` — recomputes the mass/inertia
+  estimate from the meshes (needs `trimesh`)
+- `scripts/inertia_estimate.json`, `.csv` — the estimate itself
+- `scripts/selfcoll.py` — self-collision sampling behind the SRDF (needs
+  `trimesh`, `python-fcl`)
 
 Not yet wired up: live `/joint_states` from the real robot (would need a
 bridge translating `inmoov_control`'s Arduino servo angles into this URDF's
 joint names — separate task, only makes sense once naming/geometry is
-verified to actually match), and collision geometry for the remaining
-links (only head/jaw, thumbs, wrists, and torso have it so far).
+verified to actually match).
