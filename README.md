@@ -111,6 +111,8 @@ source install/setup.bash
 Tests (no hardware needed, after building and sourcing): `tools/run_tests.sh`
 — runs every package's unit tests (skips the ament style linters and the
 scripts that need a real Arduino); see each package's README for what they cover.
+What only a person on the physical robot can check is tracked as a checklist
+with the related commits in [`docs/LIVE_TESTS.md`](docs/LIVE_TESTS.md).
 
 Bring up the whole robot (see `inmoov_bringup/README.md` for tier details
 and launch arguments):
