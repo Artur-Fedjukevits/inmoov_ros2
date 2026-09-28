@@ -51,6 +51,7 @@ lifecycle_manager:
           - voice_detector_node
           - tts_node
           - joint_state_publisher
+          - urdf_bridge          # servo <-> URDF for the Android app (rosbridge)
           - face_expressions   # launch name is 'face_expressions', not 'face_expressions_node'
           - face_detection_node_left
           - face_detection_node_right

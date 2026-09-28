@@ -29,6 +29,7 @@ from launch.actions import DeclareLaunchArgument, GroupAction, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import LifecycleNode, Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 # PulseAudio/PipeWire — needed only by audio nodes
@@ -182,6 +183,10 @@ def generate_launch_description():
         # Telegram
         DeclareLaunchArgument('telegram',
             default_value='false'),
+        # Android app / external clients: rosbridge WebSocket (ws://<robot>:<port>)
+        # + urdf_bridge (servo <-> URDF conversion, /urdf_joint_states, /urdf_joint_cmd)
+        DeclareLaunchArgument('rosbridge', default_value='true'),
+        DeclareLaunchArgument('rosbridge_port', default_value='9090'),
         DeclareLaunchArgument('allowed_chat_id',
             default_value=os.environ.get('TELEGRAM_ALLOWED_CHAT_ID', '0')),
     ]
@@ -369,6 +374,41 @@ def generate_launch_description():
         output='screen',
         respawn=True,
         respawn_delay=2.0,
+    )
+
+    # servo <-> URDF conversion for the Android app, RViz, MoveIt (see urdf_bridge_node.py)
+    urdf_bridge = LifecycleNode(
+        package='inmoov_control',
+        executable='urdf_bridge_node',
+        name='urdf_bridge',
+        namespace='',
+        output='screen',
+        respawn=True,
+        respawn_delay=2.0,
+    )
+
+    # Plain (non-lifecycle) node — not managed by lifecycle_manager.
+    # No authentication: the globs below limit clients to what the Android app
+    # needs (everything else — lifecycle services, /robot_sleep, ... — is refused).
+    # Glob format of rosbridge_server 2.x: a string "['a', 'b']", fnmatch patterns.
+    rosbridge = Node(
+        package='rosbridge_server',
+        executable='rosbridge_websocket',
+        name='rosbridge_websocket',
+        output='screen',
+        respawn=True,
+        respawn_delay=2.0,
+        parameters=[{
+            'port': ParameterValue(LaunchConfiguration('rosbridge_port'), value_type=int),
+            'address': '',
+            # /joint_cmd: calibration drives the servo directly (priority 90)
+            'topics_pub_glob': "['/urdf_joint_cmd', '/joint_cmd', "
+                               "'/urdf_bridge/set_calibration']",
+            'topics_sub_glob': "['/urdf_joint_states', '/urdf_bridge/status']",
+            'services_glob': "['/urdf_bridge/get_map']",
+            'actions_glob': '[]',
+        }],
+        condition=IfCondition(LaunchConfiguration('rosbridge')),
     )
 
     face_expressions = LifecycleNode(
@@ -718,6 +758,8 @@ def generate_launch_description():
         voice_detector,
         tts_node,
         joint_state_publisher,
+        urdf_bridge,
+        rosbridge,
         face_expressions,
         voice_emotion,
         parakeet_stt,

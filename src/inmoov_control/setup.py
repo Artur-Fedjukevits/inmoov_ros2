@@ -10,8 +10,9 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/config', ['config/servo_urdf_map.yaml']),
     ],
-    install_requires=['setuptools', 'pyserial'],
+    install_requires=['setuptools', 'pyserial', 'pyyaml'],
     zip_safe=True,
     maintainer='Artur Fedjukevits',
     maintainer_email='fedjukevitsh@gmail.com',
@@ -25,6 +26,7 @@ setup(
             'joint_state_publisher      = inmoov_control.joint_state_publisher:main',
             'face_expressions_node      = inmoov_control.face_expressions_node:main',
             'face_expression_calibrator = inmoov_control.face_expression_calibrator:main',
+            'urdf_bridge_node           = inmoov_control.urdf_bridge_node:main',
         ],
     },
 )

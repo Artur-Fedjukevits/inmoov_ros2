@@ -73,6 +73,7 @@ Executables registered in [`setup.py`](setup.py):
 | `joint_state_publisher` | `inmoov_control.joint_state_publisher:main` |
 | `face_expressions_node` | `inmoov_control.face_expressions_node:main` |
 | `face_expression_calibrator` | `inmoov_control.face_expression_calibrator:main` |
+| `urdf_bridge_node` | `inmoov_control.urdf_bridge_node:main` |
 
 ### `arduino_right_node` / `arduino_left_node`
 
@@ -308,6 +309,64 @@ ros2 run inmoov_control face_expression_calibrator
 Servo limits/rests are imported from `face_expressions_node` (`_MN`, `_MX`,
 `FACE_REST`), so they are defined in one place.
 
+### `urdf_bridge_node` (servo ↔ URDF, Android app)
+
+Source: [`inmoov_control/urdf_bridge_node.py`](inmoov_control/urdf_bridge_node.py),
+conversion library [`inmoov_control/servo_urdf_map.py`](inmoov_control/servo_urdf_map.py)
+(pure Python), table [`config/servo_urdf_map.yaml`](config/servo_urdf_map.yaml).
+
+Everything above speaks **servo** joints (`bicep_L`, radians around 90°). The robot
+model `inmoov_i2.urdf` (inmoov_description), RViz, MoveIt and the Android app speak
+**URDF** joints in URDF radians. This lifecycle node (launch name `urdf_bridge`,
+tier 2) converts both ways:
+
+| Topic / service | Type | Direction | Notes |
+|---|---|---|---|
+| `/joint_states`, `/face_joint_states` | `sensor_msgs/JointState` | subscribe | servo names (commanded pose) |
+| `/urdf_joint_states` | `sensor_msgs/JointState` | publish, 25 Hz | 41 URDF joints (no mimic joints), clamped to URDF limits |
+| `/urdf_joint_cmd` | `inmoov_msgs/JointCommand` | subscribe | URDF names/radians; source, lease, release are passed through, priority is capped at `PRIORITY_REMOTE` (80); right-eye joints are ignored (see below) |
+| `/joint_cmd` | `inmoov_msgs/JointCommand` | publish | the converted command (servo names, servo rad, velocity converted) |
+| `/urdf_bridge/get_map` | `std_srvs/Trigger` | service | `message` = JSON of the table + current servo degrees |
+| `/urdf_bridge/set_calibration` | `std_msgs/String` | subscribe | JSON `{"servo": "bicep_L", "points": [[deg, rad], ...]}` or `{"servo": ..., "reset": true}` |
+| `/urdf_bridge/status` | `std_msgs/String` | publish, latched | JSON: map source, number of calibrated joints, last calibration result (`persisted`: saved to disk or only applied until restart) |
+
+**Table.** One entry per servo: `urdf` joint, firmware `servo_range`/`servo_rest`,
+`urdf_limits`, and `points: [[servo_deg, urdf_rad], ...]` — piecewise linear,
+≥ 2 points, strictly monotonic (2 points = offset/direction/scale; more = a
+non-linear linkage). 41 servos are mapped; `lowstom` is not in the URDF. The
+shipped table is an **uncalibrated guess** (`verified: false`): arm/neck/torso
+1:1 around the firmware rest, fingers/face stretched over the URDF range, all
+directions +1. Calibrated joints are written to
+`~/.config/inmoov/servo_urdf_map.yaml` (`$INMOOV_SERVO_URDF_MAP`), which overrides
+the shipped table joint by joint. With the `map_file` parameter set, that file
+is loaded as is (no merge) and calibrations are saved back into it, whole.
+
+**Eyes.** `arduino_comm_node` mirrors the eyes (EYE_SYNC), so a command for one
+eye moves both. `/urdf_joint_cmd` drives only the left (leading) eye:
+`i02_head_right_eye_{horizontal,vertical}_joint` are ignored, otherwise two eyes
+in one command would race. `/urdf_joint_states` still reports both.
+
+**Calibration** is done from the Android app (tab *Робот → Калибровка*): the servo
+slider drives the servo directly on `/joint_cmd` (source `calibration`, priority
+90), the model slider is adjusted until the 3D model matches the real robot, each
+match is a point; *Сохранить* publishes `/urdf_bridge/set_calibration`. A table
+sent with `"verified": false` is applied but not saved (`persisted: false`).
+
+**rosbridge.** `inmoov.launch.py` also starts `rosbridge_websocket` (plain node,
+args `rosbridge:=true`, `rosbridge_port:=9090`; needs `ros-jazzy-rosbridge-server`).
+There is no authentication, so the launch whitelists only what the app uses:
+publish `/urdf_joint_cmd`, `/joint_cmd`, `/urdf_bridge/set_calibration`;
+subscribe `/urdf_joint_states`, `/urdf_bridge/status`; service
+`/urdf_bridge/get_map`; no actions. Anything else is refused — extend the globs
+in `inmoov.launch.py` when the app needs more. `/joint_cmd` is open for the
+calibration (priority 90), so still keep the robot on a trusted network. For RViz on the robot:
+`ros2 run robot_state_publisher robot_state_publisher --ros-args -r joint_states:=/urdf_joint_states -p robot_description:=...`
+(the plain `/joint_states` carries servo names, which robot_state_publisher does not know).
+
+Without the robot: [`test/mock_rosbridge_robot.py`](test/mock_rosbridge_robot.py)
+emulates rosbridge + urdf_bridge + Arduinos (`pip install websockets pyyaml`,
+`python3 test/mock_rosbridge_robot.py --demo`).
+
 ## Protocol
 
 Source of truth: [`inmoov_control/protocol.py`](inmoov_control/protocol.py),
@@ -441,6 +500,7 @@ Testing without the robot / servo power (the Arduino only needs USB power):
 ```bash
 python3 -m pytest src/inmoov_control/test/test_protocol.py -v      # no hardware
 python3 -m pytest src/inmoov_control/test/test_joint_arbiter.py -v # no hardware
+python3 -m pytest src/inmoov_control/test/test_servo_urdf_map.py -v # no ROS, no hardware
 python3 src/inmoov_control/test/serial_loopback_test.py --port /dev/ttyACM0 [--left]
 python3 src/inmoov_control/test/test_i2c_pca9685.py --port <left-board-port>
 python3 src/inmoov_control/test/servo_calibration_gui.py            # publishes /joint_cmd (priority 90)

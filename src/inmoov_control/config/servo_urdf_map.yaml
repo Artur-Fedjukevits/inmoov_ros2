@@ -1,0 +1,453 @@
+# servo_urdf_map.yaml — servo (firmware) <-> URDF joint (inmoov_i2.urdf) mapping.
+#
+# Used by urdf_bridge_node (inmoov_control) and by the Android app via rosbridge.
+# points: [servo_deg, urdf_rad] — piecewise linear, >= 2 points, monotonic.
+#   between points: linear; outside: end-segment slope, then clamped to
+#   servo_range (firmware min/max) and urdf_limits (URDF <limit>).
+#
+# INITIAL GUESS, NOT CALIBRATED (verified: false everywhere):
+#   * arm / neck / torso ("direct"): 1 servo degree = 1 joint degree,
+#     URDF zero = firmware rest angle, direction +1;
+#   * fingers / face / eyes (linkages): servo [min, rest, max] stretched over
+#     URDF [lower, 0, upper].
+# The direction (sign) of every joint must be checked on the robot — the
+# calibration tab of the Android app writes the corrected table to
+# ~/.config/inmoov/servo_urdf_map.yaml (overrides this file joint by joint).
+#
+# Generated 2026-09-28 from arduino_{left,right}_node.py tables and
+# inmoov_description/description/inmoov_i2.urdf.xacro limits.
+# Author: Artur Fedjukevits. Assisted by: Claude (Anthropic). License: GPL-3.0-only
+version: 1
+unmapped_servos: [lowstom]
+joints:
+- servo: thumb_R
+  urdf: i02_rightHand_ThumbMid_joint
+  board: right
+  servo_range: [0, 140]
+  servo_rest: 60
+  urdf_limits: [0.0, 1.149]
+  points:
+  - [0, 0.0]
+  - [140, 1.149]
+  verified: false
+- servo: index_R
+  urdf: i02_rightHand_indexPhal_joint
+  board: right
+  servo_range: [0, 160]
+  servo_rest: 40
+  urdf_limits: [0.0, 1.268]
+  points:
+  - [0, 0.0]
+  - [160, 1.268]
+  verified: false
+- servo: middle_R
+  urdf: i02_rightHand_majeurePhal_joint
+  board: right
+  servo_range: [0, 160]
+  servo_rest: 40
+  urdf_limits: [0.0, 1.298]
+  points:
+  - [0, 0.0]
+  - [160, 1.298]
+  verified: false
+- servo: ring_R
+  urdf: i02_rightHand_ringFingerPhal_joint
+  board: right
+  servo_range: [0, 150]
+  servo_rest: 30
+  urdf_limits: [0.0, 1.316]
+  points:
+  - [0, 0.0]
+  - [150, 1.316]
+  verified: false
+- servo: pinky_R
+  urdf: i02_rightHand_pinkyPhal_joint
+  board: right
+  servo_range: [0, 170]
+  servo_rest: 40
+  urdf_limits: [0.0, 1.298]
+  points:
+  - [0, 0.0]
+  - [170, 1.298]
+  verified: false
+- servo: wrist_R
+  urdf: right_wrist_z_joint
+  board: right
+  servo_range: [0, 180]
+  servo_rest: 90
+  urdf_limits: [-1.570796, 1.570796]
+  points:
+  - [0, -1.570796]
+  - [180, 1.570796]
+  verified: false
+- servo: bicep_R
+  urdf: right_elbow_x_joint
+  board: right
+  servo_range: [0, 80]
+  servo_rest: 0
+  urdf_limits: [0.0, 1.2]
+  points:
+  - [0, 0.0]
+  - [80, 1.396263]
+  verified: false
+- servo: rotate_R
+  urdf: right_shoulder_z_joint
+  board: right
+  servo_range: [40, 180]
+  servo_rest: 90
+  urdf_limits: [-0.610865, 0.837758]
+  points:
+  - [40, -0.872665]
+  - [180, 1.570796]
+  verified: false
+- servo: shoulder_R
+  urdf: right_shoulder_x_joint
+  board: right
+  servo_range: [0, 180]
+  servo_rest: 30
+  urdf_limits: [-0.523599, 2.356194]
+  points:
+  - [0, -0.523599]
+  - [180, 2.617994]
+  verified: false
+- servo: omoplate_R
+  urdf: right_shoulder_y_joint
+  board: right
+  servo_range: [10, 80]
+  servo_rest: 10
+  urdf_limits: [0.0, 1.22173]
+  points:
+  - [10, 0.0]
+  - [80, 1.22173]
+  verified: false
+- servo: rollneck
+  urdf: neck_joint
+  board: right
+  servo_range: [50, 115]
+  servo_rest: 80
+  urdf_limits: [-0.349066, 0.349066]
+  points:
+  - [50, -0.523599]
+  - [115, 0.610865]
+  verified: false
+  note: neck_joint axis ~Y = side tilt (roll)
+- servo: eye_lr_R
+  urdf: i02_head_right_eye_horizontal_joint
+  board: right
+  servo_range: [80, 100]
+  servo_rest: 90
+  urdf_limits: [-0.174533, 0.174533]
+  points:
+  - [80, -0.174533]
+  - [90, 0.0]
+  - [100, 0.174533]
+  verified: false
+  note: firmware EYE_SYNC mirrors eye_lr_L
+- servo: eye_ud_R
+  urdf: i02_head_right_eye_vertical_joint
+  board: right
+  servo_range: [85, 115]
+  servo_rest: 100
+  urdf_limits: [-0.261799, 0.261799]
+  points:
+  - [85, -0.261799]
+  - [100, 0.0]
+  - [115, 0.261799]
+  verified: false
+  note: firmware EYE_SYNC mirrors eye_ud_L
+- servo: upperLip
+  urdf: i02_head_upper_lip_joint
+  board: right
+  servo_range: [90, 105]
+  servo_rest: 90
+  urdf_limits: [0.0, 0.1]
+  points:
+  - [90, 0.0]
+  - [105, 0.1]
+  verified: false
+- servo: thumb_L
+  urdf: i02_leftHand_ThumbMid_joint
+  board: left
+  servo_range: [0, 145]
+  servo_rest: 50
+  urdf_limits: [0.0, 1.174]
+  points:
+  - [0, 0.0]
+  - [145, 1.174]
+  verified: false
+- servo: index_L
+  urdf: i02_leftHand_indexPhal_joint
+  board: left
+  servo_range: [0, 150]
+  servo_rest: 0
+  urdf_limits: [0.0, 1.302]
+  points:
+  - [0, 0.0]
+  - [150, 1.302]
+  verified: false
+- servo: majeure_L
+  urdf: i02_leftHand_majeurePhal_joint
+  board: left
+  servo_range: [0, 150]
+  servo_rest: 0
+  urdf_limits: [0.0, 1.26]
+  points:
+  - [0, 0.0]
+  - [150, 1.26]
+  verified: false
+- servo: ring_L
+  urdf: i02_leftHand_ringFingerPhal_joint
+  board: left
+  servo_range: [0, 140]
+  servo_rest: 0
+  urdf_limits: [0.0, 1.373]
+  points:
+  - [0, 0.0]
+  - [140, 1.373]
+  verified: false
+- servo: pinky_L
+  urdf: i02_leftHand_pinkyPhal_joint
+  board: left
+  servo_range: [0, 150]
+  servo_rest: 0
+  urdf_limits: [0.0, 1.358]
+  points:
+  - [0, 0.0]
+  - [150, 1.358]
+  verified: false
+- servo: wrist_L
+  urdf: left_wrist_z_joint
+  board: left
+  servo_range: [0, 180]
+  servo_rest: 150
+  urdf_limits: [-1.570796, 1.570796]
+  points:
+  - [0, -2.617994]
+  - [180, 0.523599]
+  verified: false
+  note: firmware max 300 -> effective 180
+- servo: bicep_L
+  urdf: left_elbow_x_joint
+  board: left
+  servo_range: [0, 90]
+  servo_rest: 0
+  urdf_limits: [0.0, 1.2]
+  points:
+  - [0, 0.0]
+  - [90, 1.570796]
+  verified: false
+- servo: rotate_L
+  urdf: left_shoulder_z_joint
+  board: left
+  servo_range: [40, 180]
+  servo_rest: 90
+  urdf_limits: [-0.872665, 0.610865]
+  points:
+  - [40, -0.872665]
+  - [180, 1.570796]
+  verified: false
+- servo: shoulder_L
+  urdf: left_shoulder_x_joint
+  board: left
+  servo_range: [0, 180]
+  servo_rest: 20
+  urdf_limits: [-0.349066, 2.356194]
+  points:
+  - [0, -0.349066]
+  - [180, 2.792527]
+  verified: false
+- servo: omoplate_L
+  urdf: left_shoulder_y_joint
+  board: left
+  servo_range: [25, 90]
+  servo_rest: 25
+  urdf_limits: [0.0, 1.134464]
+  points:
+  - [25, 0.0]
+  - [90, 1.134464]
+  verified: false
+- servo: neck
+  urdf: i01_head_neck_001_joint
+  board: left
+  servo_range: [0, 100]
+  servo_rest: 40
+  urdf_limits: [-0.349066, 0.349066]
+  points:
+  - [0, -0.698132]
+  - [100, 1.047198]
+  verified: false
+  note: axis ~X = nod (pitch)
+- servo: rothead
+  urdf: i01_head_rothead_joint
+  board: left
+  servo_range: [30, 140]
+  servo_rest: 90
+  urdf_limits: [-1.047198, 0.872665]
+  points:
+  - [30, -1.047198]
+  - [140, 0.872665]
+  verified: false
+  note: axis -Z = turn (yaw)
+- servo: topstom
+  urdf: torso_y_joint
+  board: left
+  servo_range: [60, 110]
+  servo_rest: 83
+  urdf_limits: [-0.261799, 0.261799]
+  points:
+  - [60, -0.401426]
+  - [110, 0.471239]
+  verified: false
+  note: axis -Y = side lean; CHECK which stomach servo leans
+- servo: midstom
+  urdf: torso_z_joint
+  board: left
+  servo_range: [60, 120]
+  servo_rest: 90
+  urdf_limits: [-0.523599, 0.523599]
+  points:
+  - [60, -0.523599]
+  - [120, 0.523599]
+  verified: false
+  note: axis Z = torso yaw; CHECK whether the robot has it
+- servo: eye_lr_L
+  urdf: i02_head_left_eye_horizontal_joint
+  board: left
+  servo_range: [80, 100]
+  servo_rest: 90
+  urdf_limits: [-0.174533, 0.174533]
+  points:
+  - [80, -0.174533]
+  - [90, 0.0]
+  - [100, 0.174533]
+  verified: false
+- servo: eye_ud_L
+  urdf: i02_head_left_eye_vertical_joint
+  board: left
+  servo_range: [80, 110]
+  servo_rest: 100
+  urdf_limits: [-0.349066, 0.174533]
+  points:
+  - [80, -0.349066]
+  - [100, 0.0]
+  - [110, 0.174533]
+  verified: false
+  note: inverted in firmware
+- servo: jaw
+  urdf: i02_head_jaw_joint
+  board: left
+  servo_range: [10, 90]
+  servo_rest: 10
+  urdf_limits: [0.0, 0.17453]
+  points:
+  - [10, 0.0]
+  - [90, 0.17453]
+  verified: false
+- servo: eyelid_L_Upper
+  urdf: i02_head_left_top_eyelid_joint
+  board: left
+  servo_range: [70, 95]
+  servo_rest: 85
+  urdf_limits: [-0.261799, 0.174533]
+  points:
+  - [70, -0.261799]
+  - [85, 0.0]
+  - [95, 0.174533]
+  verified: false
+- servo: eyelid_L_Lower
+  urdf: i02_head_left_bottom_eyelid_joint
+  board: left
+  servo_range: [75, 95]
+  servo_rest: 85
+  urdf_limits: [-0.174533, 0.174533]
+  points:
+  - [75, -0.174533]
+  - [85, 0.0]
+  - [95, 0.174533]
+  verified: false
+- servo: eyelid_R_Upper
+  urdf: i02_head_right_top_eyelid_joint
+  board: left
+  servo_range: [65, 100]
+  servo_rest: 85
+  urdf_limits: [-0.349066, 0.261799]
+  points:
+  - [65, -0.349066]
+  - [85, 0.0]
+  - [100, 0.261799]
+  verified: false
+- servo: eyelid_R_Lower
+  urdf: i02_head_right_bottom_eyelid_joint
+  board: left
+  servo_range: [70, 95]
+  servo_rest: 85
+  urdf_limits: [-0.261799, 0.174533]
+  points:
+  - [70, -0.261799]
+  - [85, 0.0]
+  - [95, 0.174533]
+  verified: false
+- servo: eyebrow_L
+  urdf: i02_head_left_eyebrow_joint
+  board: left
+  servo_range: [60, 110]
+  servo_rest: 90
+  urdf_limits: [-0.523599, 0.349066]
+  points:
+  - [60, -0.523599]
+  - [90, 0.0]
+  - [110, 0.349066]
+  verified: false
+- servo: eyebrow_R
+  urdf: i02_head_right_eyebrow_joint
+  board: left
+  servo_range: [70, 105]
+  servo_rest: 80
+  urdf_limits: [-0.174533, 0.436332]
+  points:
+  - [70, -0.174533]
+  - [80, 0.0]
+  - [105, 0.436332]
+  verified: false
+- servo: cheek_L
+  urdf: i02_head_left_cheek_joint
+  board: left
+  servo_range: [75, 115]
+  servo_rest: 100
+  urdf_limits: [-0.436332, 0.261799]
+  points:
+  - [75, -0.436332]
+  - [100, 0.0]
+  - [115, 0.261799]
+  verified: false
+- servo: cheek_R
+  urdf: i02_head_right_cheek_joint
+  board: left
+  servo_range: [68, 105]
+  servo_rest: 87
+  urdf_limits: [-0.331613, 0.314159]
+  points:
+  - [68, -0.331613]
+  - [87, 0.0]
+  - [105, 0.314159]
+  verified: false
+- servo: forhead_L
+  urdf: i02_head_left_forehead_joint
+  board: left
+  servo_range: [90, 110]
+  servo_rest: 90
+  urdf_limits: [0.0, 0.349066]
+  points:
+  - [90, 0.0]
+  - [110, 0.349066]
+  verified: false
+- servo: forhead_R
+  urdf: i02_head_right_forehead_joint
+  board: left
+  servo_range: [85, 105]
+  servo_rest: 85
+  urdf_limits: [0.0, 0.349066]
+  points:
+  - [85, 0.0]
+  - [105, 0.349066]
+  verified: false
