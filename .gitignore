@@ -20,3 +20,9 @@ wav2vec2_checkpoints/
 
 # Claude Code — personal permission settings, not for commit
 .claude/settings.local.json
+
+# Blender: autosave backups, manual "before" snapshots, scratch export folders
+*.blend1
+*_before_*.blend
+_claude_diag_export/
+_to_delete/

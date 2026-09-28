@@ -2,9 +2,10 @@
 <package format="3">
   <name>inmoov_description</name>
   <version>0.3.0</version>
-  <description>InMoov robot URDF/meshes for RViz2 comparison against the physical robot (geometry/topology check). Model (description/inmoov_i2.urdf) generated via LinkForge, and launch files, both derived in part from a fork of https://github.com/Sentience-Robotics/inmoov_urdf (GPL-3.0) — this workspace drives the robot via inmoov_control, not ros2_control, so no Gazebo/ros2_control bits are included.</description>
+  <description>InMoov robot model (URDF xacro + meshes + self-collision SRDF, estimated mass/inertia) for RViz2 comparison against the physical robot. Generated via LinkForge from a Blender model derived from InMoov (Gael Langevin) through a fork of https://github.com/Sentience-Robotics/inmoov_urdf. Code is GPL-3.0; the meshes and the .blend source are CC BY-NC 4.0 (see LICENSE-ASSETS.md). The robot itself is driven via inmoov_control, not ros2_control.</description>
   <maintainer email="fedjukevitsh@gmail.com">Artur Fedjukevits</maintainer>
-  <license>GPL-3.0-only</license>
+  <license file="LICENSE">GPL-3.0-only</license>
+  <license file="LICENSE-ASSETS.md">CC-BY-NC-4.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 

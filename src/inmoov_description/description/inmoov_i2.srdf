@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<!-- Self-collision matrix for inmoov_i2.urdf.xacro (robot name "inmoov_i1",
+<!-- Self-collision matrix for inmoov_i2.urdf.xacro (robot name "inmoov_i2",
      must match the URDF). Generated 2026-09-28 by scripts/selfcoll.py
      (20000 random poses, mimic Mid=0.8 Tip=0.6); entries chosen from its
      result by hand. Pairs NOT listed here must be checked.
@@ -7,7 +7,7 @@
      Author: Artur Fedjukevits
      Assisted by: Claude Code (Anthropic)
      License: GNU General Public License v3.0 (see repository root LICENSE) -->
-<robot name="inmoov_i1">
+<robot name="inmoov_i2">
   <!-- Neighbours in the kinematic tree (links without geometry collapsed): 42 -->
   <disable_collisions link1="NewHead_origin" link2="i02_head_jaw" reason="Adjacent"/>
   <disable_collisions link1="NewHead_origin" link2="neck_link" reason="Adjacent"/>

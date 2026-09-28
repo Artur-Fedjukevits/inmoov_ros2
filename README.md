@@ -62,7 +62,7 @@ node in dependency-ordered tiers and exposes overall health on
 | [`inmoov_msgs`](src/inmoov_msgs/README.md) | Shared message/service/action definitions (`SoundDirection`, `MemoryQuery`, `Speak`) |
 | [`inmoov_vision`](src/inmoov_vision/README.md) | Dual-eye face detection/tracking/recognition, emotion, OAK-D body perception, head tracking |
 | [`inmoov_voice`](src/inmoov_voice/README.md) | Wake word, VAD, STT, sound localization (TDOA), voice emotion, streaming TTS |
-| [`inmoov_description`](src/inmoov_description/README.md) | URDF/meshes for RViz2 reference — visual/kinematic comparison only, not used for control |
+| [`inmoov_description`](src/inmoov_description/README.md) | URDF/meshes (+ self-collision SRDF, estimated inertia) for RViz2 reference — not used for control; meshes are CC BY-NC 4.0 |
 
 Each package's own README has the full node-by-node breakdown: every ROS2
 parameter with its default and meaning, every topic/service/action with its
@@ -150,10 +150,18 @@ servo/channel mapping). Flash with the Arduino IDE or `arduino-cli`.
 
 ## License
 
-[GNU General Public License v3.0](LICENSE) throughout, including
+[GNU General Public License v3.0](LICENSE) for all code, including
 `inmoov_description`'s URDF/launch files (adapted from
 [Sentience-Robotics/inmoov_urdf](https://github.com/Sentience-Robotics/inmoov_urdf),
-also GPL-3.0 — see that package's README for details).
+also GPL-3.0).
+
+**Exception — robot model assets:** the meshes
+(`src/inmoov_description/meshes/`) and the Blender source
+(`src/inmoov_description/description/inmoov_i2.blend`) are derived from
+[InMoov](https://inmoov.fr) by Gaël Langevin and licensed under
+[CC BY-NC 4.0](src/inmoov_description/LICENSE-ASSETS.md) — attribution
+required, **no commercial use**. See
+[`inmoov_description`'s README](src/inmoov_description/README.md#license).
 
 ## Author
 
