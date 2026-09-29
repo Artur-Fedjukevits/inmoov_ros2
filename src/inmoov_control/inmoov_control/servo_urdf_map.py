@@ -1,7 +1,7 @@
 """
 servo_urdf_map.py — conversion between servo angles and URDF joint angles.
 
-Pure Python (no rclpy), shared by urdf_bridge_node, tests and test/mock_rosbridge_robot.py.
+Pure Python (no rclpy), shared by urdf_bridge_node and the tests.
 
 Three angle conventions meet here:
 

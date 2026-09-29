@@ -367,10 +367,6 @@ calibration (priority 90), so still keep the robot on a trusted network. For RVi
 `ros2 run robot_state_publisher robot_state_publisher --ros-args -r joint_states:=/urdf_joint_states -p robot_description:=...`
 (the plain `/joint_states` carries servo names, which robot_state_publisher does not know).
 
-Without the robot: [`test/mock_rosbridge_robot.py`](test/mock_rosbridge_robot.py)
-emulates rosbridge + urdf_bridge + Arduinos (`pip install websockets pyyaml`,
-`python3 test/mock_rosbridge_robot.py --demo`).
-
 ## Protocol
 
 Source of truth: [`inmoov_control/protocol.py`](inmoov_control/protocol.py),
