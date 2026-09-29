@@ -7,11 +7,12 @@
 #
 # INITIAL GUESS, NOT CALIBRATED (verified: false everywhere):
 #   * arm / neck / torso ("direct"): 1 servo degree = 1 joint degree,
-#     URDF zero = firmware rest angle, direction +1;
+#     URDF zero = firmware rest angle, direction +1 (except neck, rollneck,
+#     midstom, rotate_R: -1);
 #   * fingers / face / eyes (linkages): servo [min, rest, max] stretched over
 #     URDF [lower, 0, upper].
-# The direction (sign) of every joint must be checked on the robot — the
-# calibration tab of the Android app writes the corrected table to
+# Directions of all joints checked on the robot 2026-09-29 (mirror mode of the
+# Android app); the scale is still uncalibrated — the calibration tab of the Android app writes the corrected table to
 # ~/.config/inmoov/servo_urdf_map.yaml (overrides this file joint by joint).
 #
 # Generated 2026-09-28 from arduino_{left,right}_node.py tables and
@@ -97,9 +98,10 @@ joints:
   servo_rest: 90
   urdf_limits: [-0.610865, 0.837758]
   points:
-  - [40, -0.872665]
-  - [180, 1.570796]
+  - [40, 0.872665]
+  - [180, -1.570796]
   verified: false
+  note: direction inverted on the robot 2026-09-29
 - servo: shoulder_R
   urdf: right_shoulder_x_joint
   board: right
@@ -127,10 +129,10 @@ joints:
   servo_rest: 80
   urdf_limits: [-0.349066, 0.349066]
   points:
-  - [50, -0.523599]
-  - [115, 0.610865]
+  - [50, 0.523599]
+  - [115, -0.610865]
   verified: false
-  note: neck_joint axis ~Y = side tilt (roll)
+  note: neck_joint axis ~Y = side tilt (roll); direction inverted on the robot 2026-09-29
 - servo: eye_lr_R
   urdf: i02_head_right_eye_horizontal_joint
   board: right
@@ -273,10 +275,10 @@ joints:
   servo_rest: 40
   urdf_limits: [-0.349066, 0.349066]
   points:
-  - [0, -0.698132]
-  - [100, 1.047198]
+  - [0, 0.698132]
+  - [100, -1.047198]
   verified: false
-  note: axis ~X = nod (pitch)
+  note: axis ~X = nod (pitch); direction inverted on the robot 2026-09-29 (model up = robot down)
 - servo: rothead
   urdf: i01_head_rothead_joint
   board: left
@@ -306,10 +308,10 @@ joints:
   servo_rest: 90
   urdf_limits: [-0.523599, 0.523599]
   points:
-  - [60, -0.523599]
-  - [120, 0.523599]
+  - [60, 0.523599]
+  - [120, -0.523599]
   verified: false
-  note: axis Z = torso yaw; CHECK whether the robot has it
+  note: axis Z = torso yaw; CHECK whether the robot has it; direction inverted on the robot 2026-09-29
 - servo: eye_lr_L
   urdf: i02_head_left_eye_horizontal_joint
   board: left
