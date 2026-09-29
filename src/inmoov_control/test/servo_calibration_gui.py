@@ -75,7 +75,7 @@ SERVOS = {
     ],
     "Face (PCA9685)": [
         # Веки: один слайдер на глаз — Upper тянет Lower (инверсия в firmware)
-        # Больший угол = закрытие
+        # Больший угол = открытие
         ("eyelid_L_Upper", 75,  95,  85),   # синхронизует eyelid_L_Lower
         ("eyelid_R_Upper", 70,  95,  85),   # синхронизует eyelid_R_Lower
         ("eyebrow_L",      60, 110,  90),
