@@ -404,8 +404,12 @@ def generate_launch_description():
             # /joint_cmd: calibration drives the servo directly (priority 90)
             'topics_pub_glob': "['/urdf_joint_cmd', '/joint_cmd', "
                                "'/urdf_bridge/set_calibration']",
-            'topics_sub_glob': "['/urdf_joint_states', '/urdf_bridge/status']",
-            'services_glob': "['/urdf_bridge/get_map']",
+            # the rest is the app's read-only diagnostics (servo pose, arbitration,
+            # failsafe, lifecycle state); change_state & co. stay refused
+            'topics_sub_glob': "['/urdf_joint_states', '/urdf_bridge/status', "
+                               "'/joint_states', '/face_joint_states', '/joint_commanded', "
+                               "'/arduino_*/failsafe', '/arduino_*/joint_owners']",
+            'services_glob': "['/urdf_bridge/get_map', '/*/get_state']",
             'actions_glob': '[]',
         }],
         condition=IfCondition(LaunchConfiguration('rosbridge')),

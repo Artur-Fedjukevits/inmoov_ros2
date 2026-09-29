@@ -356,8 +356,12 @@ sent with `"verified": false` is applied but not saved (`persisted: false`).
 args `rosbridge:=true`, `rosbridge_port:=9090`; needs `ros-jazzy-rosbridge-server`).
 There is no authentication, so the launch whitelists only what the app uses:
 publish `/urdf_joint_cmd`, `/joint_cmd`, `/urdf_bridge/set_calibration`;
-subscribe `/urdf_joint_states`, `/urdf_bridge/status`; service
-`/urdf_bridge/get_map`; no actions. Anything else is refused — extend the globs
+subscribe `/urdf_joint_states`, `/urdf_bridge/status` and, for the app's
+diagnostics, `/joint_states`, `/face_joint_states`, `/joint_commanded`,
+`/arduino_*/failsafe`, `/arduino_*/joint_owners`; services
+`/urdf_bridge/get_map` and `/*/get_state` (read-only lifecycle state —
+`change_state` stays refused); no actions. Anything else is refused (silently
+for the client, a `No match found` warning in the log) — extend the globs
 in `inmoov.launch.py` when the app needs more. `/joint_cmd` is open for the
 calibration (priority 90), so still keep the robot on a trusted network. For RViz on the robot:
 `ros2 run robot_state_publisher robot_state_publisher --ros-args -r joint_states:=/urdf_joint_states -p robot_description:=...`
