@@ -438,10 +438,19 @@ class VoiceDetectorNode(LifecycleNode):
 
     def _person_present_cb(self, msg: Bool):
         now = time.time()
+        appeared = msg.data and self._person_present is not True
         self._person_present      = msg.data
         self._person_present_time = now
         if msg.data:
             self._person_last_seen = now
+        # A person showed up — listen without the wake word. Used to happen only
+        # after the greeting's TTS; with greetings once a day (2026-10-03) a known
+        # face got no TTS and the mic stayed on the wake word (live 2026-10-05).
+        # Whether a phrase is meant for the robot is llm_node's gate (name / gaze + lips).
+        if (appeared and self._lc_active and not self.is_active and not self.tts_speaking
+                and not self._sleeping and self._stt_sent_time <= 0.0):
+            self.get_logger().info('Person appeared — listening without the wake word')
+            self._schedule_relisten(0.3)
 
     def _activate_after_tts(self):
         if not self.is_active and not self.tts_speaking and not self._sleeping:
