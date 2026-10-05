@@ -81,7 +81,7 @@ def _cams(left_age, right_age, active=True):
     return types.SimpleNamespace(
         _active=active, _devs={'left': 'L', 'right': 'R'},
         _passthrough={'left': True, 'right': True}, _fails={'left': 0, 'right': 0},
-        _n_frames={'left': 15, 'right': 15},
+        _n_frames={'left': 15, 'right': 15}, _n_blink_drop=0,
         _last_ok_t={'left': now - left_age, 'right': now - right_age})
 
 
@@ -98,7 +98,8 @@ def test_eye_camera_levels():
 def test_oak_levels():
     def oak(age, running=True):
         return types.SimpleNamespace(_running=running, _model_name='yolov6-nano', _restarts=0,
-                                     _n_packets=15, _last_packet_t=time.monotonic() - age)
+                                     _n_packets=15, _n_frames=0,
+                                     _last_packet_t=time.monotonic() - age)
     assert _run(OakNode._diagnose, oak(0.1)).level == DS.OK          # empty scene still OK
     assert _run(OakNode._diagnose, oak(5)).level == DS.ERROR
     assert _run(OakNode._diagnose, oak(5, running=False)).message == 'inactive'

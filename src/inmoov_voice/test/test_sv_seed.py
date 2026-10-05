@@ -44,7 +44,8 @@ def _stub():
         get_logger=lambda: types.SimpleNamespace(info=lambda *a: None, warn=lambda *a: None,
                                                  debug=lambda *a: None),
         published=[], _next=None)
-    s._publish_voice_emb = lambda emb, ts=None: s.published.append(emb)
+    s._publish_voice_emb = (lambda emb, ts=None, other_speaker=False:
+                            s.published.append((emb, other_speaker)))
     for name in ('_sv_seed', '_sv_sim', '_sv_add_to_gallery', '_sv_reset_reference',
                  '_sv_debug_save', '_sv_check_phrase'):
         setattr(s, name, getattr(VoiceDetectorNode, name).__get__(s))

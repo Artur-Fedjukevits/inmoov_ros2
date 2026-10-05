@@ -3,7 +3,8 @@ test_camera_path.py — eye-camera frame path without cameras or models.
 
   face_capture: MJPEG passthrough publishes the camera's JPEG untouched with
   frame_id; a corrupt frame counts as a miss; the fallback republishes the other
-  eye's frame with ITS stamp + frame_id; the flip path re-encodes.
+  eye's frame with ITS stamp + frame_id; the flip path re-encodes; frames read
+  during a blink are dropped.
   face_detection: stores JPEG bytes, decodes only in _detect.
 
 Run:
@@ -14,6 +15,7 @@ Run:
 import os
 import sys
 import threading
+import time
 import types
 
 import cv2
@@ -79,18 +81,25 @@ def cap_node():
     n.destroy_node()
 
 
+def _grab_at(node, side, sec):
+    """_grab stamps the frame itself from the node clock right after the read."""
+    node.get_clock = lambda: types.SimpleNamespace(
+        now=lambda: types.SimpleNamespace(to_msg=lambda: Time(sec=sec)))
+    node._grab(side)
+
+
 def test_passthrough_publishes_camera_jpeg(cap_node):
     j = _jpeg()
     cap_node._caps = {'left': FakeCap([j])}
-    cap_node._grab('left', Time(sec=5))
+    _grab_at(cap_node, 'left', 5)
     m = cap_node._pubs['left'].msgs[0]
     assert bytes(m.data) == j and m.header.frame_id == 'eye_left' and m.header.stamp.sec == 5
 
 
 def test_corrupt_frame_falls_back_to_other_eye_with_its_stamp(cap_node):
     cap_node._caps = {'left': FakeCap([b'garbage-not-jpeg']), 'right': FakeCap([_jpeg(50)])}
-    cap_node._grab('right', Time(sec=7))          # right is fine
-    cap_node._grab('left', Time(sec=8))           # left frame corrupt → mirror of right
+    _grab_at(cap_node, 'right', 7)                # right is fine
+    _grab_at(cap_node, 'left', 8)                 # left frame corrupt → mirror of right
     assert cap_node._fails['left'] == 1
     m = cap_node._pubs['left'].msgs[0]
     assert m.header.frame_id == 'eye_right'       # consumers see the real source
@@ -104,10 +113,22 @@ def test_flip_path_reencodes(cap_node):
     cap_node._passthrough['left'] = False
     cap_node._flips['left'] = True
     cap_node._caps = {'left': FakeCap([img])}
-    cap_node._grab('left', Time(sec=1))
+    _grab_at(cap_node, 'left', 1)
     out = cv2.imdecode(np.frombuffer(bytes(cap_node._pubs['left'].msgs[0].data), np.uint8),
                        cv2.IMREAD_COLOR)
     assert out[:, -5:].mean() > 200 and out[:, :5].mean() < 50   # stripe moved right
+
+
+def test_frame_during_blink_is_dropped(cap_node):
+    cap_node._caps = {'left': FakeCap([_jpeg(), _jpeg()])}
+    cap_node._fails['left'] = 3
+    cap_node._blink_until = time.monotonic() + 10.0   # eyelids in front of the lens
+    _grab_at(cap_node, 'left', 1)
+    assert cap_node._pubs['left'].msgs == [] and cap_node._n_blink_drop == 1
+    assert cap_node._fails['left'] == 0               # a good frame, not a camera failure
+    cap_node._blink_until = 0.0
+    _grab_at(cap_node, 'left', 2)
+    assert len(cap_node._pubs['left'].msgs) == 1
 
 
 def test_face_detection_decodes_lazily():

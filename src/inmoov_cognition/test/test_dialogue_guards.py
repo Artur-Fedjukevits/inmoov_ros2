@@ -142,6 +142,11 @@ def _stub():
     s._gaze_lips_check = lambda text, t: LLMNode._gaze_lips_check(s, text, t)
     s._accept_command = lambda *a, **k: LLMNode._accept_command(s, *a, **k)
     s._dispatch_pending = lambda: LLMNode._dispatch_pending(s)
+    # STT misspellings of the name → «Лёня» before the LLM (real method)
+    s._ROBOT_NAMES = LLMNode._ROBOT_NAMES
+    s._ROBOT_NAMES_FIRST_WORD = LLMNode._ROBOT_NAMES_FIRST_WORD
+    s._UNK_NAME_RE = LLMNode._UNK_NAME_RE
+    s._normalize_robot_name = lambda text: LLMNode._normalize_robot_name(s, text)
     return s
 
 
@@ -182,7 +187,8 @@ def test_unknown_face_addressing_starts_introduction(monkeypatch):
     s._addressing_reason = lambda text: 'name'
     LLMNode.command_callback(s, String(data='лёня, привет, ты кто'))
     assert s._queried == []
-    assert [m.data for m in s._speech_addressed_pub.msgs] == ['лёня, привет, ты кто']
+    # the name comes out normalized («Лёня») — what identity_manager gets
+    assert [m.data for m in s._speech_addressed_pub.msgs] == ['Лёня, привет, ты кто']
 
     s._addressing_reason = lambda text: 'gaze'     # gaze alone doesn't introduce a stranger
     LLMNode.command_callback(s, String(data='не мерить'))
