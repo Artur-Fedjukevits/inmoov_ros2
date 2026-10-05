@@ -25,14 +25,19 @@ loaded into MoveIt or a simulator.
 
 - **`description/inmoov_i2.urdf.xacro`** — root link `stand_link`. Full-body
   joint tree: torso → neck → head, both arms → hands (59 revolute joints,
-  all with `<limit>`, 18 finger joints driven by `<mimic>`; 3 fixed joints
-  for origin markers). 317 OBJ visual meshes + 8 STL collision meshes under
+  all with `<limit>`, 18 finger joints driven by `<mimic>`; 5 fixed joints:
+  3 origin markers and the OAK-D mount, see below). 311 OBJ visual meshes +
+  8 STL collision meshes under
   `meshes/` (top-level, matching the `package://inmoov_description/meshes/…`
   URIs baked into the URDF) — torso, arms, neck, head expression, and
   fingers all have visual coverage. Collision geometry: STL meshes for the
   stand, thumbs, forearms and lower torso (hips); everything else is
   primitive `<box>`/`<cylinder>` (head, jaw, upper torso, shoulders, wrists,
   neck, fingers — 36 primitives).
+- **OAK-D frames** — `oak_mount_link` (fixed to `torso_y_link`, x forward)
+  and `oak_rgb_camera_optical_frame` (ROS optical convention: z forward,
+  x right, y down), ~1.30 m above the floor in the zero pose. Frames only,
+  no geometry.
 - **Mass and inertia** — every link carries an estimated mass, center of
   mass and full inertia tensor in SI units (see Mass and inertia below).
 - **`description/inmoov_i2.srdf`** — self-collision matrix for MoveIt (see
@@ -53,9 +58,10 @@ The robot name in the URDF and SRDF is `inmoov_i2`.
 
 LinkForge (the Blender extension that generates this model) exports
 `<origin xyz>` and mesh geometry in raw Blender scene units, not meters.
-`description/properties.xacro` defines `model_scale` (0.1196, carried over
-from the old `inmoov_urdf` fork's calibration to a measured crown height of
-1.80 m — same underlying model/units convention), and every `<origin xyz>`
+`description/properties.xacro` defines `model_scale` (0.10604 since
+2026-10-05, recalibrated against the physical robot: the crown is 1.81 m
+above the floor in the zero pose, stand included; it used to be 0.1196,
+carried over from the old `inmoov_urdf` fork), and every `<origin xyz>`
 / `<mesh scale>` in `inmoov_i2.urdf.xacro` multiplies against it, e.g.
 `xyz="${model_scale*8.972792} ..."`.
 
@@ -100,7 +106,10 @@ Options:
   the collision shapes with placeholder masses, so this is only a fallback
 
 `properties.xacro` is untouched by this — hand-maintained, only edit it if
-`model_scale` itself needs recalibrating against the physical robot.
+`model_scale` itself needs recalibrating against the physical robot. The
+inertia estimate is in SI units for the current scale, so after changing
+`model_scale` recompute it (`claude_compute_inertia.py` reads the scale from
+`properties.xacro`) and re-apply it — see Mass and inertia below.
 
 ## Mass and inertia
 
@@ -127,10 +136,10 @@ How the estimate is built (`scripts/claude_compute_inertia.py`):
   HS-805BB in torso and arms, MG996R in forearms and neck, small servos in
   the head; see `SERVOS` in the script).
 - The density is fitted so the robot sums to 16.12 kg — it comes out at
-  ~20% of solid PLA, plausible for infill plus the empty space inside the
+  ~28% of solid PLA, plausible for infill plus the empty space inside the
   hulls. COM and tensor come from the hull geometry.
-- Sanity checks: torso 5.76 kg, forearm 1.06 kg, whole head 1.42 kg, hand
-  with fingers 218 g, fingertip 2.7 g. Kinematic-only links without
+- Sanity checks: torso 5.67 kg, forearm 1.07 kg, whole head 1.43 kg, hand
+  with fingers 220 g, fingertip 2.7 g. Kinematic-only links without
   geometry get 1 g / 1e-9 kg·m².
 
 To adapt it to your own build, edit the weights/servo table in
