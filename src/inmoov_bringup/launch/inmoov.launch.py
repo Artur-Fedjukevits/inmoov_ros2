@@ -51,6 +51,13 @@ _VISION_NODES = [
 ]
 _TELEGRAM_NODES = ['telegram_bridge_node']
 
+# Eye camera resolution (WN.RCamera8M, MJPEG 4:3 — same field of view as 640x480).
+# 1280x960 since 2026-10-01: at 1.5 m a face was only ~85 px wide at 640x480,
+# too small to see the lips move (face_tracker lip activity). Pixel thresholds
+# below were tuned at 640 px and are scaled by _CAM_SCALE.
+_CAM_W, _CAM_H = 1280, 960
+_CAM_SCALE = _CAM_W / 640
+
 
 def _load_robot_config() -> dict:
     """config/robot.yaml (or $INMOOV_ROBOT_CONFIG) flattened to {launch_arg: str}."""
@@ -278,8 +285,8 @@ def generate_launch_description():
             'cam_left':     LaunchConfiguration('cam_left'),
             'cam_right':    LaunchConfiguration('cam_right'),
             'fps':          LaunchConfiguration('fps'),
-            'width':        640,
-            'height':       480,
+            'width':        _CAM_W,
+            'height':       _CAM_H,
             'jpeg_quality': 85,
         }],
     )
@@ -553,7 +560,7 @@ def generate_launch_description():
             'enroll_interval_sec':   1.0,
             'interact_interval_sec': 15.0,
             'min_det_score':         0.75,
-            'min_face_px':           60,
+            'min_face_px':           int(60 * _CAM_SCALE),
         }],
     )
 
@@ -567,7 +574,7 @@ def generate_launch_description():
         respawn_delay=2.0,
         parameters=[{
             'analysis_hz':   LaunchConfiguration('analysis_hz'),
-            'min_face_size': 48,
+            'min_face_size': int(48 * _CAM_SCALE),
         }],
     )
 
@@ -580,16 +587,16 @@ def generate_launch_description():
         respawn=True,
         respawn_delay=2.0,
         parameters=[{
-            'image_width':        640,
-            'image_height':       480,
+            'image_width':        _CAM_W,
+            'image_height':       _CAM_H,
             'gain_head':          LaunchConfiguration('gain_head'),
             'gain_eye':           LaunchConfiguration('gain_eye'),
             'rest_rothead':       LaunchConfiguration('rest_rothead'),
             'rest_neck':          LaunchConfiguration('rest_neck'),
             'rest_eye_lr':        90.0,
             'rest_eye_ud':        100.0,
-            'dead_zone_px':       20,
-            'head_dead_zone_px':  80,
+            'dead_zone_px':       int(20 * _CAM_SCALE),
+            'head_dead_zone_px':  int(80 * _CAM_SCALE),
             'return_timeout_sec': 10.0,  # was 7.0 — still too little, dropped the head to rest mid-dialogue on a brief loss of face at the edge of the frame (2026-09-01)
             'track_hz':           10.0,
             'max_step_deg':       2.0,
