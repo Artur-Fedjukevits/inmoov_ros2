@@ -21,6 +21,10 @@ servo_urdf_map.yaml (see servo_urdf_map.py):
                                        (or to map_file, if that parameter is set)
   ~/status         (std_msgs/String, latched) JSON: map source, last calibration result
 
+  /gesture/body_joints, /gesture/face_joints  (std_msgs/String, JSON "inmoov_gesture")
+        └─> gesture_store: validated, servo_deg recomputed from the table, saved to
+            gestures_dir/<kind>/<name>.json (default ~/.config/inmoov/gestures)
+
 The eyes are mirrored by arduino_comm_node (EYE_SYNC): a command for one eye
 moves both. /urdf_joint_cmd therefore only drives the left (leading) eye — the
 right-eye joints are ignored, otherwise the two eyes in one command would race
@@ -50,6 +54,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from inmoov_msgs.msg import JointCommand
 
+from . import gesture_store
 from .servo_urdf_map import (USER_MAP_PATH, JointMap, ServoUrdfMap,
                              servo_deg_to_rad, servo_rad_to_deg)
 
@@ -74,6 +79,7 @@ class UrdfBridgeNode(LifecycleNode):
         super().__init__('urdf_bridge')
         self.declare_parameter('map_file', '')          # '' = shipped table (+ user overrides)
         self.declare_parameter('publish_rate_hz', 25.0)
+        self.declare_parameter('gestures_dir', '')      # '' = gesture_store default
         self._map: ServoUrdfMap = None
         self._shipped_path = ''
         self._map_file = ''       # the map_file parameter; '' = shipped + user file
@@ -104,6 +110,10 @@ class UrdfBridgeNode(LifecycleNode):
             self.create_subscription(JointState, '/face_joint_states', self._servo_state_cb, 10),
             self.create_subscription(JointCommand, '/urdf_joint_cmd', self._urdf_cmd_cb, 20),
             self.create_subscription(String, '~/set_calibration', self._set_calibration_cb, 10),
+            self.create_subscription(String, '/gesture/body_joints',
+                                     lambda m: self._gesture_cb(m, 'body'), 10),
+            self.create_subscription(String, '/gesture/face_joints',
+                                     lambda m: self._gesture_cb(m, 'face'), 10),
         ]
         self._srv = self.create_service(Trigger, '~/get_map', self._get_map_cb)
         self._state_pub = self.create_lifecycle_publisher(JointState, '/urdf_joint_states', 10)
@@ -209,6 +219,24 @@ class UrdfBridgeNode(LifecycleNode):
         if out.cmd.name:
             out.cmd.header.stamp = self.get_clock().now().to_msg()
             self._cmd_pub.publish(out)
+
+    # ---------------------------------------------------------- gestures
+    def _gesture_cb(self, msg: String, kind: str) -> None:
+        root = self.get_parameter('gestures_dir').value or gesture_store.GESTURES_DIR
+        try:
+            g = gesture_store.parse(msg.data, kind)
+            unknown = gesture_store.add_servo_deg(g, self._map)
+            path = gesture_store.save(g, root)
+        except (gesture_store.GestureError, OSError) as e:
+            self.get_logger().error(f'urdf_bridge: gesture ({kind}) rejected: {e}')
+            return
+        self.get_logger().info(
+            f'urdf_bridge: gesture {kind}/{g["name"]!r} saved: {len(g["positions"])} joints '
+            f'-> {path}')
+        if unknown:
+            self.get_logger().warn(
+                f'urdf_bridge: gesture {g["name"]!r}: joints not in the servo table '
+                f'(stored, no servo_deg): {unknown[:5]}')
 
     # ------------------------------------------------------- calibration
     def _get_map_cb(self, request, response):

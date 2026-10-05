@@ -416,7 +416,8 @@ def generate_launch_description():
             'address': '',
             # /joint_cmd: calibration drives the servo directly (priority 90)
             'topics_pub_glob': "['/urdf_joint_cmd', '/joint_cmd', "
-                               "'/urdf_bridge/set_calibration']",
+                               "'/urdf_bridge/set_calibration', "
+                               "'/gesture/body_joints', '/gesture/face_joints']",
             # the rest is the app's read-only diagnostics (servo pose, arbitration,
             # failsafe, lifecycle state); change_state & co. stay refused
             'topics_sub_glob': "['/urdf_joint_states', '/urdf_bridge/status', "

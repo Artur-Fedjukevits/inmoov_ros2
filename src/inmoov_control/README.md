@@ -346,6 +346,18 @@ eye moves both. `/urdf_joint_cmd` drives only the left (leading) eye:
 `i02_head_right_eye_{horizontal,vertical}_joint` are ignored, otherwise two eyes
 in one command would race. `/urdf_joint_states` still reports both.
 
+**Gestures.** The Android app publishes recorded poses as one JSON string
+(`std_msgs/String`, format `inmoov_gesture` v1, positions in URDF radians) to
+`/gesture/body_joints` (`"kind": "body"`, 25 joints) and `/gesture/face_joints`
+(`"kind": "face"`, 16 joints). `urdf_bridge` validates the message
+([`gesture_store.py`](inmoov_control/gesture_store.py): kind must match the topic,
+finite numbers, ≤ 64 KiB), recomputes `servo_deg` from the calibration table and
+saves it to `<gestures_dir>/<kind>/<name>.json` (parameter `gestures_dir`, default
+`~/.config/inmoov/gestures`, or `$INMOOV_GESTURES_DIR`); the same name overwrites.
+Bad messages are only logged (the app does not wait for a reply). The BT / LLM
+read the files with `gesture_store.load()` / `list_gestures()`. Both topics are in
+the rosbridge `topics_pub_glob` of `inmoov.launch.py`.
+
 **Calibration** is done from the Android app (tab *Робот → Калибровка*): the servo
 slider drives the servo directly on `/joint_cmd` (source `calibration`, priority
 90), the model slider is adjusted until the 3D model matches the real robot, each
