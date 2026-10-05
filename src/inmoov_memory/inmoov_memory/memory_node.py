@@ -469,9 +469,11 @@ class MemoryNode(LifecycleNode):
             people = [name] if present and name else []
             self._mm.working.update_environment(people=people)
 
-            # Who the robot is looking at
+            # Who the robot is looking at. '' clears it — None means "leave as is"
+            # in update_robot_state, so "смотрю на Николь" used to stick from a
+            # finished session next to "Люди рядом: никого" (live bug 2026-09-30).
             self._mm.working.update_robot_state(
-                facing=name if present and name else None,
+                facing=name if present and name else '',
             )
 
             # Operating mode
@@ -601,7 +603,7 @@ class MemoryNode(LifecycleNode):
         self._mm.working.update_robot_state(mode=mode)
         if msg.data:
             self._mm.working.update_environment(people=[])
-            self._mm.working.update_robot_state(facing=None)
+            self._mm.working.update_robot_state(facing='')
 
     def _cleanup_episodic(self):
         """Timer: purges old low-importance episodes (the episodic sliding window)."""
@@ -1377,14 +1379,27 @@ class MemoryNode(LifecycleNode):
             self._voice_gallery_cache.pop(pid, None)
 
     def _lookup_by_name(self, req: dict) -> dict:
-        """Looks up a person by exact name (case-insensitive)."""
-        name = req.get('name', '').strip()
+        """Looks up a person by exact name or alias (case-insensitive).
+
+        Aliases live in person_notes under key 'aliases' (comma-separated,
+        e.g. "Анастасия, Настенька"). Compared in Python: SQLite LOWER()
+        only folds ASCII, so Cyrillic names would not match case-insensitively.
+        """
+        name = req.get('name', '').strip().lower()
+        if not name:
+            return {'person_id': None}
         with self._lock:
-            row = self._db.execute(
-                'SELECT id, name FROM persons WHERE LOWER(name)=LOWER(?)', (name,)
-            ).fetchone()
-        if row:
-            return {'person_id': row[0], 'name': row[1]}
+            persons = self._db.execute('SELECT id, name FROM persons').fetchall()
+            aliases = self._db.execute(
+                "SELECT person_id, value FROM person_notes WHERE key='aliases'"
+            ).fetchall()
+        for pid, pname in persons:
+            if (pname or '').strip().lower() == name:
+                return {'person_id': pid, 'name': pname}
+        names = dict(persons)
+        for pid, value in aliases:
+            if pid in names and name in (a.strip().lower() for a in (value or '').split(',')):
+                return {'person_id': pid, 'name': names[pid]}
         return {'person_id': None}
 
     def _verify_person_claim(self, req: dict) -> dict:
