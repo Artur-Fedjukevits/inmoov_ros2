@@ -115,7 +115,7 @@ def generate_launch_description():
         DeclareLaunchArgument('llm_fallback_url', default_value=robot['llm_fallback_url']),
         DeclareLaunchArgument('vision_llm_url',   default_value=robot['vision_llm_url']),
         DeclareLaunchArgument('llm_bearer_token',
-            default_value=os.environ.get('VLLM_BEARER_TOKEN', '')),
+                              default_value=os.environ.get('VLLM_BEARER_TOKEN', '')),
         DeclareLaunchArgument('tts_server_url',   default_value=robot['tts_server_url']),
         DeclareLaunchArgument('tts_fallback_url', default_value=robot['tts_fallback_url']),
         DeclareLaunchArgument('cast_to_file_url', default_value=robot['cast_to_file_url']),
@@ -123,7 +123,7 @@ def generate_launch_description():
 
         # LLM
         DeclareLaunchArgument('llm_model',
-            default_value='qwen3.8-27b'),
+                              default_value='qwen3.8-27b'),
         DeclareLaunchArgument('llm_temperature',    default_value='0.1'),
         DeclareLaunchArgument('llm_max_tokens',     default_value='512'),
 
@@ -155,7 +155,7 @@ def generate_launch_description():
 
         # Tavily
         DeclareLaunchArgument('tavily_api_key',
-            default_value=os.environ.get('TAVILY_API_KEY', '')),
+                              default_value=os.environ.get('TAVILY_API_KEY', '')),
 
         # Arduino
         DeclareLaunchArgument('port_right', default_value=robot['port_right']),
@@ -191,13 +191,13 @@ def generate_launch_description():
 
         # Telegram
         DeclareLaunchArgument('telegram',
-            default_value='false'),
+                              default_value='false'),
         # Android app / external clients: rosbridge WebSocket (ws://<robot>:<port>)
         # + urdf_bridge (servo <-> URDF conversion, /urdf_joint_states, /urdf_joint_cmd)
         DeclareLaunchArgument('rosbridge', default_value='true'),
         DeclareLaunchArgument('rosbridge_port', default_value='9090'),
         DeclareLaunchArgument('allowed_chat_id',
-            default_value=os.environ.get('TELEGRAM_ALLOWED_CHAT_ID', '0')),
+                              default_value=os.environ.get('TELEGRAM_ALLOWED_CHAT_ID', '0')),
     ]
 
     # ── Lifecycle Manager (a plain Node — manages the others) ────────────────

@@ -29,7 +29,7 @@ setup(
             'voice_detector_node  = inmoov_voice.voice_detector_node:main',
             'parakeet_stt_node    = inmoov_voice.parakeet_stt_node:main',
             'tts_node             = inmoov_voice.tts_node:main',
-'voice_emotion_node   = inmoov_voice.voice_emotion_node:main',
+            'voice_emotion_node   = inmoov_voice.voice_emotion_node:main',
             'sound_localization_node = inmoov_voice.sound_localization_node:main',
             'diagnose             = inmoov_voice.diagnose:main',
         ],

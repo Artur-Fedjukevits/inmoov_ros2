@@ -137,14 +137,14 @@ os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 
-import numpy as np
-import rclpy
-from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
-from std_msgs.msg import Header
-import sounddevice as sd
-from scipy.signal import butter, sosfiltfilt
+import numpy as np  # noqa: E402
+import rclpy  # noqa: E402
+from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn  # noqa: E402
+from std_msgs.msg import Header  # noqa: E402
+import sounddevice as sd  # noqa: E402
+from scipy.signal import butter, sosfiltfilt  # noqa: E402
 
-from inmoov_msgs.msg import SoundDirection
+from inmoov_msgs.msg import SoundDirection  # noqa: E402
 
 
 class SoundLocalizationNode(LifecycleNode):
@@ -201,7 +201,7 @@ class SoundLocalizationNode(LifecycleNode):
         self._last_voiced_t = 0.0
 
         self._sos = butter(4, [self._bandpass_low, self._bandpass_high],
-                            btype='band', fs=self.rate, output='sos')
+                           btype='band', fs=self.rate, output='sos')
 
         self._n_fft = 1
         while self._n_fft < 2 * self.block_size:

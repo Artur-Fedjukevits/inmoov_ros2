@@ -21,9 +21,9 @@ import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from sensor_msgs.msg import JointState
 
-from .arduino_comm_node  import ArduinoCommNode, deg_to_rad
+from .arduino_comm_node import ArduinoCommNode, deg_to_rad
 from .arduino_right_node import ArduinoRightNode
-from .arduino_left_node  import ArduinoLeftNode
+from .arduino_left_node import ArduinoLeftNode
 
 
 # joint → rest position in radians (same convention as /joint_command)
@@ -127,7 +127,6 @@ class JointStatePublisher(LifecycleNode):
         fs.name     = list(self._face.keys())
         fs.position = list(self._face.values())
         self._face_pub.publish(fs)
-
 
 
 def main(args=None):

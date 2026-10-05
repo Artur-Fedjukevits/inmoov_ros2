@@ -39,7 +39,7 @@ class WorkingMemory:
     TIME_OF_DAY = [
         (5,  "night"),     # 00:00-04:59 → night
         (12, "morning"),   # 05:00-11:59 → morning
-        (18, "afternoon"), # 12:00-17:59 → afternoon
+        (18, "afternoon"),  # 12:00-17:59 → afternoon
         (22, "evening"),   # 18:00-21:59 → evening
         # >= 22 → stays default "night"
     ]
@@ -149,7 +149,7 @@ class WorkingMemory:
         """Compact text for insertion into the system prompt."""
         self.refresh_time()
         t = self.data["time"]
-        l = self.data["location"]
+        loc = self.data["location"]
         s = self.data["robot_state"]
         e = self.data["environment"]
 
@@ -159,8 +159,8 @@ class WorkingMemory:
 
         return (
             f"Время: {t['timestamp']} ({t['day_of_week_ru']}, {t['time_of_day_ru']}, {t['season_ru']} {t['year']})\n"
-            f"Расположение: {l['room']}"
-            + (f" — {l['landmark']}" if l["landmark"] else "") + "\n"
+            f"Расположение: {loc['room']}"
+            + (f" — {loc['landmark']}" if loc["landmark"] else "") + "\n"
             f"Режим: {s['mode']}{facing_str}, батарея: {s['battery']}%\n"
             f"Задача: {task_str}\n"
             f"Люди рядом: {people_str}"

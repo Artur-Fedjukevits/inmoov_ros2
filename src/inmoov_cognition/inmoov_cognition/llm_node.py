@@ -667,6 +667,7 @@ def _is_user_echo(text: str, user_text: str) -> bool:
     user_words = set(_echo_words(user_text))
     return sum(w in user_words for w in words) / len(words) >= _ECHO_WORD_SHARE
 
+
 # Qwen3 sometimes switches to Chinese on creative tasks — strip ideographs from TTS chunks
 _CJK_RE = re.compile(
     '[⺀-⿿　-〿぀-ゟ゠-ヿ㐀-䶿一-鿿'
@@ -1127,7 +1128,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
             for it in controllable:
                 opts = f"  options={it['options']}" if 'options' in it else ''
                 lines.append(
-                    f"{it['name']:<42s}| {it['type']:<20s}| {it.get('label','')}{opts}"
+                    f"{it['name']:<42s}| {it['type']:<20s}| {it.get('label', '')}{opts}"
                 )
             schema_text = '\n'.join(lines)
         except Exception:
@@ -1378,7 +1379,7 @@ class LLMNode(LifecycleNode):
         try:
             headers = {'Authorization': f'Bearer {bearer}'} if bearer else {}
             r = requests.get(_models_url(chat_url), headers=headers,
-                              timeout=self.connect_timeout)
+                             timeout=self.connect_timeout)
             r.raise_for_status()
             models = [m['id'] for m in r.json().get('data', [])]
             model_base = model.split(':')[0]
@@ -1480,7 +1481,7 @@ class LLMNode(LifecycleNode):
 
         urls = [self._active_url]
         other = self.llm_fallback_url if self._active_url == self.llm_url \
-                else self.llm_url
+            else self.llm_url
         if other and other != self._active_url:
             urls.append(other)
 
@@ -2129,9 +2130,9 @@ class LLMNode(LifecycleNode):
     # ── Main LLM request ────────────────────────────────────────────────
 
     def _query_llm(self, user_text: str, person_ctx_override: dict | None = None,
-                    image_b64: str | None = None, source: str = 'voice',
-                    addressing: str = '', speaker_tag: str | None = None,
-                    other_speaker: bool = False):
+                   image_b64: str | None = None, source: str = 'voice',
+                   addressing: str = '', speaker_tag: str | None = None,
+                   other_speaker: bool = False):
         _t0 = time.time()
         if source != 'voice':
             addressing = None   # no addressee question outside voice
@@ -2151,7 +2152,7 @@ class LLMNode(LifecycleNode):
                 # person_id is known, otherwise it would reveal name/facts before identification.
                 _pid = (person_ctx or {}).get('person_id')
                 memory_context    = (self._memory_context if _pid is not None
-                                      else _strip_episodic_memory(self._memory_context))
+                                     else _strip_episodic_memory(self._memory_context))
                 scene_ctx         = self._scene_context
                 face_search_ctx   = self._face_search_status
                 # Only a fresh voice-id belongs to this utterance (it arrives before
@@ -2194,13 +2195,13 @@ class LLMNode(LifecycleNode):
 
             messages = [{'role': 'system', 'content': system_prompt}]
             messages += self.history if self.keep_history else \
-                        [{'role': 'user', 'content': turn_text}]
+                [{'role': 'user', 'content': turn_text}]
             if image_b64:
                 # self.history holds a text placeholder (see the append above) —
                 # the image is only substituted into the outgoing messages; the last
                 # user message is always this very turn.
                 messages[-1] = {**messages[-1],
-                                 'content': _build_user_content(turn_text, image_b64)}
+                                'content': _build_user_content(turn_text, image_b64)}
 
             payload = {
                 'model':       self.model,
@@ -2512,8 +2513,8 @@ class LLMNode(LifecycleNode):
                                     'messages': (
                                         [{'role': 'system', 'content': system_prompt}]
                                         + _flatten_tool_history(self.history,
-                                            'Действие выполнено. Ответь пользователю одним коротким предложением — '
-                                            'продолжи разговор естественно, не упоминая факт сохранения.')
+                                                                'Действие выполнено. Ответь пользователю одним коротким предложением — '
+                                                                'продолжи разговор естественно, не упоминая факт сохранения.')
                                     ),
                                     'tools':       [],
                                     'stream':      False,
@@ -2651,7 +2652,7 @@ class LLMNode(LifecycleNode):
             return {'error': f'Unknown function: {fn_name}'}
 
     def _call_vision_model(self, images_b64: list[str], query: str,
-                            system_content: str, max_tokens: int = 200) -> dict:
+                           system_content: str, max_tokens: int = 200) -> dict:
         """A single request to a SEPARATE vision model (self.vision_llm_url, not self.llm_url —
         that one is limited to 1 image per prompt, see the 2026-08-26 history). This model
         accepts 2-4 images at once (verified by the user on the server). A plain
@@ -2676,7 +2677,7 @@ class LLMNode(LifecycleNode):
                    if self.vision_bearer_token else {})
         try:
             r = requests.post(self.vision_llm_url, json=payload, headers=headers,
-                               timeout=(self.connect_timeout, 25.0))
+                              timeout=(self.connect_timeout, 25.0))
             r.raise_for_status()
             data = r.json()
             description = (data['choices'][0]['message']['content'] or '').strip()
@@ -2880,22 +2881,14 @@ class LLMNode(LifecycleNode):
         if not entries:
             return {'error': f'Нет данных прогноза для {target} ({resolved_loc})'}
 
-        temps   = [e['temp']   for e in entries if e['temp']   is not None]
-        winds   = [e['wind']   for e in entries if e['wind']   is not None]
+        temps   = [e['temp'] for e in entries if e['temp'] is not None]
+        winds   = [e['wind'] for e in entries if e['wind'] is not None]
         precips = [e['precip'] for e in entries]
 
         # Main description — the most frequent symbol (without the _day/_night/_polartwilight suffix)
         symbols = [e['symbol'].split('_')[0] for e in entries if e['symbol']]
         main_sym  = Counter(symbols).most_common(1)[0][0] if symbols else ''
         main_desc = self._YR_SYMBOLS.get(main_sym, main_sym)
-
-        # Hourly forecast (every 3 hours, daytime 7-22)
-        hourly = [
-            f"{e['hour']:02d}:00 {e['temp']}°C "
-            f"{self._YR_SYMBOLS.get(e['symbol'].split('_')[0], e['symbol'])}"
-            for e in entries
-            if e['hour'] % 3 == 0 and 7 <= e['hour'] <= 22
-        ]
 
         return {
             'location':    resolved_loc,
@@ -3282,7 +3275,7 @@ class LLMNode(LifecycleNode):
             )
         else:
             self.get_logger().info(
-                f'→ BT: "{text[:70]}{"..." if len(text)>70 else ""}"'
+                f'→ BT: "{text[:70]}{"..." if len(text) > 70 else ""}"'
                 + (' [TG]' if tg_req_id else '')
                 + (f' voice="{voice_preset}"' if voice_preset else '')
             )
@@ -3488,7 +3481,6 @@ class LLMNode(LifecycleNode):
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
-
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
     def _dp(self, name, default=None):
@@ -3545,7 +3537,7 @@ class LLMNode(LifecycleNode):
         self.vision_llm_url     = self.get_parameter('vision_llm_url').value
         self.vision_model       = self.get_parameter('vision_model').value
         self.vision_bearer_token = (self.get_parameter('vision_bearer_token').value
-                                     or self.bearer_token)
+                                    or self.bearer_token)
         self.model_primary     = self.get_parameter('model').value
         self.model_fallback    = self.get_parameter('model_fallback').value
         self.temperature       = self.get_parameter('temperature').value
@@ -3581,13 +3573,13 @@ class LLMNode(LifecycleNode):
         self.create_subscription(String, '/scene/objects',  self._scene_context_cb,        10)
         self.create_subscription(String, '/voice/speaker',  self._speaker_cb,              10)
         self.create_subscription(String, '/behavior/face_search_status',
-                                  self._face_search_status_cb,                             10)
+                                 self._face_search_status_cb,                             10)
         self.create_subscription(String, 'openhab_schema',  self._oh_schema_callback,      10)
         self.create_subscription(String, 'openhab_items',   self._oh_items_callback,       10)
         self.create_subscription(CompressedImage, '/camera/eye_left/compressed',
-                                  self._eye_camera_cb, _CAMERA_QOS)
+                                 self._eye_camera_cb, _CAMERA_QOS)
         self.create_subscription(CompressedImage, '/camera/eye_right/compressed',
-                                  self._eye_camera_right_cb, _CAMERA_QOS)
+                                 self._eye_camera_right_cb, _CAMERA_QOS)
         self.create_subscription(Bool,   'wake_detected',   self._wake_cb,                 10)
         self.create_subscription(Bool,   '/introducing',    self._introducing_cb,          10)
         self.create_subscription(Bool,   '/go_idle',        self._go_idle_cb,              10)

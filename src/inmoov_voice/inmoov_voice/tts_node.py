@@ -642,8 +642,6 @@ class TTSNode(LifecycleNode):
         return int(headers.get('X-Sample-Rate', 24000))
 
 
-
-
 def main():
     rclpy.init()
     node = TTSNode()

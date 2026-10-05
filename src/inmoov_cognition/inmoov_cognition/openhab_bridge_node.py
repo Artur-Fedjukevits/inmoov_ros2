@@ -337,8 +337,6 @@ class OpenHABBridgeNode(LifecycleNode):
         self._schema_pub.publish(msg)
 
 
-
-
 def main():
     rclpy.init()
     node = OpenHABBridgeNode()

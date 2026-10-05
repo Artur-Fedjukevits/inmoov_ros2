@@ -617,8 +617,6 @@ class FaceGalleryNode(LifecycleNode):
                 f'{result.get("gallery_count", 0)} gallery photo(s)')
 
 
-
-
 def main():
     rclpy.init()
     node = FaceGalleryNode()

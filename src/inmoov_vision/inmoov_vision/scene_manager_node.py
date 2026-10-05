@@ -179,9 +179,9 @@ class SceneManagerNode(LifecycleNode):
                 return
             now = time.time()
             # Drop labels not confirmed for longer than object_ttl_sec
-            stale = [l for l, e in self._labels.items() if now - e['last_seen'] > self._ttl_sec]
-            for l in stale:
-                del self._labels[l]
+            stale = [k for k, e in self._labels.items() if now - e['last_seen'] > self._ttl_sec]
+            for k in stale:
+                del self._labels[k]
 
             objects = []
             for label, entry in self._labels.items():

@@ -142,7 +142,6 @@ def rebuild(db_path: str, gallery_dir: str):
           '"request_json: \'{op: reload_gallery}\'"')
 
 
-
 def main():
     parser = argparse.ArgumentParser(description='Rebuild face gallery embeddings from photos')
     parser.add_argument('--db',      default=os.path.expanduser('~/inmoov_memory.db'),

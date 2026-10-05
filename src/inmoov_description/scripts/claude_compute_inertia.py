@@ -89,12 +89,12 @@ def main():
     root = load_urdf(S)
 
     links = {}
-    for l in root.findall('link'):
-        name = l.get('name')
+    for lk in root.findall('link'):
+        name = lk.get('name')
         V = 0.0
         M1 = np.zeros(3)
         J = np.zeros((3, 3))
-        for v in l.findall('visual'):
+        for v in lk.findall('visual'):
             g = v.find('geometry/mesh')
             o = v.find('origin')
             m = trimesh.load(os.path.join(MESHDIR, g.get('filename').split('/')[-1]), force='mesh')
@@ -130,10 +130,10 @@ def main():
             mass, note = STAND_MASS, 'IKEA catalog'
         else:
             mass, note = k*d['V'] + SERVOS.get(name, 0.0), 'estimate'
-        I = Jc*(mass/d['V'])
-        w = np.linalg.eigvalsh(I)
+        inertia = Jc*(mass/d['V'])
+        w = np.linalg.eigvalsh(inertia)
         assert w.min() > 0 and w[0] + w[1] >= w[2]*0.999, (name, w)
-        out[name] = dict(mass=mass, com=c.tolist(), I=I.tolist(), V_cm3=d['V']*1e6,
+        out[name] = dict(mass=mass, com=c.tolist(), I=inertia.tolist(), V_cm3=d['V']*1e6,
                          servo=SERVOS.get(name, 0.0), note=note)
 
     with open(OUT_JSON, 'w', encoding='utf-8') as f:
@@ -144,9 +144,9 @@ def main():
         wr.writerow(['link', 'mass_kg', 'servo_kg', 'hull_cm3', 'com_x', 'com_y', 'com_z',
                      'ixx', 'iyy', 'izz', 'ixy', 'ixz', 'iyz', 'note'])
         for n, r in sorted(out.items(), key=lambda x: -x[1]['mass']):
-            I = r['I']
+            inertia = r['I']
             wr.writerow([n, round(r['mass'], 4), r['servo'], round(r['V_cm3'], 1), *[round(x, 5) for x in r['com']],
-                         *['%.3e' % x for x in (I[0][0], I[1][1], I[2][2], I[0][1], I[0][2], I[1][2])], r['note']])
+                         *['%.3e' % x for x in (inertia[0][0], inertia[1][1], inertia[2][2], inertia[0][1], inertia[0][2], inertia[1][2])], r['note']])
 
     print(f'k = {k:.1f} kg/m^3 (= {k/PLA_DENSITY:.2f} of solid PLA), robot {ROBOT_MASS:.2f} kg, servos {servo_total:.2f} kg')
     for n, r in sorted(out.items(), key=lambda x: -x[1]['mass'])[:20]:

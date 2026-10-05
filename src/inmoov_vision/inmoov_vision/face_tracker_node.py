@@ -39,7 +39,6 @@ import collections
 import json
 import os
 import threading
-import time
 
 import cv2
 import numpy as np
@@ -80,8 +79,10 @@ def _smooth_bbox(prev: list | None, new: list,
 
 
 def _iou(a: list, b: list) -> float:
-    x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
-    x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
     inter = max(0, x2 - x1) * max(0, y2 - y1)
     area_a = (a[2] - a[0]) * (a[3] - a[1])
     area_b = (b[2] - b[0]) * (b[3] - b[1])
@@ -399,7 +400,6 @@ class FaceTrackerNode(LifecycleNode):
             f'sync={t["sync"]} speech={t["speech_sec"]}s cov={t["coverage"]} n={t["n"]}'
             for t in sorted(tracks, key=lambda t: -t['excess']))
         self.get_logger().info(f'Lips seg#{seg.get("id")} ({t1 - t0:.1f}s{", SV-rejected voice" if seg.get("sv_rejected") else ""}): {parts}')
-
 
 
 def main():

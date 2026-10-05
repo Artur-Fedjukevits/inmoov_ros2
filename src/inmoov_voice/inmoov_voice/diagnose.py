@@ -32,15 +32,33 @@ from typing import Optional
 
 USE_COLOR = sys.stdout.isatty()
 
+
 def _c(text: str, code: str) -> str:
     return f'\033[{code}m{text}\033[0m' if USE_COLOR else text
 
-OK    = lambda t: _c(t, '32')   # green
-WARN  = lambda t: _c(t, '33')   # yellow
-FAIL  = lambda t: _c(t, '31')   # red
-INFO  = lambda t: _c(t, '36')   # cyan
-BOLD  = lambda t: _c(t, '1')    # bold
-DIM   = lambda t: _c(t, '2')    # dim
+
+def OK(t):
+    return _c(t, '32')
+
+
+def WARN(t):
+    return _c(t, '33')
+
+
+def FAIL(t):
+    return _c(t, '31')
+
+
+def INFO(t):
+    return _c(t, '36')
+
+
+def BOLD(t):
+    return _c(t, '1')
+
+
+def DIM(t):
+    return _c(t, '2')
 
 
 # ── Check result ─────────────────────────────────────────────────────────
@@ -118,7 +136,7 @@ def check_llm(quick: bool) -> list[Check]:
     checks = []
 
     for label, base_url in [('Primary (vLLM, RTX 3090)', LLM_PRIMARY),
-                              ('Local (NUC)', LLM_LOCAL)]:
+                            ('Local (NUC)', LLM_LOCAL)]:
         if not base_url:
             continue
         name = f'LLM {label}'
@@ -176,7 +194,7 @@ def check_tts(quick: bool) -> list[Check]:
     checks = []
 
     for label, base_url in [('Primary (RTX 5060)', TTS_PRIMARY),
-                              ('Local (ROCm)', TTS_LOCAL)]:
+                            ('Local (ROCm)', TTS_LOCAL)]:
         if not base_url:
             continue
         name = f'TTS {label}'

@@ -75,14 +75,15 @@ SERVO_DEFS: list[tuple] = [
 ]
 
 SERVO_INFO   = {name: (mn, mx, rest, label, grp) for name, mn, mx, rest, label, grp in SERVO_DEFS}
-FACE_REST    = {name: rest                        for name, _, _, rest, _, _     in SERVO_DEFS}
-SERVO_LIMITS = {name: (mn, mx)                   for name, mn, mx, _, _, _      in SERVO_DEFS}
+FACE_REST    = {name: rest for name, _, _, rest, _, _ in SERVO_DEFS}
+SERVO_LIMITS = {name: (mn, mx) for name, mn, mx, _, _, _ in SERVO_DEFS}
 SERVO_NAMES  = [name for name, *_ in SERVO_DEFS]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default expression positions (before calibration)
 # Ported from face_expressions_node.py: _MIN → min_angle, _MAX → max_angle
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _build_defaults() -> dict[str, dict[str, int]]:
     mn = {n: v[0] for n, v in SERVO_LIMITS.items()}
@@ -225,6 +226,7 @@ EXPRESSION_NAMES = list(EXPRESSIONS_DEFAULTS.keys())
 # JSON — load / save
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def load_calibration() -> dict[str, dict[str, int]]:
     """Load the calibration JSON file; return defaults if it does not exist."""
     if os.path.exists(_LOAD_FILE):
@@ -247,6 +249,7 @@ def save_calibration(data: dict[str, dict[str, int]]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # ROS2 node
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _r(deg: float) -> float:
     return (deg - 90.0) * math.pi / 180.0
@@ -282,6 +285,7 @@ class FaceCalibNode(Node):
 # ─────────────────────────────────────────────────────────────────────────────
 # GUI
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 # Group colours
 GROUP_COLORS = {

@@ -55,7 +55,7 @@ _LABEL_MAP = {
     'Contempt': 'contempt',
     'Disgust':  'disgust',
     'Fear':     'fear',
-    'Happiness':'happy',
+    'Happiness': 'happy',
     'Neutral':  'neutral',
     'Sadness':  'sad',
     'Surprise': 'surprise',
@@ -301,8 +301,6 @@ class EmotionRecognitionNode(LifecycleNode):
                     self.get_logger().debug(f'Emotion skip: {e}')
         finally:
             self._busy = False
-
-
 
 
 def main():

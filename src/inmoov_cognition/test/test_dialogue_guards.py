@@ -565,6 +565,7 @@ def test_await_lips_matches_the_phrase_once():
     assert LLMNode._await_lips(s, 100.0)['segment_id'] == 7
     assert LLMNode._await_lips(s, 100.0) is None       # already used; seg 6 too old
     # arrives a moment after the text (the usual order)
+
     def late():
         time.sleep(0.01)
         LLMNode._speaker_evidence_cb(s, String(data=json.dumps(

@@ -1200,8 +1200,10 @@ class MemoryNode(LifecycleNode):
                 fg = self._gallery_cache.get(from_id)
                 tg = self._gallery_cache.get(to_id)
                 if fg is not None and tg is not None and len(fg) > 0 and len(tg) > 0:
-                    fc = np.mean(fg, axis=0); fc /= np.linalg.norm(fc) + 1e-8
-                    tc = np.mean(tg, axis=0); tc /= np.linalg.norm(tc) + 1e-8
+                    fc = np.mean(fg, axis=0)
+                    fc /= np.linalg.norm(fc) + 1e-8
+                    tc = np.mean(tg, axis=0)
+                    tc /= np.linalg.norm(tc) + 1e-8
                     sim = float(np.dot(fc, tc))
                     if sim < 0.35:
                         return {
@@ -1209,7 +1211,7 @@ class MemoryNode(LifecycleNode):
                             'reason':     'similarity_too_low',
                             'similarity': round(sim, 3),
                             'message':    (f'Сходство лиц {from_name}↔{to_name} '
-                                          f'слишком низкое ({sim:.2f}). Это точно один человек?'),
+                                           f'слишком низкое ({sim:.2f}). Это точно один человек?'),
                         }
 
             # ── Photo gallery: keep the best by quality within the limit ──

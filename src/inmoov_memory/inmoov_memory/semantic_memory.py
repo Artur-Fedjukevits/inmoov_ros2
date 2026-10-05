@@ -111,10 +111,10 @@ class SemanticMemory:
         source: str = "conversation",
     ) -> int:
         """Saves or updates a fact. Returns the record ID."""
-        subject   = str(subject   or "").strip()
+        subject   = str(subject or "").strip()
         predicate = str(predicate or "").strip()
-        value     = str(value     or "").strip()
-        category  = str(category  or "preference").strip()
+        value     = str(value or "").strip()
+        category  = str(category or "preference").strip()
         if not subject or not predicate or not value:
             logger.warning("save_fact: empty field — skipping (subj=%r pred=%r val=%r)",
                            subject, predicate, value)

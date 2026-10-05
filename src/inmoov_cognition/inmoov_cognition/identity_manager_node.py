@@ -158,7 +158,6 @@ class IdentityManagerNode(LifecycleNode):
     def __init__(self):
         super().__init__('identity_manager_node')
 
-
         # ── State ─────────────────────────────────────────────────────
         self._state           = State.IDLE
         self._primary_track   = None
@@ -836,7 +835,7 @@ class IdentityManagerNode(LifecycleNode):
         result = self._lookup_voice(emb)
         if not result or result.get('confidence') != 'high':
             sim  = result.get('similarity', 0) if result else 0
-            name = result.get('name', '?')     if result else '?'
+            name = result.get('name', '?') if result else '?'
             conf = result.get('confidence', 'none') if result else 'no_result'
             self.get_logger().info(
                 f'Voice identification from IDLE: not recognized '
@@ -865,7 +864,7 @@ class IdentityManagerNode(LifecycleNode):
         result = self._lookup_voice(emb)
         if not result or result.get('confidence') != 'high':
             sim  = result.get('similarity', 0) if result else 0
-            name = result.get('name', '?')     if result else '?'
+            name = result.get('name', '?') if result else '?'
             conf = result.get('confidence', 'none') if result else 'no_result'
             self.get_logger().info(
                 f'Voice identification (RECOGNIZING): not recognized '
@@ -1246,7 +1245,7 @@ class IdentityManagerNode(LifecycleNode):
         result = self._call_memory({
             'op':              'verify_person_claim',
             'person_id':       person_id,
-            'face_embedding':  face_emb  if face_emb  else None,
+            'face_embedding':  face_emb if face_emb else None,
             'voice_embedding': voice_emb if voice_emb else None,
         })
         if result is None:
@@ -1842,7 +1841,6 @@ class IdentityManagerNode(LifecycleNode):
                 self._pub_person_present(False)
                 self._set_introducing(False)
 
-
     def _update_seen_and_embedding(self, person_id: int):
         """update_seen + an EMA update of the embedding on every encounter."""
         import numpy as np
@@ -1872,7 +1870,6 @@ class IdentityManagerNode(LifecycleNode):
     # ── Helpers ────────────────────────────────────────────────────────
 
     def _publish_social_context(self):
-        
         """Publishes the social context @ 2 Hz → the BehaviorManager Blackboard.
 
         Fully stops in sleep mode.
@@ -1882,7 +1879,7 @@ class IdentityManagerNode(LifecycleNode):
         """
         if self._sleeping:
             return
-            
+
         with self._lock:
             state           = self._state
             person          = dict(self._current_person)
@@ -2022,7 +2019,6 @@ class IdentityManagerNode(LifecycleNode):
         except Exception:
             return None
 
-
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 
     def _dp(self, name, default=None):
@@ -2155,6 +2151,7 @@ class IdentityManagerNode(LifecycleNode):
 
     def on_error(self, state):
         return TransitionCallbackReturn.SUCCESS
+
 
 def main():
     rclpy.init()

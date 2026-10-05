@@ -218,7 +218,6 @@ def test_reconcile_chroma(tmp_path):
     assert 'deadbeef' not in fake.items
 
 
-
 def test_reconcile_does_not_delete_a_fact_saved_meanwhile(tmp_path):
     """save_fact() running between reconcile's SQLite snapshot and its Chroma
     delete must not lose the new fact (review 2026-09-26)."""

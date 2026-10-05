@@ -22,8 +22,8 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-import serial
-from inmoov_control.protocol import (
+import serial  # noqa: E402
+from inmoov_control.protocol import (  # noqa: E402
     build_set_servos, FrameParser,
     CMD_ULTRASONIC, CMD_PIR
 )
@@ -56,9 +56,9 @@ SEQUENCES = {
         ("Rest position",           RIGHT_REST),
         ("Fingers open",            [180]*6 + RIGHT_REST[6:]),
         ("Fingers closed",          [0]*6   + RIGHT_REST[6:]),
-        ("Shoulder up",             [0,0,0,0,0,0, 0, 90, 90, 10, 80, 90,100,90]),
-        ("Head roll left",          [0,0,0,0,0,0, 0, 90, 30, 10, 50, 90,100,90]),
-        ("Head roll right",         [0,0,0,0,0,0, 0, 90, 30, 10,115, 90,100,90]),
+        ("Shoulder up",             [0, 0, 0, 0, 0, 0, 0, 90, 90, 10, 80, 90, 100, 90]),
+        ("Head roll left",          [0, 0, 0, 0, 0, 0, 0, 90, 30, 10, 50, 90, 100, 90]),
+        ("Head roll right",         [0, 0, 0, 0, 0, 0, 0, 90, 30, 10, 115, 90, 100, 90]),
         ("Rest position",           RIGHT_REST),
     ],
     'left': [

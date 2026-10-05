@@ -1010,8 +1010,6 @@ class VoiceDetectorNode(LifecycleNode):
         self.publisher_.publish(msg)
 
 
-
-
 def main():
     rclpy.init()
     node = VoiceDetectorNode()

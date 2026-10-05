@@ -77,10 +77,10 @@ from telegram.ext import (
 # ── Geolocation helpers ──────────────────────────────────────────────────────
 
 _TRANSLIT_MAP = {
-    'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh',
-    'з':'z','и':'i','й':'j','к':'k','л':'l','м':'m','н':'n','о':'o',
-    'п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'kh','ц':'ts',
-    'ч':'ch','ш':'sh','щ':'shch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo', 'ж': 'zh',
+    'з': 'z', 'и': 'i', 'й': 'j', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o',
+    'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts',
+    'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
 }
 
 # "где сейчас Настя?" / "где Настя" / "where is Nastja"
@@ -89,9 +89,11 @@ _WHERE_RE = re.compile(
     re.IGNORECASE,
 )
 
+
 def _translit(s: str) -> str:
     """Transliterates Cyrillic → Latin for fuzzy name matching."""
     return ''.join(_TRANSLIT_MAP.get(c, c) for c in s.lower())
+
 
 def _parse_location_state(state: str) -> tuple[float, float] | None:
     """Parses an OpenHAB Location item state: 'lat,lon[,alt]' → (lat, lon)."""
@@ -157,7 +159,7 @@ class TelegramBridgeNode(LifecycleNode):
         self._dp('allowed_chat_id', 0)
         self._dp('llm_timeout_sec', 35.0)
         self._dp('cam_device',
-            '/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0')
+                 '/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0')
         self._dp('memory_db_path', os.path.expanduser('~/inmoov_memory.db'))
 
         self._allowed_chat_id = self.get_parameter('allowed_chat_id').value
@@ -443,7 +445,7 @@ class TelegramBridgeNode(LifecycleNode):
     # ── Request to llm_node ──────────────────────────────────────────────────
 
     def _publish_ask(self, req_id: str, text: str, telegram_id: int | None,
-                      image_base64: str | None = None) -> None:
+                     image_base64: str | None = None) -> None:
         """Publishes /telegram_ask; person_ctx is injected from the DB by telegram_id."""
         person_ctx = self._lookup_person(telegram_id) if telegram_id else None
         payload: dict = {'request_id': req_id, 'text': text}
@@ -797,7 +799,7 @@ class TelegramBridgeNode(LifecycleNode):
         await self._ask_and_reply(update, text, image_base64=image_b64)
 
     async def _ask_and_reply(self, update: Update, text: str,
-                              image_base64: str | None = None):
+                             image_base64: str | None = None):
         """Sends the request via llm_node and streams the reply by editing the message."""
         sent = await update.message.reply_text(
             '👀 Смотрю...' if image_base64 else '⏳ Думаю...')

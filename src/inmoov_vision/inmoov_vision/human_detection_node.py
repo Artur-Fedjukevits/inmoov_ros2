@@ -240,7 +240,6 @@ class HumanDetectionNode(LifecycleNode):
             self._was_detected = detected
 
 
-
 def main():
     rclpy.init()
     node = HumanDetectionNode()

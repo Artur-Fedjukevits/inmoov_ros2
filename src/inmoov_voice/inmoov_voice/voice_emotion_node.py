@@ -161,8 +161,6 @@ class VoiceEmotionNode(LifecycleNode):
             self._busy = False
 
 
-
-
 def main():
     rclpy.init()
     node = VoiceEmotionNode()

@@ -207,9 +207,9 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
 
         self._bb = py_trees.blackboard.Client(name='ExecCmd')
         self._bb.register_key(key='/robot/command',
-                               access=py_trees.common.Access.READ)
+                              access=py_trees.common.Access.READ)
         self._bb.register_key(key='/robot/command',
-                               access=py_trees.common.Access.WRITE)
+                              access=py_trees.common.Access.WRITE)
 
     def initialise(self):
         cmd    = self._bb.robot.command
@@ -582,9 +582,9 @@ class SetSleepMode(py_trees.behaviour.Behaviour):
         self._pub = node.create_publisher(Bool, '/robot_sleep', lqos)
         self._bb  = py_trees.blackboard.Client(name='SetSleep')
         self._bb.register_key(key='/robot/sleep',
-                               access=py_trees.common.Access.WRITE)
+                              access=py_trees.common.Access.WRITE)
         self._bb.register_key(key='/robot/sleep_requested',
-                               access=py_trees.common.Access.WRITE)
+                              access=py_trees.common.Access.WRITE)
 
     def initialise(self):
         self._node.enable_face_detection(False)
@@ -610,11 +610,11 @@ class WebSearchBehaviour(py_trees.behaviour.Behaviour):
         self._result_pub = node.create_publisher(String, 'search_result', 10)
         self._bb         = py_trees.blackboard.Client(name='WebSearch')
         self._bb.register_key(key='/search/query',
-                               access=py_trees.common.Access.READ)
+                              access=py_trees.common.Access.READ)
         self._bb.register_key(key='/search/query',
-                               access=py_trees.common.Access.WRITE)
+                              access=py_trees.common.Access.WRITE)
         self._bb.register_key(key='/search/result',
-                               access=py_trees.common.Access.WRITE)
+                              access=py_trees.common.Access.WRITE)
         self._done    = threading.Event()
         self._snippet = ''
         self._success = False
@@ -739,7 +739,7 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
         self._node      = node
         self._bb = py_trees.blackboard.Client(name='PIRScan')
         self._bb.register_key(key='/pir/scan_active',
-                               access=py_trees.common.Access.WRITE)
+                              access=py_trees.common.Access.WRITE)
         self._phase      = 0
         self._phase_end  = 0.0
         self._completed  = False   # True once _done() has been called (scan finished without a face)
@@ -844,17 +844,17 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     _HEAD_TURN_OFFSET = 25.0
     _JOINTS = ('midstom', 'rothead', 'neck')
     _AIM_GAIN       = 1.4  # 2026-08-24: 1:1 undershot — the head caught the face for a
-                            # moment at the edge of the frame and immediately lost it
-                            # (OAK-D is physically offset from the eye axis, parallax
-                            # requires a bit of angle overshoot). Tuned empirically, not
-                            # from geometry — refine based on real-world results.
+    # moment at the edge of the frame and immediately lost it
+    # (OAK-D is physically offset from the eye axis, parallax
+    # requires a bit of angle overshoot). Tuned empirically, not
+    # from geometry — refine based on real-world results.
 
     def __init__(self, node: Node):
         super().__init__('SoundScan')
         self._node      = node
         self._bb = py_trees.blackboard.Client(name='SoundScan')
         self._bb.register_key(key='/sound/scan_active',
-                               access=py_trees.common.Access.WRITE)
+                              access=py_trees.common.Access.WRITE)
         self._phase      = 0     # 0=moving to target, 1=waiting for human_detected, 2=returning to center
         self._phase_end  = 0.0
         self._completed  = False
@@ -2067,7 +2067,6 @@ class BehaviorManagerNode(LifecycleNode):
     def _tick(self):
         if self._tree is not None:
             self._tree.tick_once()
-
 
     # ── Lifecycle callbacks ────────────────────────────────────────────────
 

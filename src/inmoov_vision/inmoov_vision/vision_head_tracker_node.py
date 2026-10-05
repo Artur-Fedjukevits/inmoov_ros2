@@ -399,9 +399,9 @@ class VisionHeadTrackerNode(LifecycleNode):
             # for longer than FALLBACK_SEC. If the left is active but does not see a face — that is NOT absence,
             # it is just a bad angle. We use _last_left_msg_t instead of _last_left_t.
             left_msg_ref = self._last_left_msg_t if self._last_left_msg_t > 0.0 \
-                           else self._last_left_t
+                else self._last_left_t
             left_absent  = (now - left_msg_ref) >= _FALLBACK_SEC
-            left_bbox    = self._left_bbox  if left_fresh  else None
+            left_bbox    = self._left_bbox if left_fresh else None
             right_bbox   = self._right_bbox if (right_fresh and left_absent) else None
             bbox_seq    = self._bbox_seq
             last_any    = max(self._last_left_t, self._last_right_t)
@@ -595,8 +595,6 @@ class VisionHeadTrackerNode(LifecycleNode):
             _deg_to_rad(self._eye_ud, center=90.0),
         ]
         self._face_pub.publish(self._command(msg, lease_sec))
-
-
 
 
 def main():

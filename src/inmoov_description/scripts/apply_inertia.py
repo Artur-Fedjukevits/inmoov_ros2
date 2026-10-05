@@ -43,11 +43,11 @@ def apply_inertia(text, data):
         if name not in data:
             return m.group(0)
         r = data[name]
-        c, I = r['com'], r['I']
+        c, inertia = r['com'], r['I']
         new = (f'<inertial>\n      <origin xyz="{_g(c[0])} {_g(c[1])} {_g(c[2])}" rpy="0 0 0" />\n'
                f'      <mass value="{_g(r["mass"])}" />\n'
-               f'      <inertia ixx="{_g(I[0][0])}" ixy="{_g(I[0][1])}" ixz="{_g(I[0][2])}" '
-               f'iyy="{_g(I[1][1])}" iyz="{_g(I[1][2])}" izz="{_g(I[2][2])}" />\n    </inertial>')
+               f'      <inertia ixx="{_g(inertia[0][0])}" ixy="{_g(inertia[0][1])}" ixz="{_g(inertia[0][2])}" '
+               f'iyy="{_g(inertia[1][1])}" iyz="{_g(inertia[1][2])}" izz="{_g(inertia[2][2])}" />\n    </inertial>')
         body2, n = INERTIAL_RE.subn(lambda _: new, body, count=1)
         if n == 0:
             body2 = '\n    ' + new + body

@@ -311,7 +311,6 @@ class FaceDetectionNode(LifecycleNode):
         finally:
             self._busy = False
 
-
     def _watchdog(self):
         if not self._enabled:
             return
@@ -332,8 +331,6 @@ class FaceDetectionNode(LifecycleNode):
             self.get_logger().warn(
                 f'No face detected for {now - self._no_face_since:.0f}s')
             self._no_face_since = now  # reset to avoid spamming every 5s
-
-
 
 
 def main():

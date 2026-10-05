@@ -27,8 +27,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-import serial
-from inmoov_control.protocol import (
+import serial  # noqa: E402
+from inmoov_control.protocol import (  # noqa: E402
     build_frame, FrameParser,
     CMD_DIAG_REQ, CMD_DIAG_RESP
 )

@@ -73,8 +73,8 @@ class JointArbiter:
         """Live leases: group → {source, priority, remaining_sec}."""
         now = self._clock()
         return {
-            key: {'source': l.source, 'priority': l.priority,
-                  'remaining_sec': round(l.expires - now, 2)}
+            key: {'source': lease.source, 'priority': lease.priority,
+                  'remaining_sec': round(lease.expires - now, 2)}
             for key in list(self._leases)
-            if (l := self._owner(key, now)) is not None
+            if (lease := self._owner(key, now)) is not None
         }

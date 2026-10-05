@@ -344,8 +344,6 @@ class FaceRecognitionNode(LifecycleNode):
         self._pub.publish(msg)
 
 
-
-
 def main():
     rclpy.init()
     node = FaceRecognitionNode()

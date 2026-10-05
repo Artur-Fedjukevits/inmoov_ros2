@@ -24,8 +24,14 @@ Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
-import sys, os, json, itertools, xml.etree.ElementTree as ET
-import numpy as np, fcl, trimesh
+import sys
+import os
+import json
+import itertools
+import xml.etree.ElementTree as ET
+import numpy as np
+import fcl
+import trimesh
 
 PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -34,11 +40,13 @@ N = int(sys.argv[2]) if len(sys.argv) > 2 else 20000
 rng = np.random.default_rng(0)
 root = ET.parse(URDF).getroot()
 
+
 def rpy2R(r, p, y):
     cr, sr, cp, sp, cy, sy = np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
     return np.array([[cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
                      [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
                      [-sp, cp*sr, cp*cr]])
+
 
 def origin(el):
     T = np.eye(4)
@@ -48,79 +56,113 @@ def origin(el):
         T[:3, :3] = rpy2R(*[float(v) for v in o.get('rpy', '0 0 0').split()])
     return T
 
+
 def mesh_path(uri):
     # package://inmoov_description/... -> this package's directory
     prefix = 'package://inmoov_description/'
     return os.path.join(PKG, uri[len(prefix):]) if uri.startswith(prefix) else uri
 
+
 def axis_angle(a, q):
-    a = a / np.linalg.norm(a); K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
-    R = np.eye(4); R[:3, :3] = np.eye(3) + np.sin(q)*K + (1-np.cos(q))*K@K
+    a = a / np.linalg.norm(a)
+    K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+    R = np.eye(4)
+    R[:3, :3] = np.eye(3) + np.sin(q)*K + (1-np.cos(q))*K@K
     return R
+
 
 # ---------- kinematic tree ----------
 joints = {}
 for j in root.findall('joint'):
-    lim = j.find('limit'); m = j.find('mimic')
+    lim = j.find('limit')
+    m = j.find('mimic')
     joints[j.get('name')] = dict(
         type=j.get('type'), parent=j.find('parent').get('link'), child=j.find('child').get('link'),
         T=origin(j), axis=np.array([float(v) for v in (j.find('axis').get('xyz') if j.find('axis') is not None else '1 0 0').split()]),
         lo=float(lim.get('lower', 0)) if lim is not None else 0.0, hi=float(lim.get('upper', 0)) if lim is not None else 0.0,
         mimic=(m.get('joint'), float(m.get('multiplier', 1)), float(m.get('offset', 0))) if m is not None else None)
 child2joint = {v['child']: k for k, v in joints.items()}
-links = [l.get('name') for l in root.findall('link')]
-base = [l for l in links if l not in child2joint][0]
+links = [lk.get('name') for lk in root.findall('link')]
+base = [lk for lk in links if lk not in child2joint][0]
 order = []  # topological joint order
+
+
 def walk(link):
     for k, v in joints.items():
-        if v['parent'] == link: order.append(k); walk(v['child'])
+        if v['parent'] == link:
+            order.append(k)
+            walk(v['child'])
+
+
 walk(base)
 active = [k for k in order if joints[k]['type'] in ('revolute', 'continuous', 'prismatic') and joints[k]['mimic'] is None]
+
 
 def fk(q):
     TW = {base: np.eye(4)}
     for k in order:
         j = joints[k]
-        if j['type'] == 'fixed': val = 0.0
-        elif j['mimic']: src, mul, off = j['mimic']; val = q[src]*mul + off
-        else: val = q[k]
+        if j['type'] == 'fixed':
+            val = 0.0
+        elif j['mimic']:
+            src, mul, off = j['mimic']
+            val = q[src]*mul + off
+        else:
+            val = q[k]
         q[k] = val
         TW[j['child']] = TW[j['parent']] @ j['T'] @ (axis_angle(j['axis'], val) if j['type'] != 'fixed' else np.eye(4))
     return TW
 
+
 # ---------- collision geometry ----------
 spheres = []
 geoms = {}  # link -> list of (fcl.CollisionObject, T_link_geom)
-for l in root.findall('link'):
-    for c in l.findall('collision'):
-        g = c.find('geometry')[0]; Tl = origin(c)
-        if g.tag == 'box': geo = fcl.Box(*[float(v) for v in g.get('size').split()])
-        elif g.tag == 'cylinder': geo = fcl.Cylinder(float(g.get('radius')), float(g.get('length')))
-        elif g.tag == 'sphere': geo = fcl.Sphere(float(g.get('radius')))
+for lk in root.findall('link'):
+    for c in lk.findall('collision'):
+        g = c.find('geometry')[0]
+        Tl = origin(c)
+        if g.tag == 'box':
+            geo = fcl.Box(*[float(v) for v in g.get('size').split()])
+        elif g.tag == 'cylinder':
+            geo = fcl.Cylinder(float(g.get('radius')), float(g.get('length')))
+        elif g.tag == 'sphere':
+            geo = fcl.Sphere(float(g.get('radius')))
         elif g.tag == 'mesh':
             m = trimesh.load(mesh_path(g.get('filename')), force='mesh')
             sc = [float(v) for v in g.get('scale', '1 1 1').split()]
             m.apply_scale(sc)
-            geo = fcl.BVHModel(); geo.beginModel(len(m.vertices), len(m.faces))
-            geo.addSubModel(m.vertices, m.faces); geo.endModel()
-        if g.tag == 'box': ctr, rad = np.zeros(3), np.linalg.norm([float(v) for v in g.get('size').split()])/2
-        elif g.tag == 'cylinder': ctr, rad = np.zeros(3), np.hypot(float(g.get('radius')), float(g.get('length'))/2)
-        elif g.tag == 'sphere': ctr, rad = np.zeros(3), float(g.get('radius'))
+            geo = fcl.BVHModel()
+            geo.beginModel(len(m.vertices), len(m.faces))
+            geo.addSubModel(m.vertices, m.faces)
+            geo.endModel()
+        if g.tag == 'box':
+            ctr, rad = np.zeros(3), np.linalg.norm([float(v) for v in g.get('size').split()])/2
+        elif g.tag == 'cylinder':
+            ctr, rad = np.zeros(3), np.hypot(float(g.get('radius')), float(g.get('length'))/2)
+        elif g.tag == 'sphere':
+            ctr, rad = np.zeros(3), float(g.get('radius'))
         else:
-            ctr = (m.vertices.min(0)+m.vertices.max(0))/2; rad = np.linalg.norm(m.vertices-ctr, axis=1).max()
-        geoms.setdefault(l.get('name'), []).append((fcl.CollisionObject(geo), Tl))
-        spheres.append((l.get('name'), len(geoms[l.get('name')])-1, Tl[:3,:3]@ctr+Tl[:3,3], rad))
-clinks = [l for l in links if l in geoms]
+            ctr = (m.vertices.min(0)+m.vertices.max(0))/2
+            rad = np.linalg.norm(m.vertices-ctr, axis=1).max()
+        geoms.setdefault(lk.get('name'), []).append((fcl.CollisionObject(geo), Tl))
+        spheres.append((lk.get('name'), len(geoms[lk.get('name')])-1, Tl[:3, :3]@ctr+Tl[:3, 3], rad))
+clinks = [lk for lk in links if lk in geoms]
 obj2link = {id(o): ln for ln, lst in geoms.items() for o, _ in lst}
+
 
 def place(TW):
     for ln, lst in geoms.items():
         for o, Tl in lst:
-            T = TW[ln] @ Tl; o.setTransform(fcl.Transform(T[:3, :3], T[:3, 3]))
+            T = TW[ln] @ Tl
+            o.setTransform(fcl.Transform(T[:3, :3], T[:3, 3]))
 
-SL = [sp[0] for sp in spheres]; SR = np.array([sp[3] for sp in spheres])
+
+SL = [sp[0] for sp in spheres]
+SR = np.array([sp[3] for sp in spheres])
 IU = np.triu_indices(len(spheres), 1)
 cand_mask = np.array([SL[i] != SL[j] for i, j in zip(*IU)])
+
+
 def colliding_pairs(TW):
     place(TW)
     C = np.array([TW[ln][:3, :3] @ c + TW[ln][:3, 3] for ln, _, c, _ in spheres])
@@ -128,42 +170,55 @@ def colliding_pairs(TW):
     hit = (d < SR[IU[0]] + SR[IU[1]]) & cand_mask
     found = set()
     for i, j in zip(IU[0][hit], IU[1][hit]):
-        a, b = SL[i], SL[j]; p = tuple(sorted((a, b)))
-        if p in found: continue
+        a, b = SL[i], SL[j]
+        p = tuple(sorted((a, b)))
+        if p in found:
+            continue
         if fcl.collide(geoms[a][spheres[i][1]][0], geoms[b][spheres[j][1]][0], fcl.CollisionRequest(), fcl.CollisionResult()):
             found.add(p)
     return found
 
 # ---------- adjacency (collapse links without collision geometry) ----------
+
+
 def coll_ancestor(link):
     while link in child2joint:
         link = joints[child2joint[link]]['parent']
-        if link in geoms: return link
+        if link in geoms:
+            return link
     return None
+
+
 adjacent = {}
-for l in clinks:
-    a = coll_ancestor(l)
+for lk in clinks:
+    a = coll_ancestor(lk)
     if a:
-        path = []; x = l
-        while x != a: path.append(x); x = joints[child2joint[x]]['parent']
-        adjacent[tuple(sorted((l, a)))] = 'Adjacent' if len(path) == 1 else 'Adjacent (via ' + ', '.join(path[1:]) + ')'
+        path = []
+        x = lk
+        while x != a:
+            path.append(x)
+            x = joints[child2joint[x]]['parent']
+        adjacent[tuple(sorted((lk, a)))] = 'Adjacent' if len(path) == 1 else 'Adjacent (via ' + ', '.join(path[1:]) + ')'
 
 # ---------- zero pose ----------
 q0 = {k: 0.0 for k in active}
 default = colliding_pairs(fk(dict(q0)))
 depth = {}
-TW0 = fk(dict(q0)); place(TW0)
+TW0 = fk(dict(q0))
+place(TW0)
 for a, b in default:
     best = 0.0
     for o1, _ in geoms[a]:
         for o2, _ in geoms[b]:
-            rq = fcl.CollisionRequest(num_max_contacts=50, enable_contact=True); rs = fcl.CollisionResult()
+            rq = fcl.CollisionRequest(num_max_contacts=50, enable_contact=True)
+            rs = fcl.CollisionResult()
             if fcl.collide(o1, o2, rq, rs):
                 best = max([best] + [c.penetration_depth for c in rs.contacts])
     depth[(a, b)] = best
 
 # ---------- random sampling ----------
-lo = np.array([joints[k]['lo'] for k in active]); hi = np.array([joints[k]['hi'] for k in active])
+lo = np.array([joints[k]['lo'] for k in active])
+hi = np.array([joints[k]['hi'] for k in active])
 count = {}
 for i in range(N):
     u = rng.random(len(active))
@@ -178,15 +233,20 @@ allpairs = [tuple(sorted(p)) for p in itertools.combinations(clinks, 2)]
 res = []
 for p in allpairs:
     f = count.get(p, 0)/N
-    if p in adjacent: cat = 'adjacent'
-    elif p in default: cat = 'default'
-    elif f >= 0.95: cat = 'always'
-    elif f == 0: cat = 'never'
-    else: cat = 'check'
+    if p in adjacent:
+        cat = 'adjacent'
+    elif p in default:
+        cat = 'default'
+    elif f >= 0.95:
+        cat = 'always'
+    elif f == 0:
+        cat = 'never'
+    else:
+        cat = 'check'
     res.append(dict(a=p[0], b=p[1], cat=cat, freq=f, zero_pose=p in default,
                     depth_mm=round(depth.get(p, 0)*1000, 1), note=adjacent.get(p, '')))
 json.dump(dict(N=N, active=len(active), clinks=len(clinks), pairs=res), open('selfcoll_result.json', 'w'), indent=1, ensure_ascii=False)
-from collections import Counter
+from collections import Counter  # noqa: E402
 print('samples', N, 'active joints', len(active), 'links w/ collision', len(clinks), 'pairs', len(allpairs))
 print(Counter(r['cat'] for r in res))
 for r in sorted(res, key=lambda r: (r['cat'], -r['freq'])):

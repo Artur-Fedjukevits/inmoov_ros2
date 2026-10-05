@@ -486,8 +486,6 @@ class FaceExpressionsNode(LifecycleNode):
         self._executor.submit(self._fe.hold, name)
 
 
-
-
 def main(args=None):
     rclpy.init(args=args)
     node = FaceExpressionsNode()

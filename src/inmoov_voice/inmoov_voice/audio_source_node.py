@@ -435,7 +435,6 @@ class AudioSourceNode(LifecycleNode):
         finally:
             self._restart_in_progress = False
 
-
     # ── PipeWire / WirePlumber recovery ──────────────────────────────────────
 
     def _pipewire_jabra_state(self):
