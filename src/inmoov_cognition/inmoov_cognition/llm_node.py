@@ -1817,6 +1817,7 @@ class LLMNode(LifecycleNode):
         'лен', 'лён', 'ленин', 'леоня', 'леона', 'леля', 'лёля', 'лёль', 'лення',
         'люня', 'ляня', 'легин', 'кленечка', 'лёночка', 'юленя',
         'лена', 'лене', 'лену',   # no Лена in the household
+        'женя', 'жене', 'женю', 'женей', 'жень',   # no Женя among family/friends
     })
     # Real words/names STT also writes for "Лёня" — only count in the vocative
     # position (first word, or set off by a comma: "Да, Лень, это я"), otherwise
@@ -1834,6 +1835,24 @@ class LLMNode(LifecycleNode):
         return bool(self._ROBOT_NAMES.intersection(words)
                     or self._ROBOT_NAMES_FIRST_WORD.intersection(vocative)
                     or any(self._UNK_NAME_RE.match(w) for w in words))
+
+    def _normalize_robot_name(self, text: str) -> str:
+        """Every STT misspelling of the robot's name ("Женя", "Лена", "Л<unk>ня"…)
+        becomes "Лёня", so the LLM doesn't correct the user that it's called
+        differently. Only called once the phrase is known to address the robot."""
+        def fix(m: re.Match) -> str:
+            w = m.group(0).lower().replace('<unk>', '*')
+            return 'Лёня' if (w in self._ROBOT_NAMES or self._UNK_NAME_RE.match(w)) else m.group(0)
+        text = re.sub(r'[А-Яа-яЁёІі]*(?:<unk>|\*)?[А-Яа-яЁёІі]*', fix, text)
+        # Real words/names accepted only as a vocative ("Лень, включи свет", "Юля, ...")
+        low = text.lower()
+        spans = [(m.start(1), m.end(1)) for m in re.finditer(r'^\W*([а-яёі]+)', low)]
+        spans += [(m.start(1), m.end(1))
+                  for m in re.finditer(r'[,.!?]\s*([а-яёі]+)\s*[,.!?]', low)]
+        for s, e in sorted(spans, reverse=True):
+            if low[s:e] in self._ROBOT_NAMES_FIRST_WORD:
+                text = text[:s] + 'Лёня' + text[e:]
+        return text
 
     def _split_at_name(self, text: str) -> str:
         """A recording that glued table talk to an address by name ("…чипсы. Это на
@@ -2010,6 +2029,7 @@ class LLMNode(LifecycleNode):
         self._direction_hint_pub.publish(hint_msg)
 
         if addressing == 'name':
+            text = self._normalize_robot_name(text)
             split = self._split_at_name(text)
             if split != text:
                 self.get_logger().info('LLM: name mid-recording — earlier talk marked as background')
