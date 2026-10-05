@@ -162,6 +162,10 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
     _TORSO_MAX              = 120.0
     _TORSO_HALF_RANGE       = 30.0   # _REST_MIDSTOM ± this = _TORSO_MIN/_TORSO_MAX
     _TORSO_PARTIAL_FRACTION = 0.3    # scope='partial'
+    # scope='head' with a turn at least this wide still brings the torso along
+    # (as 'partial') — the head and torso must never face different ways.
+    # Smaller glances only re-center a torso that points the other way.
+    _TORSO_FOLLOW_MIN_PAN   = 20.0
 
     # Arbitration (inmoov_msgs/JointCommand): the override holds the head for
     # 5 s + 1.5 s (see _send_head_cmd / _resume_head_tracker) — the lease covers
@@ -178,7 +182,7 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         self._pub_stat   = node.create_publisher(String,     'status_request',   10)
         self._timer      = None   # timer that stops motion
         self._head_timer = None   # timer that hands control back to head_tracker after a manual command
-        self._last_scope = 'head'  # scope of the last head command — whether the torso needs to return to center
+        self._torso_moved = False  # the last head command moved the torso — it needs to return to center
 
         # Track the current rothead/neck from ANY accepted command (/joint_commanded, including
         # from head_tracker itself while it's following a face) — so that before a
@@ -187,8 +191,10 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         # as vision_head_tracker_node._external_joint_cb.
         self._known_rothead     = self._REST_ROTHEAD
         self._known_neck        = self._REST_NECK
+        self._known_midstom     = self._REST_MIDSTOM
         self._pre_turn_rothead  = self._REST_ROTHEAD
         self._pre_turn_neck     = self._REST_NECK
+        self._pre_turn_midstom  = self._REST_MIDSTOM
         self._override_active   = False   # True between a manual command and resume
         # Was a track actually locked BEFORE the manual command (not just "the
         # head was at rest/center") — see _resume_head_tracker.
@@ -236,6 +242,28 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
                 self._known_rothead = pos * 180.0 / math.pi + 90.0
             elif name == 'neck':
                 self._known_neck    = pos * 180.0 / math.pi + 90.0
+            elif name == 'midstom':
+                self._known_midstom = pos * 180.0 / math.pi + 90.0
+
+    def _torso_for_pan(self, pan: float, scope: str):
+        """midstom for a head command, or None to leave the torso alone.
+        The torso always ends up on the same side as the head (or centered):
+        - scope partial/full, or 'head' with |pan| >= _TORSO_FOLLOW_MIN_PAN → turn it that way;
+        - a small 'head' glance → only re-center a torso that points the other way;
+        - never pull it back against the turn: if it is already turned further
+          that way (e.g. by FaceSearch), keep it. Live bug 2026-09-30: torso at 120°
+          after FaceSearch, "turn right" (pan=+45 partial) sent it back to 99°."""
+        if pan == 0:
+            return None
+        rest    = self._REST_MIDSTOM
+        current = self._known_midstom - rest
+        if scope == 'head' and abs(pan) < self._TORSO_FOLLOW_MIN_PAN:
+            return rest if current * pan < 0 else None
+        fraction = 1.0 if scope == 'full' else self._TORSO_PARTIAL_FRACTION
+        target = math.copysign(self._TORSO_HALF_RANGE * fraction, pan)
+        if current * pan > 0 and abs(current) > abs(target):
+            target = current
+        return max(self._TORSO_MIN, min(self._TORSO_MAX, rest + target))
 
     def _do_head(self, cmd: dict):
         pan   = float(cmd.get('pan',  0))
@@ -251,6 +279,7 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
             # left) — don't overwrite the snapshot with an intermediate turned position.
             self._pre_turn_rothead = self._known_rothead
             self._pre_turn_neck    = self._known_neck
+            self._pre_turn_midstom = self._known_midstom
             self._had_lock_before_turn = getattr(self._node, '_face_locked', False)
             self._override_active  = True
 
@@ -259,14 +288,12 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
 
         joints = {'rothead': rothead, 'neck': neck}
 
-        midstom = None
-        if scope in ('partial', 'full') and pan != 0:
-            fraction = self._TORSO_PARTIAL_FRACTION if scope == 'partial' else 1.0
-            offset   = math.copysign(self._TORSO_HALF_RANGE * fraction, pan)
-            midstom  = max(self._TORSO_MIN, min(self._TORSO_MAX, self._REST_MIDSTOM + offset))
+        midstom = self._torso_for_pan(pan, scope)
+        if midstom is not None:
             joints['midstom'] = midstom
-
-        self._last_scope = scope
+        # The torso has to go back to center on resume only if it is off center now
+        self._torso_moved = midstom is not None and midstom != self._REST_MIDSTOM
+        self._node.note_manual_turn()
         torso_log = f' midstom={midstom:.0f}°' if midstom is not None else ''
         self._node.get_logger().info(
             f'Head: pan={pan:+.0f}° tilt={tilt:+.0f}° scope={scope} → '
@@ -288,7 +315,7 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         if self._override_active:
             self._node.release_joints(self._SOURCE, self._HEAD_JOINTS)
         self._override_active = False
-        self._last_scope      = 'head'
+        self._torso_moved     = False
         if self._timer:
             self._timer.cancel()
             self._timer = None
@@ -324,11 +351,12 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
             return
         if self._had_lock_before_turn:
             back = {'rothead': self._pre_turn_rothead, 'neck': self._pre_turn_neck}
-            if self._last_scope != 'head':
-                # The torso was moved by a manual command (scope=partial/full) —
+            if self._torso_moved:
+                # The torso was moved by a manual command (see _torso_for_pan) —
                 # head_tracker only controls the head, so the torso won't return
-                # to center on its own.
-                back['midstom'] = self._REST_MIDSTOM
+                # on its own. Back to where it was with the face, not to center —
+                # otherwise head and torso would end up facing different ways.
+                back['midstom'] = self._pre_turn_midstom
                 self._node.note_own_torso_move()
             # Hold it until _enable_tracker_now releases (1.5 s below)
             self._node.send_joints(self._SOURCE, JointCommand.PRIORITY_BT_COMMAND, 3.0, back)
@@ -339,7 +367,7 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
             self._node.get_logger().info(
                 'Head: there was no face before the command either — staying at the '
                 'current (just-confirmed) position, not rolling back')
-        self._last_scope       = 'head'
+        self._torso_moved      = False
         self._override_active  = False
 
         # Give the servos time to physically finish turning (the return trip can
@@ -805,11 +833,16 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     _MIN_CONFIDENCE = 0.15  # below this the direction is "unknown", don't turn (stay centered)
     _MIN_ANGLE_DEG  = 15.0  # |angle_deg| smaller than this also counts as "near center", don't turn
 
-    # rothead: rest=90, min=30, max=140 (same convention as PIRScanBehaviour: LEFT=120/RIGHT=60)
+    # rothead: rest=90, min=30, max=140 — same side convention as midstom:
+    # >90 = right (aim_head_at_human: OAK-D angle +28° → rothead 129°; pan>0 = right)
     _ROTHEAD_CENTER = 90.0
     _ROTHEAD_MIN    = 30.0
     _ROTHEAD_MAX    = 140.0
     _NECK_REST      = 40.0
+    # The head turns the same way as the torso on a sound/voice-hint turn
+    # (see BehaviorManagerNode.turn_toward) — torso 30° + head 25° ≈ 55° off-axis.
+    _HEAD_TURN_OFFSET = 25.0
+    _JOINTS = ('midstom', 'rothead', 'neck')
     _AIM_GAIN       = 1.4  # 2026-08-24: 1:1 undershot — the head caught the face for a
                             # moment at the edge of the frame and immediately lost it
                             # (OAK-D is physically offset from the eye axis, parallax
@@ -827,21 +860,28 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
         self._completed  = False
         self._target     = self._CENTER
 
-    def _torso_cmd(self, midstom: float) -> None:
-        self._node.note_own_torso_move()
+    def _turn_cmd(self, midstom: float) -> None:
         # Lease covers go + the whole dwell; released on found / done / preempt
-        self._node.send_joints('bt_scan', JointCommand.PRIORITY_BT_SCAN,
+        self._node.turn_toward(midstom, 'bt_scan', JointCommand.PRIORITY_BT_SCAN,
                                self._GO_DURATION + self._DWELL_TIMEOUT + 1.0,
-                               {'midstom': midstom}, vel=self._TURN_VEL)
+                               vel=self._TURN_VEL)
 
     def initialise(self) -> None:
         self._completed = False
         self._phase      = 0
+        self._started_mono = time.monotonic()
+        self._moved      = True
 
         angle      = getattr(self._node, '_last_sound_angle', 0.0)
         confidence = getattr(self._node, '_last_sound_confidence', 0.0)
 
-        if confidence < self._MIN_CONFIDENCE or abs(angle) < self._MIN_ANGLE_DEG:
+        if self._node.manual_turn_recent():
+            # The user has just turned us explicitly — don't override it with a guess
+            self._target = self._CENTER
+            self._moved  = False
+            self._node.get_logger().info(
+                'SoundScan: a manual turn command was just executed — not turning')
+        elif confidence < self._MIN_CONFIDENCE or abs(angle) < self._MIN_ANGLE_DEG:
             self._target = self._CENTER
             self._node.get_logger().info(
                 f'SoundScan: direction is unconfident (angle={angle:.0f}° '
@@ -858,7 +898,8 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
                 f'— turning torso left')
 
         self._node.enable_face_detection(True)
-        self._torso_cmd(self._target)
+        if self._moved:
+            self._turn_cmd(self._target)
         self._phase_end = time.monotonic() + self._GO_DURATION
 
     def update(self) -> py_trees.common.Status:
@@ -882,8 +923,12 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
                 # _torso_cmd and a confusing "return to center" log. Live bug
                 # 2026-08-28 (noticed by the user).
                 return self._done()
+            if self._node._last_manual_turn_mono > self._started_mono:
+                # A manual turn command arrived during the dwell — leave the robot
+                # where the user pointed it, don't swing back to center.
+                return self._done()
             self._phase = 2
-            self._torso_cmd(self._CENTER)
+            self._turn_cmd(self._CENTER)
             self._phase_end = now + self._GO_DURATION
             self._node.get_logger().info('SoundScan: no person found before the timeout — returning to center')
             return py_trees.common.Status.RUNNING
@@ -894,7 +939,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
 
     def _found(self) -> py_trees.common.Status:
         self._completed = True
-        self._node.release_joints('bt_scan', ('midstom',))
+        self._node.release_joints('bt_scan', self._JOINTS)
         self._bb.sound.scan_active = False
         self._node.aim_head_at_human()   # aim the head using OAK-D right away, don't wait for face_detection to find it
         self._node.enable_head_tracker(True)
@@ -904,7 +949,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
 
     def _done(self) -> py_trees.common.Status:
         self._completed = True
-        self._node.release_joints('bt_scan', ('midstom',))
+        self._node.release_joints('bt_scan', self._JOINTS)
         self._node.enable_face_detection(False)
         self._bb.sound.scan_active = False
         # First failure of the session (right after the wake word) — count it as
@@ -928,7 +973,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
                 return
             # A real preempt (e.g. /social/person_present became True some other way,
             # SocialBranch intercepted before we ourselves saw /human_detected).
-            self._node.release_joints('bt_scan', ('midstom',))
+            self._node.release_joints('bt_scan', self._JOINTS)
             self._node.enable_head_tracker(True)
             self._node.get_logger().info('SoundScan: interrupted (person found) — head_tracker enabled')
 
@@ -964,13 +1009,17 @@ class FaceSearchAttempt(py_trees.behaviour.Behaviour):
         target, source = node.record_face_search_attempt()
         node.enable_face_detection(True)
         if target is not None:
-            node.note_own_torso_move()
-            # Short lease: the turn itself (~0.6 s) with a margin; no release needed
-            node.send_joints('bt_scan', JointCommand.PRIORITY_BT_SCAN, 1.5,
-                             {'midstom': target}, vel=1.0)
+            # Short lease: the turn itself (~0.6 s) with a margin; no release needed.
+            # head_tracker keeps the head there afterwards (it syncs to /joint_commanded).
+            rothead = node.turn_toward(target, 'bt_scan', JointCommand.PRIORITY_BT_SCAN,
+                                       1.5, vel=1.0)
             node.get_logger().info(
                 f'FaceSearch: attempt #{node._face_search_attempts} — '
-                f'{source} → midstom={target:.0f}°')
+                f'{source} → midstom={target:.0f}° rothead={rothead:.0f}°')
+        elif source == 'manual_command':
+            node.get_logger().info(
+                f'FaceSearch: attempt #{node._face_search_attempts} — '
+                f'no turn, a manual turn command was just executed')
         else:
             node.get_logger().info(
                 f'FaceSearch: attempt #{node._face_search_attempts} — '
@@ -1006,6 +1055,9 @@ class IdleBlinkBehaviour(py_trees.behaviour.Behaviour):
     def _send(self, positions: dict, vel: float = 0.0) -> None:
         # Lowest priority, no lease: an expression holding the eyelids wins
         self._node.send_joints('blink', JointCommand.PRIORITY_BLINK, 0.0, positions, vel=vel)
+        # The eyelids pass in front of the eye cameras — face_capture drops those
+        # frames (/eyes/blink: True on close, False on reopen)
+        self._node.publish_blink(positions is self._CLOSED)
 
     def initialise(self) -> None:
         self._next_blink = time.monotonic() + random.uniform(self._INTERVAL_MIN, self._INTERVAL_MAX)
@@ -1304,6 +1356,11 @@ class BehaviorManagerNode(LifecycleNode):
     # 2026-09-26: PIRScan started while head_tracker was following the speaker,
     # and the head went back to rest.
     _DIALOGUE_ACTIVE_HOLD_SEC = 30.0
+    # An explicit turn command from the user (robot_control head / look_direction)
+    # outranks the robot's own guesses (sound direction, voice hint): for this long
+    # after it, SoundScan/FaceSearch do not turn anything. Live bug 2026-09-30:
+    # FaceSearch turned the torso 0.2 s after "turn right" was executed.
+    _MANUAL_TURN_PRIORITY_SEC = 20.0
 
     def __init__(self):
         super().__init__('behavior_manager_node')
@@ -1312,6 +1369,7 @@ class BehaviorManagerNode(LifecycleNode):
         self._pir_next_scan_at     = 0.0
         self._pir_prev_state       = False
         self._last_own_torso_move_mono = float('-inf')
+        self._last_manual_turn_mono    = float('-inf')  # see manual_turn_recent
         self._last_dialogue_mono   = float('-inf')  # see is_dialogue_active
 
         # Cache of the last /sound_direction and /human_detected for SoundScanBehaviour
@@ -1449,11 +1507,37 @@ class BehaviorManagerNode(LifecycleNode):
         msg.data = enabled
         self._head_tracker_pub.publish(msg)
 
+    def publish_blink(self, closing: bool) -> None:
+        if self.lc_active:
+            self._blink_pub.publish(Bool(data=closing))
+
     def note_own_torso_move(self) -> None:
         """Call on EVERY command to the midstom joint — the PIR is physically in
         the torso and sees the robot's own rotation as "human motion"
         (see _PIR_SELF_MOTION_BLANK_SEC/_pir_cb)."""
         self._last_own_torso_move_mono = time.monotonic()
+
+    def note_manual_turn(self) -> None:
+        """An explicit head/torso turn command from the user was executed."""
+        self._last_manual_turn_mono = time.monotonic()
+
+    def manual_turn_recent(self) -> bool:
+        return time.monotonic() - self._last_manual_turn_mono < self._MANUAL_TURN_PRIORITY_SEC
+
+    def turn_toward(self, midstom: float, source: str, priority: int,
+                    lease_sec: float, vel: float = 0.0) -> float:
+        """Turn the torso AND the head toward the same side (a sound/voice-hint
+        guess). The head adds SoundScanBehaviour._HEAD_TURN_OFFSET on top of the
+        torso in the same direction; midstom at center → head straight too.
+        Live bug 2026-09-30: only the torso turned toward the voice, the head
+        stayed at 90°. Returns the rothead sent."""
+        side = (midstom > SoundScanBehaviour._CENTER) - (midstom < SoundScanBehaviour._CENTER)
+        rothead = SoundScanBehaviour._ROTHEAD_CENTER + side * SoundScanBehaviour._HEAD_TURN_OFFSET
+        self.note_own_torso_move()
+        self.send_joints(source, priority, lease_sec,
+                         {'midstom': midstom, 'rothead': rothead,
+                          'neck': SoundScanBehaviour._NECK_REST}, vel=vel)
+        return rothead
 
     def aim_head_at_human(self) -> None:
         """One-shot precise aiming of the head (rothead) at the person using
@@ -1617,7 +1701,12 @@ class BehaviorManagerNode(LifecycleNode):
             if prev['direction'] is None or not self._human_detected:
                 self._face_search_attempts += 1
 
-        if self._last_direction_hint == 'right':
+        if self.manual_turn_recent():
+            # The user has just told us explicitly where to turn — that wins over
+            # our own guesses; the hint came from the same utterance, drop it.
+            self._last_direction_hint = 'none'
+            target, source = None, 'manual_command'
+        elif self._last_direction_hint == 'right':
             target, source = SoundScanBehaviour._RIGHT, 'voice_hint'
             # A one-shot hint — consume it right away, otherwise on the next failure
             # (or after look_direction/a photo ALREADY disproved it) it
@@ -1722,7 +1811,7 @@ class BehaviorManagerNode(LifecycleNode):
             self._bb.robot.sleep_text = event.get(
                 'text', 'Спокойной ночи! Скажи «Эй Лёня» чтобы разбудить меня.')
         elif action == 'goodbye':
-            # The LLM said goodbye explicitly. speak_text is already spoken by TTS via llm_node —
+            # The LLM said goodbye explicitly. The farewell `text` is sent straight to TTS by llm_node —
             # FarewellBranch is not needed (otherwise the farewell would be spoken twice).
             # Just switch IM to IDLE and start the timer to turn vision off.
             self._bb.social.should_greet      = False
@@ -1999,6 +2088,7 @@ class BehaviorManagerNode(LifecycleNode):
         # All servo commands of this node (BT leaves + aim_head_at_human) — plain
         # publisher, gated by lc_active in send_joints()
         self._joint_cmd_pub = self.create_publisher(JointCommand, '/joint_cmd', 20)
+        self._blink_pub     = self.create_publisher(Bool, '/eyes/blink', 10)
 
         self._tree = build_tree(self, tavily_key)
         self._tree.setup_with_descendants()
