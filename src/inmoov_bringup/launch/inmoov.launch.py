@@ -123,7 +123,9 @@ def generate_launch_description():
         # Wake word
         DeclareLaunchArgument('wakeword_model', default_value=robot['wakeword_model']),
         DeclareLaunchArgument('wakeword_threshold', default_value='0.9'),
-        DeclareLaunchArgument('wakeword_patience',  default_value='2'),
+        DeclareLaunchArgument('wakeword_patience',  default_value='3'),
+        DeclareLaunchArgument('wakeword_save_dir',
+                              default_value=os.path.expanduser('~/inmoov_wake_debug')),
 
         # Audio
         DeclareLaunchArgument('audio_device_index', default_value='-1'),
@@ -319,6 +321,7 @@ def generate_launch_description():
             'model_path':   LaunchConfiguration('wakeword_model'),
             'threshold':    LaunchConfiguration('wakeword_threshold'),
             'patience':     LaunchConfiguration('wakeword_patience'),
+            'save_dir':     LaunchConfiguration('wakeword_save_dir'),
             'debounce_sec': 1.5,
         }],
     )

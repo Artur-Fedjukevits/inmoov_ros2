@@ -156,6 +156,8 @@ the first model key returned is used as the score.
 | `threshold` | double | `0.9` | Activation score threshold (launch default `wakeword_threshold` is the same). |
 | `patience` | int | `2` | Consecutive 80 ms model frames with score ≥ `threshold` required to activate (launch arg `wakeword_patience`). Cuts single-frame spikes from TV/speech. |
 | `debounce_sec` | double | `1.5` | Minimum time between two activations. |
+| `save_dir` | string | `''` | If set, the last `save_sec` of audio before every activation is saved there as `YYYYmmdd_HHMMSS_<score>.wav` — collects false activations for retraining (launch arg `wakeword_save_dir`, default `~/inmoov_wake_debug`; `''` disables). |
+| `save_sec` | double | `3.0` | Seconds of audio before an activation to save. |
 
 **Topics**
 

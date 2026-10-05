@@ -17,14 +17,19 @@ Parameters:
   threshold     (float) — activation score threshold (default 0.9)
   patience      (int)   — consecutive 80 ms frames >= threshold required to activate (default 2)
   debounce_sec  (float) — minimum interval between two activations (default 1.5)
+  save_dir      (str)   — if set, the last save_sec of audio before every activation is
+                          written there as WAV (collects false activations for retraining)
+  save_sec      (float) — how much audio before an activation to save (default 3.0)
 
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
 License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
+import collections
 import os
 import time
+import wave
 
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
@@ -45,6 +50,8 @@ class WakeWordNode(LifecycleNode):
         self.debounce_sec     = 1.5
         self._frames_above    = 0     # consecutive frames with score >= threshold
         self._buf             = np.zeros(0, dtype=np.int16)
+        self.save_dir         = ''
+        self._history         = collections.deque()   # recent frames, for save_dir
         self.last_activation  = 0.0
         self.activation_count = 0
         self.wake_pub         = None
@@ -64,11 +71,18 @@ class WakeWordNode(LifecycleNode):
         self._dp('threshold',    0.9)
         self._dp('patience',     2)
         self._dp('debounce_sec', 1.5)
+        self._dp('save_dir',     '')
+        self._dp('save_sec',     3.0)
 
         model_path        = self.get_parameter('model_path').value
         self.threshold    = self.get_parameter('threshold').value
         self.patience     = max(1, int(self.get_parameter('patience').value))
         self.debounce_sec = self.get_parameter('debounce_sec').value
+        self.save_dir     = os.path.expanduser(self.get_parameter('save_dir').value)
+        n_hist = int(np.ceil(self.get_parameter('save_sec').value * 16000 / FRAME_SAMPLES))
+        self._history = collections.deque(maxlen=max(1, n_hist))
+        if self.save_dir:
+            os.makedirs(self.save_dir, exist_ok=True)
 
         self.wake_pub  = self.create_lifecycle_publisher(Bool,    'wake_detected', 10)
         self.score_pub = self.create_lifecycle_publisher(Float32, 'wake_score',    10)
@@ -82,7 +96,7 @@ class WakeWordNode(LifecycleNode):
         self.create_subscription(Float32MultiArray, 'raw_audio', self._audio_callback, 20)
         self.get_logger().info(
             f"Wake word ready (threshold={self.threshold}, patience={self.patience}, "
-            f"debounce={self.debounce_sec}s)")
+            f"debounce={self.debounce_sec}s, save_dir={self.save_dir or 'off'})")
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
@@ -124,6 +138,7 @@ class WakeWordNode(LifecycleNode):
             self._process_frame(frame)
 
     def _process_frame(self, frame: np.ndarray):
+        self._history.append(frame)
         prediction = self.model.predict(frame)
 
         # Determine the model key on the first call
@@ -154,6 +169,20 @@ class WakeWordNode(LifecycleNode):
                 f"Wake word detected! Score={score:.3f} "
                 f"(activation #{self.activation_count})"
             )
+            if self.save_dir:
+                self._save_activation(score)
+
+    def _save_activation(self, score: float):
+        """Write the audio that triggered the activation, e.g. 20261003_142048_0.990.wav."""
+        name = time.strftime('%Y%m%d_%H%M%S') + f'_{score:.3f}.wav'
+        try:
+            with wave.open(os.path.join(self.save_dir, name), 'wb') as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(np.concatenate(list(self._history)).tobytes())
+        except OSError as e:
+            self.get_logger().warning(f'Could not save activation audio: {e}')
 
     # destroy_node replaced by lifecycle callbacks
 

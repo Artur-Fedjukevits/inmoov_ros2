@@ -191,7 +191,8 @@ Servers / LLM:
 Wake word:
 - `wakeword_model` (default `/home/artur/openWakeWord/my_custom_model/ey_lyonya.onnx`)
 - `wakeword_threshold` (default `0.9`)
-- `wakeword_patience` (default `2`; consecutive 80 ms frames above the threshold)
+- `wakeword_patience` (default `3`; consecutive 80 ms frames above the threshold)
+- `wakeword_save_dir` (default `~/inmoov_wake_debug`; audio before each activation is saved there, `''` disables)
 
 Audio:
 - `audio_device_index` (default `-1`), `audio_device_name` (default `pulse`), `output_device_name` (default `''`)
