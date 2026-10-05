@@ -199,7 +199,7 @@ Audio:
 - `pa_source_check` (default `Jabra`, empty string disables the check)
 
 VAD / speaker verification:
-- `vad_threshold` (`0.4`), `silence_duration_sec` (`2.5`), `pipeline_timeout_sec` (`45.0`)
+- `vad_threshold` (`0.4`), `silence_duration_sec` (`1.0`), `pipeline_timeout_sec` (`45.0`)
 - `speaker_verification` (`true`), `sv_threshold` (`0.35`, phrase-level), `sv_min_speech_sec` (`1.2`), `sv_debug_dir` (`~/inmoov_sv_debug`, WAVs of judged phrases for tuning)
 
 Tavily:

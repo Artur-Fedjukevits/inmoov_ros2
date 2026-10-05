@@ -236,7 +236,7 @@ embeddings, RMS-normalised to 0.05 before embedding).
 |---|---|---|---|
 | `sample_rate` | int | `16000` | Sample rate used for the VAD and durations. |
 | `vad_threshold` | double | `0.4` | Silero speech probability threshold. |
-| `silence_duration_sec` | double | `2.5` | Silence that ends a phrase. |
+| `silence_duration_sec` | double | `1.0` | Silence that ends a phrase (was 2.5 — added 1.5 s to every reply and glued table talk into one recording). |
 | `min_phrase_sec` | double | `0.3` | Minimum buffer length (chunks) for a phrase to be sent. |
 | `min_speech_sec` | double | `1.0` | Minimum accepted speech length for a phrase to be sent. |
 | `min_speech_sec_introducing` | double | `0.4` | Same, while `/introducing` is true. |

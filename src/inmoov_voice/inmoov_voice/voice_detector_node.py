@@ -21,13 +21,19 @@ Subscribes:
                                            {person_id, name, gallery: [{embedding, timestamp}]}
 
 Publishes:
-  audio_to_whisper  (Float32MultiArray)  — recorded phrase, dim label 'sample_rate'
-  /voice_embedding  (String JSON)        — {embedding, timestamp} -> identity_manager -> DB
+  audio_to_whisper  (Float32MultiArray)  — recorded phrase, dim label 'sample_rate';
+                                           an extra dim 'other_speaker' marks a phrase SV
+                                           rejected (not the current interlocutor)
+  /voice_embedding  (String JSON)        — {embedding, timestamp[, other_speaker]} -> identity_manager
+                                           (other_speaker: SV-rejected phrase, voice lookup only)
+  /voice/segment    (String JSON)        — {id, t_start, t_end, env_hz, envelope, vad, sv_rejected}
+                                           of every phrase sent to STT or rejected by SV
+                                           -> face_tracker lip activity
   /robot_sleep      (Bool, latched)      — False on wake word while asleep
   /tts_cancel_queue (Bool)               — True on wake word during TTS
 
 Parameters:
-  sample_rate (16000), vad_threshold (0.4), silence_duration_sec (2.5),
+  sample_rate (16000), vad_threshold (0.4), silence_duration_sec (1.0),
   min_phrase_sec (0.3), min_speech_sec (1.0), min_speech_sec_introducing (0.4),
   max_phrase_sec (20.0), no_speech_timeout_sec (8.0), pipeline_timeout_sec (90.0),
   speaker_verification (True), sv_threshold (0.35), sv_min_speech_sec (1.2), sv_debug_dir ('')
@@ -84,7 +90,7 @@ class VoiceDetectorNode(LifecycleNode):
         # ── Parameters ────────────────────────────────────────────────────
         self._dp('sample_rate',           16000)
         self._dp('vad_threshold',         0.4)
-        self._dp('silence_duration_sec',  2.5)
+        self._dp('silence_duration_sec',  1.0)
         self._dp('min_phrase_sec',        0.3)
         self._dp('min_speech_sec',        1.0)
         self._dp('min_speech_sec_introducing', 0.4)
@@ -127,10 +133,13 @@ class VoiceDetectorNode(LifecycleNode):
         )
         self.create_subscription(Bool,   '/robot_sleep',  self._robot_sleep_cb,  latched_qos)
         self.create_subscription(String, '/voice_anchor', self._voice_anchor_cb, 10)
+        self.create_subscription(String, '/voice/sv_confirm', self._sv_confirm_cb, 10)
 
         # ── Lifecycle Publishers ───────────────────────────────────────────
         self.publisher_      = self.create_lifecycle_publisher(Float32MultiArray, 'audio_to_whisper', 10)
         self._voice_emb_pub  = self.create_lifecycle_publisher(String, '/voice_embedding', 10)
+        self._segment_pub    = self.create_lifecycle_publisher(String, '/voice/segment', 10)
+        self._segment_id     = 0
         self._sleep_pub      = self.create_lifecycle_publisher(Bool, '/robot_sleep', latched_qos)
         self._tts_cancel_pub = self.create_lifecycle_publisher(Bool, '/tts_cancel_queue', 10)
 
@@ -189,6 +198,14 @@ class VoiceDetectorNode(LifecycleNode):
         self._sv_seed_unconfirmed      = False
         self._sv_seed_rejects          = 0
         self._SV_SEED_MAX_REJECTS      = 2   # phrases
+        # A phrase dropped as too short ("Эй, Лёня" — 0.6 s) is kept for a moment
+        # and prepended to the next phrase if that one starts right after it
+        # (live 2026-10-03: "Эй Лёня" dropped, then "Кими хороший" came without
+        # the name and was ignored). (chunks, speech chunks, finish time)
+        self._carry             = None
+        # Embeddings of recent SV-rejected phrases by /voice/segment id (see _sv_confirm_cb)
+        self._rejected_embs: dict = {}
+        self._sv_last_reject_emb = None
         self._introducing       = False
         self.is_active          = False
         self.audio_buffer       = []
@@ -231,6 +248,7 @@ class VoiceDetectorNode(LifecycleNode):
         self._lc_active = True
         self.publisher_.on_activate(state)
         self._voice_emb_pub.on_activate(state)
+        self._segment_pub.on_activate(state)
         self._sleep_pub.on_activate(state)
         self._tts_cancel_pub.on_activate(state)
         return TransitionCallbackReturn.SUCCESS
@@ -244,6 +262,7 @@ class VoiceDetectorNode(LifecycleNode):
         self._pre_roll_buffer.clear()
         self.publisher_.on_deactivate(state)
         self._voice_emb_pub.on_deactivate(state)
+        self._segment_pub.on_deactivate(state)
         self._sleep_pub.on_deactivate(state)
         self._tts_cancel_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
@@ -315,12 +334,23 @@ class VoiceDetectorNode(LifecycleNode):
         person_active = self._is_person_present()
 
         if self.is_active:
-            self.get_logger().warn('Wake word during recording — resetting the buffer, starting over')
-            self.audio_buffer    = []
+            # Keep the last _WAKE_KEEP_SEC, drop what came before. The wake word fires
+            # ~0.3-0.8 s after "Лёня" (openWakeWord patience), so a full reset threw
+            # away the wake word AND the first words of the request (live 2026-10-05:
+            # STT got "Zavody", "Morredi de escogo."). The wake word stays in the
+            # phrase — STT hears the whole thing and the name opens the gate.
+            keep = max(1, int(self._WAKE_KEEP_SEC * self.rate / (self._chunk_size or 512)))
+            kept = self.audio_buffer[-keep:]
+            ids  = {id(c) for c in kept}
+            self.get_logger().warn(
+                f'Wake word during recording — keeping the last {self._WAKE_KEEP_SEC:.1f}s '
+                f'(the wake word + what follows), dropping the rest')
+            self.audio_buffer    = kept
+            self._speech_audio   = [c for c in self._speech_audio if id(c) in ids]
+            self.speech_chunks   = len(self._speech_audio)
             self.silence_counter = 0
             self.activation_time = time.time()
             self._last_wake_time = time.time()
-            self._speech_audio.clear()
             if not person_active:
                 self._sv_reset_reference()
             return
@@ -482,6 +512,24 @@ class VoiceDetectorNode(LifecycleNode):
                     self.get_logger().info(
                         'TTS finished — nobody in frame, auto-activation disabled')
 
+    def _sv_confirm_cb(self, msg: String):
+        """llm_node: an SV-rejected phrase was spoken by the face in view (its lips
+        moved with the speech, it looked at the robot) — the interlocutor after all.
+        Its voice joins the live session gallery (not the DB directly), so the next
+        phrases pass SV. The gallery is reset with the session anyway."""
+        try:
+            seg_id = json.loads(msg.data).get('segment_id')
+        except Exception:
+            return
+        emb = self._rejected_embs.pop(seg_id, None)
+        if emb is None or not self._sv_enabled:
+            return
+        self._sv_last_gallery_add = 0.0   # bypass the add interval: a correction
+        if self._sv_add_to_gallery(emb):
+            self.get_logger().info(
+                f'SV: lips confirmed the interlocutor\'s voice (segment {seg_id}) — '
+                f'added to the live gallery')
+
     def _voice_anchor_cb(self, msg: String):
         """Load the voice gallery from the DB (identity_manager → voice_detector).
 
@@ -603,12 +651,19 @@ class VoiceDetectorNode(LifecycleNode):
         self._publish_voice_emb(emb, now)
         return True
 
-    def _publish_voice_emb(self, emb: np.ndarray, ts: float = None):
+    def _publish_voice_emb(self, emb: np.ndarray, ts: float = None,
+                           other_speaker: bool = False):
         emb_msg = String()
-        emb_msg.data = json.dumps({
+        data = {
             'embedding': emb.tolist(),
             'timestamp': ts if ts is not None else time.time(),
-        })
+        }
+        if other_speaker:
+            data['other_speaker'] = True
+        # Whose gallery this voice matched — identity_manager saves it to that
+        # person's DB gallery only if it is the face in view (see its _voice_embedding_cb)
+        data['anchor_person_id'] = self._sv_anchor_person_id
+        emb_msg.data = json.dumps(data)
         self._voice_emb_pub.publish(emb_msg)
 
     def _sv_seed(self, emb: np.ndarray) -> None:
@@ -680,6 +735,11 @@ class VoiceDetectorNode(LifecycleNode):
                               f'({self._SV_SEED_MAX_REJECTS} phrases, last similarity={sim:.2f}) '
                               f'— re-seeded from this phrase, accepted')
         self._sv_debug_save(speech, 'reject', sim)
+        # Not added to the gallery — only for identity_manager to tell llm_node
+        # WHO this other person is (/voice/speaker, other_speaker=True). Kept: if the
+        # lips show it was the interlocutor after all, /voice/sv_confirm adds it.
+        self._publish_voice_emb(emb, other_speaker=True)
+        self._sv_last_reject_emb = emb
         return False, (f'SV: phrase rejected — not the current speaker '
                        f'(similarity={sim:.2f} < {self._sv_threshold:.2f}, {sec:.1f}s speech)')
 
@@ -690,7 +750,8 @@ class VoiceDetectorNode(LifecycleNode):
         try:
             import wave
             os.makedirs(self._sv_debug_dir, exist_ok=True)
-            name = time.strftime('%Y%m%d_%H%M%S') + f'_{verdict}' + (
+            # ms: the parts of one split recording are saved within the same second
+            name = time.strftime('%Y%m%d_%H%M%S') + f'{int(time.time() * 1000) % 1000:03d}_{verdict}' + (
                 f'_{sim:.2f}' if sim is not None else '') + '.wav'
             with wave.open(os.path.join(self._sv_debug_dir, name), 'wb') as w:
                 w.setnchannels(1)
@@ -781,9 +842,27 @@ class VoiceDetectorNode(LifecycleNode):
             self.get_logger().warn('Phrase length limit reached — forcing the end of recording')
             self._finish_recording(reason='timeout')
 
-    # ── Finishing the recording ───────────────────────────────────────────
+    _CARRY_SEC        = 3.0   # a dropped short phrase joins a phrase starting within this
+    _WAKE_KEEP_SEC    = 2.0   # wake word during recording: keep this much of the tail
+
+    def _take_carry(self) -> int:
+        """Prepends a fresh dropped short phrase to the current one. Returns the
+        number of samples prepended (0 if none)."""
+        carry, self._carry = self._carry, None
+        if carry is None:
+            return 0
+        chunks, speech, t_fin = carry
+        cs = self._chunk_size or 512
+        started = time.time() - len(self.audio_buffer) * cs / self.rate
+        if started - t_fin > self._CARRY_SEC:
+            return 0
+        self.audio_buffer  = chunks + self.audio_buffer
+        self._speech_audio = speech + self._speech_audio
+        self.speech_chunks += len(speech)
+        return sum(len(c) for c in chunks)
 
     def _finish_recording(self, reason: str = 'silence'):
+        carried = self._take_carry()
         # During an introduction, short answers are expected (a name, "Ника", "да") —
         # the minimum speech length threshold is lowered so they aren't dropped.
         effective_min_speech_sec = (
@@ -795,6 +874,9 @@ class VoiceDetectorNode(LifecycleNode):
 
         long_enough = (len(self.audio_buffer) > min_chunks
                        and self.speech_chunks >= min_speech_chunks)
+        if carried and long_enough:
+            self.get_logger().info(
+                f'Short phrase just before ({carried / self.rate:.1f}s) joined to this one')
         sv_ok = True
         if long_enough and self._speech_audio:
             sv_ok, sv_log = self._sv_check_phrase(np.concatenate(self._speech_audio))
@@ -805,6 +887,25 @@ class VoiceDetectorNode(LifecycleNode):
                 self.get_logger().warn(sv_log)
 
         if long_enough and not sv_ok:
+            # Another person, not the current interlocutor. Still transcribed, marked
+            # other_speaker: STT routes it to voice_command_other, where llm_node
+            # answers it only if the robot is called by name (multi-person talk).
+            # Does not touch the STT wait / presence state of the main dialogue.
+            # The lip analysis needs it too: the face in view must come out
+            # "silent" here (speaker detection).
+            # (its voice-id was already published by _sv_check_phrase)
+            full_audio = np.concatenate(self.audio_buffer)
+            self.get_logger().info(
+                f'Phrase from another speaker ({len(full_audio) / self.rate:.1f}s, '
+                f'speech={speech_sec:.1f}s) — sending to STT as other_speaker')
+            self._publish(full_audio, other_speaker=True)
+            # The carried part is not contiguous in time — lips look at this phrase only
+            self._publish_segment(full_audio[carried:], sv_rejected=True)
+            if self._sv_last_reject_emb is not None:
+                self._rejected_embs[self._segment_id] = self._sv_last_reject_emb
+                self._sv_last_reject_emb = None
+                while len(self._rejected_embs) > 5:
+                    self._rejected_embs.pop(next(iter(self._rejected_embs)))
             if self._should_keep_listening() and not self._sleeping:
                 self._schedule_relisten(0.5)
         elif long_enough:
@@ -825,11 +926,18 @@ class VoiceDetectorNode(LifecycleNode):
             # stopped hearing the user. Live bug 2026-08-28.
             self._person_last_seen = time.time()
             self._publish(full_audio)
+            # The carried part is not contiguous in time — lips look at this phrase only
+            self._publish_segment(full_audio[carried:])
         else:
             self.get_logger().info(
                 f'Phrase dropped: speech {speech_sec:.1f}s < {effective_min_speech_sec:.1f}s'
-                f'{" (introducing)" if self._introducing else ""} — ignoring'
+                f'{" (introducing)" if self._introducing else ""}'
+                f'{" (with the short phrase before it)" if carried else ""} — ignoring'
             )
+            if self.speech_chunks > 0:
+                # Without the trailing silence, so the join is tight
+                keep = self.audio_buffer[:max(0, len(self.audio_buffer) - self.silence_counter)]
+                self._carry = (keep, list(self._speech_audio), time.time())
             if self._should_keep_listening() and not self._sleeping:
                 self._schedule_relisten(0.5)
 
@@ -841,13 +949,63 @@ class VoiceDetectorNode(LifecycleNode):
         self._speech_audio.clear()
         # The gallery is NOT reset — it lives for the whole session until go_idle / robot_sleep
 
-    def _publish(self, audio: np.ndarray):
+    _SEGMENT_ENV_HZ = 20   # loudness envelope rate for lip sync (50 ms frames)
+
+    def _publish_segment(self, audio: np.ndarray, sv_rejected: bool = False):
+        """Time window + loudness envelope of the phrase, for face_tracker to check
+        whose lips moved in sync with it (who is speaking). The phrase ends now —
+        its audio is the last `len(audio)` samples (chunk latency ~ one chunk)."""
+        hop = self.rate // self._SEGMENT_ENV_HZ
+        n   = len(audio) // hop
+        if n == 0:
+            return
+        frames   = audio[:n * hop].reshape(n, hop)
+        envelope = np.sqrt(np.mean(frames * frames, axis=1))
+        vad      = self._segment_vad(audio, n, hop)
+        t_end    = time.time()
+        self._segment_id += 1
+        msg = String()
+        msg.data = json.dumps({
+            'id':       self._segment_id,
+            't_start':  t_end - n * hop / self.rate,
+            't_end':    t_end,
+            'env_hz':   self._SEGMENT_ENV_HZ,
+            'envelope': [round(float(v), 5) for v in envelope],
+            'vad':      vad,
+            'sv_rejected': sv_rejected,
+        })
+        self._segment_pub.publish(msg)
+
+    def _segment_vad(self, audio: np.ndarray, n: int, hop: int) -> list[int]:
+        """Silero VAD per envelope frame (1 = speech): lip analysis must look only at
+        the speech itself — the phrase also holds ~silence_duration_sec of trailing "silence"
+        that may contain chewing/laughing (live record 2026-10-01: a bite of food
+        in that tail looked like the strongest mouth movement of the phrase).
+        Re-run over the finished phrase (a few ms), the same way as
+        _take_pre_roll_speech; the live VAD state is reset before and after."""
+        cs = self._chunk_size or 512
+        self.vad_model.reset_states()
+        with torch.no_grad():
+            speech = [self.vad_model(torch.from_numpy(np.ascontiguousarray(
+                          audio[i:i + cs])), self.rate).item() > self.vad_threshold
+                      for i in range(0, len(audio) - cs + 1, cs)]
+        self.vad_model.reset_states()
+        if not speech:
+            return [0] * n
+        return [int(speech[min(len(speech) - 1, (k * hop + hop // 2) // cs)]) for k in range(n)]
+
+    def _publish(self, audio: np.ndarray, other_speaker: bool = False):
         msg = Float32MultiArray()
         dim = MultiArrayDimension()
         dim.label  = 'sample_rate'
         dim.size   = len(audio)
         dim.stride = self.rate
         msg.layout.dim = [dim]
+        if other_speaker:
+            # Marker dim (size 0, no data): STT → voice_command_other
+            other = MultiArrayDimension()
+            other.label = 'other_speaker'
+            msg.layout.dim.append(other)
         msg.data = audio.tolist()
         self.publisher_.publish(msg)
 

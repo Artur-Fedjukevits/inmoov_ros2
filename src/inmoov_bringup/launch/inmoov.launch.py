@@ -134,7 +134,7 @@ def generate_launch_description():
 
         # VAD / SV
         DeclareLaunchArgument('vad_threshold',          default_value='0.4'),
-        DeclareLaunchArgument('silence_duration_sec',   default_value='2.5'),
+        DeclareLaunchArgument('silence_duration_sec',   default_value='1.0'),
         DeclareLaunchArgument('pipeline_timeout_sec',   default_value='45.0'),
         DeclareLaunchArgument('speaker_verification',   default_value='true'),
         # Phrase-level SV (see voice_detector_node): cosine threshold for a whole phrase,

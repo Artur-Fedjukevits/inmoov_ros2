@@ -110,6 +110,8 @@ class VoiceEmotionNode(LifecycleNode):
     def _audio_cb(self, msg: Float32MultiArray):
         if self._sleeping or self._busy:
             return
+        if any(d.label == 'other_speaker' for d in msg.layout.dim):
+            return   # not the interlocutor — their emotion must not drive the face
 
         audio = np.array(msg.data, dtype=np.float32)
         if len(audio) < _MIN_SAMPLES:
