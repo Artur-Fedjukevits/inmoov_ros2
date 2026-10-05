@@ -8,3 +8,4 @@ onnxruntime>=1.17     # 1.24.3  — face_detection_node
 insightface==0.7.3    #         — face_detection_node (buffalo_l)
 hsemotion-onnx>=0.3   # 0.3.1   — emotion_recognition_node
 depthai>=3.0,<4       # 3.6.1   — oak_node (v3 API only)
+websockets>=13      # 16.0    — video_ws_node (also python3-websockets via rosdep)

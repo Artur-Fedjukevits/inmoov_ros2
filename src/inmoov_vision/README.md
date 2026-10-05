@@ -426,11 +426,29 @@ active.
 | `model_name` | string | `yolov6-nano` | HubAI model name (launch arg `oak_model`). |
 | `conf_threshold` | double | `0.5` | NN confidence threshold (launch arg `oak_conf_threshold`). |
 | `fps` | int | `15` | Sensor FPS of all three cameras. |
+| `stream_enabled` | bool | `true` | Publish the hardware-MJPEG stream below. |
+| `stream_width` / `stream_height` | int | `640` / `480` | MJPEG frame size (4:3, full FOV). |
+| `stream_fps` | int | `15` | MJPEG frame rate (≤ `fps`). |
+| `stream_quality` | int | `80` | JPEG quality 1-100. |
+| `rgb_frame_id` | string | `oak_rgb_camera_optical_frame` | `frame_id` of the stream (URDF link). |
 
 | Topic | Type | Dir | Notes |
 |---|---|---|---|
-| `objects/detections` | `std_msgs/String` (JSON) | pub | Relative name. `{"objects": [{"label", "confidence", "x_mm", "y_mm", "z_mm", "bbox": [xmin, ymin, xmax, ymax] (normalized 0-1)}]}`. |
+| `objects/detections` | `std_msgs/String` (JSON) | pub | Relative name. `{"objects": [{"label", "confidence", "x_mm", "y_mm", "z_mm" (mm, ROS optical convention — x right, **y down**, z forward, frame `oak_rgb_camera_optical_frame`; depthai reports Y up, `oak_node` negates it), "bbox": [xmin, ymin, xmax, ymax] (normalized 0-1)}]}`. |
+| `oak/rgb/image_raw/compressed` | `sensor_msgs/CompressedImage` (`jpeg`) | pub | Sensor QoS. Encoded by the OAK `VideoEncoder` (MJPEG), the host only forwards bytes; not published while there are no subscribers. |
 | `objects/nearest` | `std_msgs/String` (JSON) | pub | Relative name. The single object with the smallest `abs(z_mm)`, same fields. |
+
+### `video_ws_node`
+
+Source: [`inmoov_vision/video_ws_node.py`](inmoov_vision/video_ws_node.py).
+Plain (non-lifecycle) node: subscribes to `oak/rgb/image_raw/compressed` and
+sends each JPEG as one **binary** WebSocket message (`ws://<robot>:9091`) —
+no decoding or re-encoding. Each client always gets the latest frame; a slow
+client drops frames without stalling the others. Godot: `WebSocketPeer` →
+`Image.load_jpg_from_buffer()` → `ImageTexture` → `TextureRect`.
+Parameters: `topic`, `port` (9091), `host`. Launch args `video_ws`,
+`video_ws_port`. Needs `websockets` ≥ 13 (`websockets.asyncio` API) from
+`requirements.txt` — Ubuntu 24.04's `python3-websockets` (10.4) is too old.
 
 ### `human_detection_node`
 

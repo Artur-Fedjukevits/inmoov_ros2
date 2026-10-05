@@ -196,6 +196,9 @@ def generate_launch_description():
         # + urdf_bridge (servo <-> URDF conversion, /urdf_joint_states, /urdf_joint_cmd)
         DeclareLaunchArgument('rosbridge', default_value='true'),
         DeclareLaunchArgument('rosbridge_port', default_value='9090'),
+        # OAK-D Lite hardware-MJPEG stream for the Android app (binary JPEG per WS message)
+        DeclareLaunchArgument('video_ws', default_value='true'),
+        DeclareLaunchArgument('video_ws_port', default_value='9091'),
         DeclareLaunchArgument('allowed_chat_id',
                               default_value=os.environ.get('TELEGRAM_ALLOWED_CHAT_ID', '0')),
     ]
@@ -423,6 +426,20 @@ def generate_launch_description():
             'actions_glob': '[]',
         }],
         condition=IfCondition(LaunchConfiguration('rosbridge')),
+    )
+
+    # Plain node (not lifecycle-managed): oak_node's JPEG topic -> WebSocket :9091
+    video_ws = Node(
+        package='inmoov_vision',
+        executable='video_ws_node',
+        name='video_ws_node',
+        output='screen',
+        respawn=True,
+        respawn_delay=2.0,
+        parameters=[{
+            'port': ParameterValue(LaunchConfiguration('video_ws_port'), value_type=int),
+        }],
+        condition=IfCondition(LaunchConfiguration('video_ws')),
     )
 
     face_expressions = LifecycleNode(
@@ -774,6 +791,7 @@ def generate_launch_description():
         joint_state_publisher,
         urdf_bridge,
         rosbridge,
+        video_ws,
         face_expressions,
         voice_emotion,
         parakeet_stt,
