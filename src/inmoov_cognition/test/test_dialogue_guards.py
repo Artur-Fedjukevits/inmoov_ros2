@@ -295,6 +295,7 @@ def test_addressing_block():
     assert llm_node._build_addressing_block(None) == ''
     assert '[ignore]' not in llm_node._build_addressing_block('name')
     assert '[ignore]' in llm_node._build_addressing_block('gaze')
+    assert '[ignore]' not in llm_node._build_addressing_block('wake')
 
 
 # ─────────────────────────────────────────────────────────────────────────────

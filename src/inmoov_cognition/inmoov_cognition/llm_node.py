@@ -1001,16 +1001,21 @@ def _build_addressing_block(addressing: str | None) -> str:
 
     addressing: 'name' / 'gaze' / 'wake' / '' (reason unknown, e.g. a queued
     phrase), None — not a voice request (Telegram): no block at all.
-    Everything except 'name' also gets the [ignore] rule: the gate can't tell a
-    phone call held while facing the robot from a question to it — the LLM can.
+    'name' and 'wake' are explicit calls to the robot: no [ignore] rule (live
+    2026-10-05: a phrase right after "Эй, Лёня" was dropped by the LLM as [ignore]).
+    Everything else also gets the [ignore] rule: the gate can't tell a phone call
+    held while facing the robot from a question to it — the LLM can.
     """
     if addressing is None:
         return ''
     if addressing == 'name':
         return '\nАдресность: к тебе обратились по имени — реплика точно тебе, отвечай.\n'
+    if addressing == 'wake':
+        return ('\nАдресность: реплика прозвучала сразу после wake word «Эй, Лёня» — '
+                'она точно обращена к тебе, всегда отвечай (даже если фраза обрывочная '
+                'или непонятная — переспроси).\n')
     why = {
         'gaze': 'собеседник смотрит тебе в глаза',
-        'wake': 'реплика прозвучала сразу после «Эй, Лёня», лицо ещё не найдено',
     }.get(addressing, 'причина неизвестна')
     return (
         f'\nАдресность ({why}): микрофон слышит всё вокруг, и реплика могла быть '
