@@ -122,14 +122,25 @@ class _Pub:
 def _stub():
     queried = []
     s = types.SimpleNamespace(
+        _split_at_name=lambda text: text,
         _lock=threading.Lock(), _introducing=False, _processing=False,
         _pending=PendingUtterance(), _direction_hint_pub=_Pub(), _tts_cancel_pub=_Pub(),
+        _speech_addressed_pub=_Pub(), _introduce_on_address=False, _social_ctx_ts=0.0,
+        _GAZE_CTX_STALE_SEC=LLMNode._GAZE_CTX_STALE_SEC,
         _addressing_reason=lambda text: 'gaze',
         get_logger=lambda: types.SimpleNamespace(
             info=lambda *a, **k: None, debug=lambda *a, **k: None, warn=lambda *a, **k: None),
         _queried=queried,
     )
-    s._query_llm = lambda text, **kw: queried.append(text)
+    s._query_llm = lambda text, **kw: (queried.append(text), s._query_kw.append(kw))
+    s._query_kw = []
+    s._speaker_tag = lambda other: '[Говорит Герман]: ' if other else None
+    s._lips_ev = None                       # what _await_lips returns (no lip data)
+    s._await_lips = lambda t, sv_rejected=False: s._lips_ev
+    s._other_speaker_check = lambda *a: LLMNode._other_speaker_check(s, *a)
+    s._sv_confirm_pub = _Pub()
+    s._gaze_lips_check = lambda text, t: LLMNode._gaze_lips_check(s, text, t)
+    s._accept_command = lambda *a, **k: LLMNode._accept_command(s, *a, **k)
     s._dispatch_pending = lambda: LLMNode._dispatch_pending(s)
     return s
 
@@ -161,6 +172,30 @@ def test_busy_command_is_queued_then_run(monkeypatch):
     assert len(s._tts_cancel_pub.msgs) == cancels_before, 'queued reply must not cut the TTS'
 
 
+def test_unknown_face_addressing_starts_introduction(monkeypatch):
+    """An unknown face waits silently; when it addresses the robot the utterance
+    goes to identity_manager (/speech_addressed → introduction), not to the LLM."""
+    _run_threads_now(monkeypatch)
+    s = _stub()
+    s._introduce_on_address = True
+    s._social_ctx_ts = time.monotonic()
+    s._addressing_reason = lambda text: 'name'
+    LLMNode.command_callback(s, String(data='лёня, привет, ты кто'))
+    assert s._queried == []
+    assert [m.data for m in s._speech_addressed_pub.msgs] == ['лёня, привет, ты кто']
+
+    s._addressing_reason = lambda text: 'gaze'     # gaze alone doesn't introduce a stranger
+    LLMNode.command_callback(s, String(data='не мерить'))
+    assert len(s._speech_addressed_pub.msgs) == 1 and s._queried == []
+    s._lips_ev = {'who': 'primary'}                # …unless their lips moved with the speech
+    LLMNode.command_callback(s, String(data='а ты кто такой'))
+    assert len(s._speech_addressed_pub.msgs) == 2 and s._queried == []
+
+    s._social_ctx_ts = time.monotonic() - 10.0     # stale context — normal dialogue
+    LLMNode.command_callback(s, String(data='который час'))
+    assert s._queried == ['который час']
+
+
 def test_queued_command_dropped_when_introducing(monkeypatch):
     _run_threads_now(monkeypatch)
     s = _stub()
@@ -177,6 +212,13 @@ def test_queued_command_dropped_when_introducing(monkeypatch):
 
 def _gate(looking=None, ctx_age=0.1, since_wake=1e6):
     now = time.monotonic()
+    g = _gate_ns(looking, ctx_age, since_wake, now)
+    g._has_robot_name = lambda text: LLMNode._has_robot_name(g, text)
+    g._split_at_name = lambda text: LLMNode._split_at_name(g, text)
+    return g
+
+
+def _gate_ns(looking, ctx_age, since_wake, now):
     return types.SimpleNamespace(
         _lock=threading.Lock(), _looking_at_robot=looking,
         _social_ctx_ts=now - ctx_age, _wake_ts=now - since_wake, wake_grace_sec=30.0,
@@ -301,3 +343,294 @@ def test_tools_execute_only_through_run_tool():
                         and n.func.attr == '_execute_tool'):
                     offenders.append(f'{fn.name}:{n.lineno}')
     assert offenders == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# identity_manager social policy: once-a-day greeting, introduce only when addressed
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _identity_stub(tmp_path):
+    from inmoov_cognition.identity_manager_node import IdentityManagerNode, State
+    s = types.SimpleNamespace(
+        _lock=threading.Lock(), _greet_log={}, _greet_day_start_hour=4,
+        _greet_log_path=str(tmp_path / 'greet.json'),
+        _state=State.INTERACTING, _current_person={}, _intro_declined=False,
+        get_logger=lambda: types.SimpleNamespace(
+            info=lambda *a, **k: None, warn=lambda *a, **k: None),
+    )
+    for m in ('_greet_day', '_load_greet_log', '_greeted_today', '_mark_greeted_today',
+              '_speech_addressed_cb'):
+        setattr(s, m, getattr(IdentityManagerNode, m).__get__(s))
+    s.intros = []
+    s._start_introduction = lambda: s.intros.append(1)
+    return s, State
+
+
+def test_greeting_once_a_day_survives_restart(tmp_path):
+    s, _ = _identity_stub(tmp_path)
+    assert not s._greeted_today(5)
+    s._mark_greeted_today(5)
+    assert s._greeted_today(5)
+    assert not s._greeted_today(6)
+    s2, _ = _identity_stub(tmp_path)               # node restarted
+    s2._greet_log = s2._load_greet_log()
+    assert s2._greeted_today(5)
+    s2._greet_log['5'] = '2000-01-01'              # yesterday's greeting doesn't count
+    assert not s2._greeted_today(5)
+
+
+def test_unknown_face_introduced_only_when_addressed(tmp_path):
+    s, State = _identity_stub(tmp_path)
+    s._speech_addressed_cb(String(data='привет'))
+    assert s.intros == [1]
+    s._intro_declined = True                       # gave no name once — don't nag
+    s._speech_addressed_cb(String(data='привет'))
+    assert s.intros == [1]
+    s._intro_declined = False
+    s._current_person = {'person_id': 5, 'name': 'Артур'}   # known — LLM handles it
+    s._speech_addressed_cb(String(data='привет'))
+    assert s.intros == [1]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Speaker fusion (identity_manager, shadow mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mouth(tracks, sv_rejected=False):
+    return {'segment_id': 7, 'side': 'left', 't_start': 10.0, 't_end': 12.0,
+            'sv_rejected': sv_rejected,
+            'tracks': [{'track_id': tid, 'verdict': v, 'excess': 0.05} for tid, v in tracks]}
+
+
+_LOOKING = [(10.0 + 0.2 * k, 1, 0.1) for k in range(10)]   # track 1 frontal all phrase
+
+
+def _fuse(mouth, gaze=_LOOKING):
+    from inmoov_cognition.identity_manager_node import fuse_speaker_evidence
+    return fuse_speaker_evidence(mouth, 1, gaze, 0.30, 0.50)
+
+
+def test_fusion_primary_speaking_and_looking_passes():
+    ev = _fuse(_mouth([(1, 'speaking')]))
+    assert ev['who'] == 'primary' and ev['gaze'] is True
+    assert ev['gaze_gate'] is True and ev['fused_gate'] is True
+
+
+def test_fusion_looking_but_silent_lips_blocks():
+    # Live 2026-10-03 "Не мерить.": face looking at the robot, someone else talking
+    ev = _fuse(_mouth([(1, 'silent')]))
+    assert ev['who'] == 'offscreen'
+    assert ev['gaze_gate'] is True and ev['fused_gate'] is False
+
+
+def test_fusion_other_face_speaking():
+    ev = _fuse(_mouth([(1, 'unknown'), (2, 'speaking')]))
+    assert ev['who'] == 'other_face' and ev['others_speaking'] == [2]
+    assert ev['fused_gate'] is False
+
+
+def test_fusion_gaze_outside_phrase_ignored():
+    stale = [(5.0, 1, 0.1), (5.2, 1, 0.1)]   # looked before the phrase, not during
+    ev = _fuse(_mouth([(1, 'speaking')]), gaze=stale)
+    assert ev['gaze'] is None and ev['gaze_gate'] is False and ev['fused_gate'] is False
+
+
+def test_fusion_sv_rejected_has_no_gate():
+    ev = _fuse(_mouth([(1, 'silent')], sv_rejected=True))
+    assert ev['gaze_gate'] is None and ev['fused_gate'] is None
+
+
+def test_fusion_unknown_lips_do_not_veto():
+    # Live seg#3/#18: real questions with lips 'unknown' — gaze decides
+    ev = _fuse(_mouth([(1, 'unknown')]))
+    assert ev['who'] == 'unknown' and ev['fused_gate'] is True
+
+
+def test_fusion_briefly_seen_faces_ignored():
+    m = _mouth([(1, 'unknown'), (2, 'speaking')])
+    m['tracks'][1]['coverage'] = 0.13            # live seg#13: flickering tracks
+    ev = _fuse(m)
+    assert ev['others_speaking'] == [] and ev['fused_gate'] is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-person talk: another speaker's phrase (SV-rejected) → voice_command_other
+
+def test_other_speaker_needs_robot_name(monkeypatch):
+    _run_threads_now(monkeypatch)
+    s = _stub()
+    s._addressing_reason = lambda text: 'gaze'      # interlocutor looks — irrelevant here
+    LLMNode.command_callback(s, String(data='вот так и делаем'), other_speaker=True)
+    assert s._queried == []
+
+    s._addressing_reason = lambda text: 'name'
+    LLMNode.command_callback(s, String(data='Лёня, а ты что думаешь?'), other_speaker=True)
+    assert s._queried == ['Лёня, а ты что думаешь?']
+    assert s._query_kw[-1]['other_speaker'] is True
+    assert s._query_kw[-1]['speaker_tag'] == '[Говорит Герман]: '
+
+
+def test_other_speaker_never_starts_introduction(monkeypatch):
+    _run_threads_now(monkeypatch)
+    s = _stub()
+    s._introduce_on_address = True
+    s._social_ctx_ts = time.monotonic()
+    s._addressing_reason = lambda text: 'name'
+    LLMNode.command_callback(s, String(data='Лёня, привет'), other_speaker=True)
+    assert s._speech_addressed_pub.msgs == [] and s._queried == ['Лёня, привет']
+
+
+def test_other_speaker_queued_keeps_its_tag(monkeypatch):
+    _run_threads_now(monkeypatch)
+    s = _stub()
+    s._processing = True
+    s._addressing_reason = lambda text: 'name'
+    LLMNode.command_callback(s, String(data='Лёня, привет'), other_speaker=True)
+    s._processing = False
+    LLMNode._dispatch_pending(s)
+    assert s._query_kw[-1] == {'speaker_tag': '[Говорит Герман]: ', 'other_speaker': True}
+
+
+def _tag_stub(speaker, history=(), face_name=''):
+    return types.SimpleNamespace(_lock=threading.Lock(), _speaker=speaker,
+                                 history=list(history),
+                                 _person_context={'name': face_name} if face_name else None)
+
+
+def test_speaker_tag():
+    now = time.time()
+    german = {'ts': now, 'confidence': 'high', 'name': 'Герман', 'other_speaker': True}
+    t = LLMNode._speaker_tag
+    assert t(_tag_stub(german), True) == '[Говорит Герман]: '
+    assert t(_tag_stub({}), True) == '[Говорит другой человек, голос не опознан]: '
+    # one-on-one: the interlocutor's turns stay untagged…
+    assert t(_tag_stub({}, face_name='Артур'), False) is None
+    # …until someone else spoke in this history; another phrase's voice-id is not used
+    hist = [{'role': 'user', 'content': '[Говорит Герман]: Лёня, привет'}]
+    assert t(_tag_stub(german, hist, 'Артур'), False) == '[Говорит Артур]: '
+
+
+def test_other_speaker_block_and_tag_cleanup():
+    from inmoov_cognition.llm_node import _build_speaker_block, _clean_llm_text
+    block = _build_speaker_block({'other_speaker': True, 'confidence': 'high',
+                                  'name': 'Герман', 'face_name': 'Артур'})
+    assert 'Герман' in block and 'НЕ твой текущий собеседник' in block and 'Артур' in block
+    assert _clean_llm_text('[Говорит Лёня]: Привет, Герман!') == 'Привет, Герман!'
+
+
+def test_split_at_name_marks_glued_talk_as_background():
+    g = _gate(False)
+    glued = ('Очень поздно будет все. Чипсы, лучше один раз чипсы. '
+             'Это на следующий. Леня, ты знаешь, сколько калорий в чипсах?')
+    out = LLMNode._split_at_name(g, glued)
+    assert out.startswith('[Перед обращением звучал разговор, возможно не тебе: «Очень поздно')
+    assert out.endswith('\nЛеня, ты знаешь, сколько калорий в чипсах?')
+    assert LLMNode._split_at_name(g, 'Лёня, который час? Я опаздываю.') == \
+        'Лёня, который час? Я опаздываю.'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gaze vetoed by lips (/speaker_evidence)
+
+def test_gaze_vetoed_when_face_in_view_was_silent(monkeypatch):
+    # Live 2026-10-04: "You change one year." — the face in view looked, lips still
+    _run_threads_now(monkeypatch)
+    s = _stub()
+    for who in ('offscreen', 'other_face'):
+        s._lips_ev = {'who': who, 'lips': 'silent', 'excess': 0.003}
+        LLMNode.command_callback(s, String(data='You change one year.'))
+    assert s._queried == []
+    for who in ('primary', 'unknown', None):    # 'unknown' lips / no data don't veto
+        s._processing = False
+        s._lips_ev = {'who': who} if who else None
+        LLMNode.command_callback(s, String(data='который час'))
+    assert s._queried == ['который час'] * 3
+
+
+def test_name_never_waits_for_lips(monkeypatch):
+    _run_threads_now(monkeypatch)
+    s = _stub()
+    s._addressing_reason = lambda text: 'name'
+    s._lips_ev = {'who': 'offscreen'}
+    LLMNode.command_callback(s, String(data='Лёня, который час'))
+    assert s._queried == ['Лёня, который час']
+
+
+def test_await_lips_matches_the_phrase_once():
+    s = types.SimpleNamespace(_lips_cond=threading.Condition(), _lips_used_seg=None,
+                              _LIPS_WAIT_SEC=0.05, _LIPS_MATCH_SEC=LLMNode._LIPS_MATCH_SEC)
+    import collections
+    s._lips_evidence = collections.deque([{'segment_id': 6, 't_end': 90.0, 'who': 'primary'},
+                                          {'segment_id': 7, 't_end': 99.0, 'who': 'offscreen'}])
+    assert LLMNode._await_lips(s, 100.0)['segment_id'] == 7
+    assert LLMNode._await_lips(s, 100.0) is None       # already used; seg 6 too old
+    # arrives a moment after the text (the usual order)
+    def late():
+        time.sleep(0.01)
+        LLMNode._speaker_evidence_cb(s, String(data=json.dumps(
+            {'segment_id': 8, 't_end': 100.5, 'who': 'primary'})))
+    s._LIPS_WAIT_SEC = 1.0
+    threading.Thread(target=late).start()
+    assert LLMNode._await_lips(s, 101.0)['segment_id'] == 8
+
+
+def test_sv_rejected_but_lips_say_interlocutor(monkeypatch):
+    # Live 2026-10-05: the SV anchor stayed Artur's, Nicole in view spoke — her
+    # phrases came as "another person". Lips + gaze override SV, voice is learned.
+    _run_threads_now(monkeypatch)
+    s = _stub()
+    s._addressing_reason = lambda text: None
+    s._lips_ev = {'who': 'primary', 'lips': 'speaking', 'gaze': True,
+                  'excess': 0.08, 'segment_id': 21}
+    LLMNode.command_callback(s, String(data='зачем ходить в школу'), other_speaker=True)
+    assert s._queried == ['зачем ходить в школу']
+    assert s._query_kw[-1]['other_speaker'] is False
+    assert json.loads(s._sv_confirm_pub.msgs[-1].data) == {'segment_id': 21}
+
+    # lips 'unknown' or not looking → still another person (needs the name)
+    for ev in ({'who': 'unknown', 'lips': 'unknown', 'gaze': True},
+               {'who': 'primary', 'lips': 'speaking', 'gaze': False}):
+        s._lips_ev = ev
+        s._processing = False
+        LLMNode.command_callback(s, String(data='налево нет'), other_speaker=True)
+    assert s._queried == ['зачем ходить в школу'] and len(s._sv_confirm_pub.msgs) == 1
+
+
+def test_await_lips_keeps_rejected_and_accepted_apart():
+    import collections
+    s = types.SimpleNamespace(_lips_cond=threading.Condition(), _lips_used_seg=None,
+                              _LIPS_WAIT_SEC=0.01, _LIPS_MATCH_SEC=LLMNode._LIPS_MATCH_SEC,
+                              _lips_evidence=collections.deque(
+                                  [{'segment_id': 3, 't_end': 99.0, 'sv_rejected': True}]))
+    assert LLMNode._await_lips(s, 100.0) is None
+    assert LLMNode._await_lips(s, 100.0, sv_rejected=True)['segment_id'] == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# identity_manager: a voice goes to the person's DB gallery only if their lips spoke
+
+def test_voice_saved_to_db_only_when_lips_confirm(monkeypatch):
+    from inmoov_cognition.identity_manager_node import IdentityManagerNode as IM
+    saved, logs = [], []
+    monkeypatch.setattr('inmoov_cognition.identity_manager_node.threading.Thread',
+                        lambda target, args=(), daemon=None: types.SimpleNamespace(
+                            start=lambda: saved.append(args)))
+    now = time.time()
+    s = types.SimpleNamespace(
+        _lock=threading.Lock(), _current_person={'person_id': 10},
+        _session_voice_save_count=0, _session_voice_last_save_ts=0.0,
+        _SV_SESSION_MAX=IM._SV_SESSION_MAX, _VOICE_SAVE_WAIT_SEC=IM._VOICE_SAVE_WAIT_SEC,
+        _VOICE_SAVE_MATCH_SEC=IM._VOICE_SAVE_MATCH_SEC, _add_voice_to_gallery=None,
+        get_logger=lambda: types.SimpleNamespace(info=logs.append))
+    s._expire_voice_saves = lambda t: IM._expire_voice_saves(s, t)
+    s._pending_voice_saves = [{'person_id': 10, 'emb': [1], 'ts': now - 1.0, 'added': now - 0.5}]
+    # Live 2026-10-04: Herman spoke, Nicole (in frame) silent → not saved
+    IM._resolve_voice_saves(s, {'t_end': now - 0.9, 'who': 'offscreen', 'lips': 'silent'})
+    assert saved == [] and s._pending_voice_saves == []
+    s._pending_voice_saves = [{'person_id': 10, 'emb': [2], 'ts': now - 1.0, 'added': now - 0.5}]
+    IM._resolve_voice_saves(s, {'t_end': now - 0.9, 'who': 'primary', 'lips': 'speaking'})
+    assert saved == [(10, [2], now - 1.0)] and s._session_voice_save_count == 1
+    # no lip verdict in time → dropped
+    s._pending_voice_saves = [{'person_id': 10, 'emb': [3], 'ts': now - 9, 'added': now - 9}]
+    IM._expire_voice_saves(s, now)
+    assert s._pending_voice_saves == [] and len(saved) == 1

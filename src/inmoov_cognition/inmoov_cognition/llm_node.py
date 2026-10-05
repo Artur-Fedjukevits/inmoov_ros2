@@ -24,6 +24,12 @@ Tools:
 
 Topics:
   /voice_command   (in)  String — text from Whisper STT
+  /voice_command_other (in) String — STT of a phrase by someone other than the
+                         interlocutor (SV-rejected); answered only if it names the robot
+  /speaker_evidence (in) String JSON — identity_manager lips+gaze per phrase: vetoes
+                         a gaze-only address when the face in view did not speak
+  /voice/sv_confirm (out) String JSON {segment_id} — an SV-rejected phrase the lips
+                         showed was the interlocutor's → voice_detector adds its voice
   /wake_detected   (in)  Bool   — wake word; opens the addressee gate while no face is in view
   /llm_response    (out) String JSON {text, voice_instruct} → BT Blackboard
   /robot_events    (out) String JSON — physical commands (move/arm/head/sleep/search) → BT
@@ -38,6 +44,7 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import base64
+import collections
 import concurrent.futures
 import datetime
 import json
@@ -212,7 +219,8 @@ TOOLS = [
                         'enum': ['head', 'partial', 'full'],
                         'description': (
                             'For head: how much torso to add to the head turn. '
-                            '"head" (default) — head only, for an ordinary glance/orientation. '
+                            '"head" (default) — an ordinary glance/orientation; for |pan| >= 20 the '
+                            'torso follows ~30% automatically so head and torso face the same way. '
                             '"partial" — head + ~30% torso rotation same direction as pan; use when '
                             'the person explicitly says they are standing/sitting off to that side '
                             'and a head-only turn will not be enough to bring them into camera view. '
@@ -553,7 +561,8 @@ TOOLS = [
                         'type': 'string',
                         'enum': ['head', 'partial', 'full'],
                         'description': (
-                            '"head" (по умолчанию) — только голова, обычный взгляд в сторону. '
+                            '"head" (по умолчанию) — обычный взгляд в сторону; при |pan| >= 20 корпус '
+                            'автоматически доворачивается на ~30% туда же, голова и корпус всегда смотрят в одну сторону. '
                             '"partial" — голова + ~30% поворота корпуса туда же; используй, когда '
                             'собеседник явно сказал что стоит/сидит сбоку и одной головы не хватит, '
                             'чтобы он попал в кадр. '
@@ -620,10 +629,43 @@ _ECHO_QUESTION_RE = re.compile(
 # the addressee gate still clearly wasn't meant for the robot (a phone call,
 # talking to someone else in the room) — see _build_addressing_block/_query_llm.
 _NOT_ADDRESSED_MARKER = '[ignore]'
+# /voice/speaker older than this does not belong to the current utterance
+_SPEAKER_FRESH_SEC = 4.0
+# Who said a user turn, prefixed to its text in the history once more than one
+# person talks to the robot (see LLMNode._speaker_tag)
+_SPEAKER_TAG_PREFIX = '[Говорит '
+_SPEAKER_TAG_RE = re.compile(r'\[Говорит [^\]]{1,60}\]:\s*')
+
+
+def _speaker_tag(name: str) -> str:
+    return f'{_SPEAKER_TAG_PREFIX}{name}]: '
 
 
 def _is_not_addressed(text: str) -> bool:
     return text.lstrip().startswith(_NOT_ADDRESSED_MARKER)
+
+
+# Qwen3 at low temperature sometimes parrots the user's utterance back ("Нет, Лёня,
+# я справа." → "Лёня, я справа."); once one parrot lands in the history it keeps
+# doing it every turn. Live bug 2026-09-30. A sentence counts as an echo when
+# (almost) all of its words come from the user's utterance.
+_ECHO_MIN_WORDS   = 3
+_ECHO_WORD_SHARE  = 0.9
+_REPEAT_REQUEST_RE = re.compile(r'\b(?:повтори|скажи|произнеси)', re.IGNORECASE)
+
+
+def _echo_words(text: str) -> list[str]:
+    return re.findall(r'\w+', text.lower().replace('ё', 'е'))
+
+
+def _is_user_echo(text: str, user_text: str) -> bool:
+    if not user_text or _REPEAT_REQUEST_RE.search(user_text):
+        return False   # "повтори за мной ..." — repeating is the answer
+    words = _echo_words(text)
+    if len(words) < _ECHO_MIN_WORDS:
+        return False
+    user_words = set(_echo_words(user_text))
+    return sum(w in user_words for w in words) / len(words) >= _ECHO_WORD_SHARE
 
 # Qwen3 sometimes switches to Chinese on creative tasks — strip ideographs from TTS chunks
 _CJK_RE = re.compile(
@@ -739,6 +781,7 @@ def _clean_llm_text(text: str) -> str:
     """Strip stage directions, CJK, decorative markers and unrecognized inline
     tags that LLM injects."""
     cleaned = _STAGE_DIR_RE.sub('', text)
+    cleaned = _SPEAKER_TAG_RE.sub('', cleaned)   # the model copying the history's tags
     cleaned = _CJK_RE.sub('', cleaned)
     cleaned = _filter_inline_tags(cleaned)
     cleaned = re.sub(r'  +', ' ', cleaned).strip()
@@ -982,10 +1025,60 @@ def _build_addressing_block(addressing: str | None) -> str:
     )
 
 
+def _build_speaker_block(speaker: dict | None) -> str:
+    """Who is speaking by voice vs who is in frame (/voice/speaker from
+    identity_manager). The robot may look at one person while another one, out
+    of frame, talks to it — live bug 2026-09-30: "смотрю на Николь", Artur said
+    "я справа", the LLM took it as Николь's words and started parroting.
+    speaker — the fresh /voice/speaker for this utterance, None — no block."""
+    if not speaker:
+        return ''
+    if speaker.get('other_speaker'):
+        return _build_other_speaker_block(speaker)
+    conf    = speaker.get('confidence')
+    name    = speaker.get('name') or ''
+    face    = speaker.get('face_name') or ''
+    in_view = bool(speaker.get('face_visible')) or bool(face)
+    # No quoted example phrases here: with «я справа» quoted, Qwen started
+    # parroting the user again (checked against the server 2026-09-30).
+    if conf == 'high' and name:
+        if face == name:
+            return f'\nКто говорит: {name} (узнал по голосу, он же у тебя в кадре).\n'
+        if face:
+            return (f'\nКто говорит: {name} (узнал по голосу). В кадре у тебя {face} — '
+                    f'это не говорящий, {name} сейчас, скорее всего, вне кадра.\n')
+        return f'\nКто говорит: {name} (узнал по голосу), в кадре его нет.\n'
+    guess = f', немного похож на {name}' if conf == 'uncertain' and name else ''
+    if in_view:
+        return (f'\nКто говорит: неизвестно (голос не опознан{guess}). В кадре кто-то есть, '
+                f'но это не обязательно говорящий — он может быть вне кадра.\n')
+    return f'\nКто говорит: неизвестно (голос не опознан{guess}), в кадре никого нет.\n'
+
+
+def _build_other_speaker_block(speaker: dict) -> str:
+    """The phrase came from someone other than the current interlocutor (SV
+    rejected the voice) who called the robot by name — multi-person talk."""
+    conf = speaker.get('confidence')
+    name = speaker.get('name') or ''
+    face = speaker.get('face_name') or ''
+    if conf == 'high' and name:
+        who = f'{name} (узнал по голосу)'
+    elif conf == 'uncertain' and name:
+        who = f'другой человек, голос немного похож на {name}'
+    else:
+        who = 'другой человек, голос не опознан'
+    main = f' (твой собеседник сейчас — {face})' if face else ''
+    return (f'\nКто говорит: {who}. Это НЕ твой текущий собеседник{main}, а ещё один '
+            f'человек рядом, он позвал тебя по имени — ответь именно ему. Рядом несколько '
+            f'людей: реплики в истории помечены «[Говорит …]:», не путай, кто что сказал. '
+            f'Свой ответ такой пометкой не начинай.\n')
+
+
 def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
                         memory_context: str = '', scene_ctx: dict | None = None,
                         face_search_ctx: dict | None = None,
-                        addressing: str | None = None) -> str:
+                        addressing: str | None = None,
+                        speaker: dict | None = None) -> str:
     """Builds the system prompt with the device schema and the interlocutor's context.
 
     oh_schema — JSON string with the OpenHAB schema (name/label/type/options, no state).
@@ -1065,6 +1158,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
     scene_block       = _build_scene_block(scene_ctx)
     face_search_block = _build_face_search_block(face_search_ctx)
     addressing_block  = _build_addressing_block(addressing)
+    speaker_block     = _build_speaker_block(speaker)
 
     # IMPORTANT: the whole DYNAMIC block (person_block/memory_block/scene_block —
     # time, interlocutor, recent events, surrounding scene — changes on EVERY
@@ -1110,7 +1204,7 @@ def build_system_prompt(oh_schema: str, person_ctx: dict | None = None,
 - Если цель команды широкая или неточная ("выключи везде", "выключи весь свет", "выключи всё", "во всём доме") — это означает ВСЕ устройства группы AllLights (для света) или All_Heaters (для отопления). СНАЧАЛА вызови search_openhab_items(group_filter=AllLights, state_filter="ON") чтобы найти включённые устройства, ЗАТЕМ вызови items_control для КАЖДОГО найденного. Не отвечай текстом вместо этой последовательности вызовов.
 
 {devices_block}
-{person_block}{memory_block}{scene_block}{face_search_block}{addressing_block}"""
+{person_block}{memory_block}{scene_block}{face_search_block}{addressing_block}{speaker_block}"""
 
 
 _RU_WEEKDAY = {
@@ -1230,6 +1324,9 @@ class LLMNode(LifecycleNode):
         # Interlocutor's gaze: True/False/None (None = no face / no data from the detector)
         # Used to filter out speech not addressed to the robot, see _addressing_reason.
         self._looking_at_robot: bool | None = None
+        # identity_manager: an unknown face is waiting silently — an addressed
+        # utterance starts the introduction instead of going to the LLM.
+        self._introduce_on_address = False
         self._social_ctx_ts: float = 0.0   # monotonic time of the last /social_context
         self._wake_ts:       float = 0.0   # monotonic time of the last wake word
 
@@ -1245,6 +1342,11 @@ class LLMNode(LifecycleNode):
         # Face-search status from behavior_manager_node (/behavior/face_search_status)
         # — inserted into the system prompt via _build_face_search_block
         self._face_search_status: dict = {}
+        self._speaker: dict = {}   # /voice/speaker — who spoke the last utterance (voice-id)
+        # /speaker_evidence (lips + gaze per phrase) for the gaze veto, see _gaze_lips_check
+        self._lips_cond     = threading.Condition()
+        self._lips_evidence = collections.deque(maxlen=8)
+        self._lips_used_seg = None
         # Accumulates the transcript of the current dialogue
         self._dialogue_lines: list[str] = []
 
@@ -1371,6 +1473,10 @@ class LLMNode(LifecycleNode):
         payload = dict(payload)
         payload['stream'] = True
         payload['stream_options'] = {'include_usage': True}
+        # vLLM rejects `tools: []` with HTTP 400 ("must not be an empty array") —
+        # R3 sends exactly that, and the reply was lost. Live bug 2026-09-30.
+        if not payload.get('tools'):
+            payload.pop('tools', None)
 
         urls = [self._active_url]
         other = self.llm_fallback_url if self._active_url == self.llm_url \
@@ -1494,7 +1600,7 @@ class LLMNode(LifecycleNode):
         self._tg_resp_pub.publish(msg)
         self.get_logger().debug(f'TG partial: "{text[:50]}"')
 
-    def _stream_with_tts(self, payload: dict) -> tuple[str, list]:
+    def _stream_with_tts(self, payload: dict, echo_of: str = '') -> tuple[str, list]:
         """
         Streams the LLM's response and speaks it as it becomes ready via the 'speak'
         action (POST /tts/stream on the TTS server — OmniVoice
@@ -1502,6 +1608,8 @@ class LLMNode(LifecycleNode):
         rather than one WS session for the whole response).
         Returns (full_content, api_tool_calls).
         Stops sending to TTS once a tool-call marker is detected.
+        echo_of — the user's utterance: leading sentences that merely parrot it
+        (_is_user_echo) are not spoken; the caller decides what to do with the reply.
         """
         with self._lock:
             voice_style = self._voice_style.get('emotion', '')
@@ -1515,6 +1623,15 @@ class LLMNode(LifecycleNode):
         first_chunk_sent          = False
         chunk_buf: list[str]      = []  # sentences waiting to be sent as one TTS request
         chunk_chars                = 0
+        echo_prefix                = bool(echo_of)  # every sentence so far parroted the user
+
+        def _is_echo(sentence: str) -> bool:
+            nonlocal echo_prefix
+            if echo_prefix and _is_user_echo(sentence, echo_of):
+                self.get_logger().warn(f'Echo filter: dropped "{sentence[:60]}"')
+                return True
+            echo_prefix = False
+            return False
 
         def _flush_chunk(force: bool = False):
             """Sends the accumulated block as a single Speak goal.
@@ -1577,6 +1694,8 @@ class LLMNode(LifecycleNode):
                             if not first_chunk_sent and _ECHO_QUESTION_RE.match(sentence):
                                 self.get_logger().warn(
                                     f'Echo-question filter: dropped "{sentence[:60]}"')
+                            elif _is_echo(sentence):
+                                pass
                             elif tg_req_id:
                                 self._tg_stream_partial(sentence, tg_req_id)
                             else:
@@ -1607,7 +1726,7 @@ class LLMNode(LifecycleNode):
                     tail = tail[m_end:].strip()
                     self.get_logger().warn(
                         f'Echo-question filter: dropped "{buf.strip()[:m_end][:60]}"')
-                if tail:
+                if tail and not _is_echo(tail):
                     if tg_req_id:
                         self._tg_stream_partial(tail, tg_req_id)
                     else:
@@ -1707,6 +1826,29 @@ class LLMNode(LifecycleNode):
     _UNK_NAME_RE = re.compile(r'^л[а-яё]?\*[а-яё]{0,3}$')
     _GAZE_CTX_STALE_SEC = 2.0   # /social_context comes @ 2 Hz
 
+    def _has_robot_name(self, text: str) -> bool:
+        low   = text.lower().replace('<unk>', '*')
+        words = re.findall(r'[а-яёі*]+', low)
+        vocative = set(words[:1]) | set(re.findall(r'[,.!?]\s*([а-яёі]+)\s*[,.!?]', low))
+        return bool(self._ROBOT_NAMES.intersection(words)
+                    or self._ROBOT_NAMES_FIRST_WORD.intersection(vocative)
+                    or any(self._UNK_NAME_RE.match(w) for w in words))
+
+    def _split_at_name(self, text: str) -> str:
+        """A recording that glued table talk to an address by name ("…чипсы. Это на
+        следующий. Лёня, ты знаешь…", live 2026-10-03): marks the talk before the
+        sentence with the name as background, so the LLM answers the address.
+        Text unchanged if the name is in the first sentence (or absent)."""
+        sentences = [x for x in re.split(r'(?<=[.!?…])\s+', text.strip()) if x]
+        for i, sent in enumerate(sentences):
+            if self._has_robot_name(sent):
+                if i == 0:
+                    return text
+                before = ' '.join(sentences[:i])
+                return (f'[Перед обращением звучал разговор, возможно не тебе: «{before}»]\n'
+                        f'{" ".join(sentences[i:])}')
+        return text
+
     def _addressing_reason(self, text: str) -> str | None:
         """Why a voice utterance counts as addressed to the robot, None if it doesn't.
 
@@ -1717,12 +1859,7 @@ class LLMNode(LifecycleNode):
         Everything else — a face looking away, or no face and no recent wake word
         (person walked off mid-dialogue) — is not the robot's business.
         """
-        low   = text.lower().replace('<unk>', '*')
-        words = re.findall(r'[а-яёі*]+', low)
-        vocative = set(words[:1]) | set(re.findall(r'[,.!?]\s*([а-яёі]+)\s*[,.!?]', low))
-        if (self._ROBOT_NAMES.intersection(words)
-                or self._ROBOT_NAMES_FIRST_WORD.intersection(vocative)
-                or any(self._UNK_NAME_RE.match(w) for w in words)):
+        if self._has_robot_name(text):
             return 'name'
         now = time.monotonic()
         with self._lock:
@@ -1741,7 +1878,13 @@ class LLMNode(LifecycleNode):
             with self._lock:
                 self._wake_ts = time.monotonic()
 
-    def command_callback(self, msg: String):
+    def other_command_callback(self, msg: String):
+        """A phrase by someone other than the current interlocutor (voice_detector
+        SV rejected the voice → STT → voice_command_other). Multi-person talk:
+        answered only when it calls the robot by name."""
+        self.command_callback(msg, other_speaker=True)
+
+    def command_callback(self, msg: String, other_speaker: bool = False):
         text = msg.data.strip()
         if not text:
             return  # voice_detector publishes an empty string on silence — ignore it
@@ -1750,6 +1893,12 @@ class LLMNode(LifecycleNode):
         # wake word — ignore.
         # Runs before the lock: _addressing_reason takes it itself.
         addressing = self._addressing_reason(text)
+        if other_speaker:
+            # SV says: not the interlocutor's voice. The lips may say otherwise —
+            # checked off the executor thread (the evidence arrives via a callback)
+            threading.Thread(target=self._other_speaker_check,
+                             args=(text, time.time(), addressing), daemon=True).start()
+            return
         if addressing is None:
             with self._lock:
                 looking = self._looking_at_robot
@@ -1757,8 +1906,98 @@ class LLMNode(LifecycleNode):
                 f'LLM: speech not addressed to the robot (gaze={looking}, no name, '
                 f'no recent wake word) — skipping: "{text[:60]}"')
             return
-        self.get_logger().info(f'LLM: addressed to the robot ({addressing})')
+        else:
+            self.get_logger().info(f'LLM: addressed to the robot ({addressing})')
 
+        if addressing == 'gaze' and not other_speaker:
+            # Gaze alone lets in speech by someone off-screen while the face in view
+            # just looks this way (live 2026-10-04: "You change one year." — lips of
+            # the face in view still). Check the lips first; the wait is off the
+            # executor thread (the evidence arrives through a callback).
+            threading.Thread(target=self._gaze_lips_check, args=(text, time.time()),
+                             daemon=True).start()
+            return
+        self._accept_command(text, addressing, other_speaker)
+
+    # /speaker_evidence (identity_manager) waited for after the STT text: it comes
+    # ~0.5 s after the phrase's end + lip analysis, usually within STT time
+    _LIPS_WAIT_SEC   = 1.5
+    _LIPS_MATCH_SEC  = 5.0   # evidence of a phrase that ended this long before the text
+
+    def _speaker_evidence_cb(self, msg: String):
+        try:
+            ev = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if ev.get('t_end') is None:
+            return
+        with self._lips_cond:
+            self._lips_evidence.append(ev)
+            self._lips_cond.notify_all()
+
+    def _await_lips(self, t_text: float, sv_rejected: bool = False) -> dict | None:
+        """Lip evidence of the phrase whose STT text arrived at t_text (wall clock),
+        None if it doesn't come in _LIPS_WAIT_SEC (no face / lips off). sv_rejected
+        picks the evidence of an SV-rejected phrase (voice_command_other) or not."""
+        deadline = time.monotonic() + self._LIPS_WAIT_SEC
+        with self._lips_cond:
+            while True:
+                for ev in reversed(self._lips_evidence):
+                    if (t_text - self._LIPS_MATCH_SEC <= ev['t_end'] <= t_text + 0.1
+                            and bool(ev.get('sv_rejected')) == sv_rejected
+                            and ev.get('segment_id') != self._lips_used_seg):
+                        self._lips_used_seg = ev.get('segment_id')
+                        return ev
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self._lips_cond.wait(left)
+
+    def _other_speaker_check(self, text: str, t_text: float, addressing: str | None):
+        """A phrase SV rejected (not the anchor's voice). If the face in view spoke it
+        — lips moved with the speech, nobody else's did, it looked at the robot —
+        it IS the interlocutor and SV was wrong (live 2026-10-05: the anchor stayed
+        on the previous person). Then it's handled as theirs and its voice joins
+        the live SV gallery (/voice/sv_confirm). Otherwise another person: answered
+        only when calling the robot by name."""
+        ev = self._await_lips(t_text, sv_rejected=True)
+        if ev and ev.get('who') == 'primary' and ev.get('lips') == 'speaking' and ev.get('gaze'):
+            self.get_logger().info(
+                f'LLM: SV said another voice, but the face in view spoke it '
+                f'(lips excess={ev.get("excess")}, gaze) — the interlocutor')
+            self._sv_confirm_pub.publish(String(data=json.dumps(
+                {'segment_id': ev.get('segment_id')})))
+            self._accept_command(text, addressing if addressing == 'name' else 'gaze',
+                                 False, lips_who='primary')
+            return
+        # The gaze / wake word belong to the interlocutor, not to this voice
+        if addressing != 'name':
+            self.get_logger().info(
+                f'LLM: another person, no robot name — skipping: "{text[:60]}"')
+            return
+        self.get_logger().info('LLM: another person called the robot by name')
+        self._accept_command(text, addressing, True)
+
+    def _gaze_lips_check(self, text: str, t_text: float):
+        """Gaze passed the gate — veto it if the lips show someone else spoke:
+        the face in view stayed silent ('offscreen') or another face talked
+        ('other_face'). 'unknown' lips don't veto (shadow run 2026-10-03/04: this
+        rule blocked 3 of ~50 gaze phrases, all 3 not addressed; requiring a positive
+        'primary' would have cut 2 real questions). An unknown face is stricter:
+        gaze introduces only with lips positively matching ('primary')."""
+        ev  = self._await_lips(t_text)
+        who = ev.get('who') if ev else None
+        if who in ('offscreen', 'other_face'):
+            self.get_logger().info(
+                f'LLM: gaze vetoed by lips (who={who}, lips={ev.get("lips")}, '
+                f'excess={ev.get("excess")}) — skipping: "{text[:60]}"')
+            return
+        self.get_logger().info(f'LLM: gaze confirmed by lips (who={who or "no data"})')
+        self._accept_command(text, 'gaze', False, lips_who=who)
+
+    def _accept_command(self, text: str, addressing: str, other_speaker: bool,
+                        lips_who: str | None = None):
+        """An utterance that passed the addressee gate → introduction or the LLM."""
         # Parsing the voice direction hint — independent of, and before, the LLM request
         # (doesn't block/slow down the response). Published on EVERY addressed
         # utterance (even direction='none') — this is both a hint and the
@@ -1769,12 +2008,40 @@ class LLMNode(LifecycleNode):
             {'direction': direction, 'phrase': phrase, 'text': text[:80]}, ensure_ascii=False)
         self._direction_hint_pub.publish(hint_msg)
 
+        if addressing == 'name':
+            split = self._split_at_name(text)
+            if split != text:
+                self.get_logger().info('LLM: name mid-recording — earlier talk marked as background')
+                text = split
+
         with self._lock:
             if self._introducing:
                 self.get_logger().debug('LLM: /introducing=True — command ignored')
                 return
+            # The introduction is for the unknown face in view — another voice is
+            # not necessarily that face, so it just gets an LLM answer
+            intro_on_address = (not other_speaker and self._introduce_on_address and
+                                time.monotonic() - self._social_ctx_ts <= self._GAZE_CTX_STALE_SEC)
+        if intro_on_address:
+            # Gaze alone is too weak for a stranger — they face the robot while talking
+            # to someone else, or another person speaks (live 2026-10-03: "Не мерить."
+            # with the watcher's lips still). Gaze introduces only when the lips show
+            # that very face spoke; otherwise the name or the wake word is needed.
+            if addressing == 'gaze' and lips_who != 'primary':
+                self.get_logger().info(
+                    f'LLM: unknown person, gaze without their lips speaking '
+                    f'(who={lips_who or "no data"}) — skipping: "{text[:60]}"')
+                return
+            # An unknown person spoke to the robot: identity_manager answers with the
+            # introduction ("Привет! Мы ещё не знакомы...") — not the LLM.
+            self.get_logger().info('LLM: unknown person addressed the robot → introduction')
+            self._speech_addressed_pub.publish(String(data=text))
+            return
+
+        tag = self._speaker_tag(other_speaker)
+        with self._lock:
             if self._processing:
-                replaced = self._pending.put(text)
+                replaced = self._pending.put((text, tag, other_speaker))
                 self.get_logger().info(
                     f'LLM is busy — command queued{" (replaced the previous one)" if replaced else ""}: '
                     f'"{text[:60]}"')
@@ -1785,9 +2052,31 @@ class LLMNode(LifecycleNode):
         _cancel.data = True
         self._tts_cancel_pub.publish(_cancel)
         threading.Thread(
-            target=self._query_llm, args=(text,), kwargs={'addressing': addressing},
+            target=self._query_llm, args=(text,),
+            kwargs={'addressing': addressing, 'speaker_tag': tag,
+                    'other_speaker': other_speaker},
             daemon=True,
         ).start()
+
+    def _speaker_tag(self, other_speaker: bool) -> str | None:
+        """History prefix naming who said this turn. Another person's phrase is
+        always tagged; the interlocutor's — only once someone else has spoken in
+        this history (until then it's a plain one-on-one dialogue)."""
+        with self._lock:
+            sp = self._speaker
+            if (time.time() - sp.get('ts', 0.0) >= _SPEAKER_FRESH_SEC
+                    or bool(sp.get('other_speaker')) != other_speaker):
+                sp = {}   # stale, or the voice-id of a different phrase
+            multi = any(m.get('role') == 'user'
+                        and str(m.get('content', '')).startswith(_SPEAKER_TAG_PREFIX)
+                        for m in self.history)
+            face_name = (self._person_context or {}).get('name') or ''
+        name = sp.get('name', '') if sp.get('confidence') == 'high' else ''
+        if other_speaker:
+            return _speaker_tag(name or 'другой человек, голос не опознан')
+        if multi:
+            return _speaker_tag(name or face_name or 'собеседник')
+        return None
 
     def _telegram_ask_cb(self, msg: String):
         """Request from telegram_bridge_node: JSON {request_id, text, person_ctx?, image_base64?}.
@@ -1841,7 +2130,8 @@ class LLMNode(LifecycleNode):
 
     def _query_llm(self, user_text: str, person_ctx_override: dict | None = None,
                     image_b64: str | None = None, source: str = 'voice',
-                    addressing: str = ''):
+                    addressing: str = '', speaker_tag: str | None = None,
+                    other_speaker: bool = False):
         _t0 = time.time()
         if source != 'voice':
             addressing = None   # no addressee question outside voice
@@ -1864,10 +2154,24 @@ class LLMNode(LifecycleNode):
                                       else _strip_episodic_memory(self._memory_context))
                 scene_ctx         = self._scene_context
                 face_search_ctx   = self._face_search_status
+                # Only a fresh voice-id belongs to this utterance (it arrives before
+                # the STT text: same recording, lookup is faster than STT)
+                # …and only the voice-id of the same kind of phrase: another
+                # person's lookup must not describe the interlocutor's turn
+                speaker = (self._speaker
+                           if addressing is not None
+                           and time.time() - self._speaker.get('ts', 0.0) < _SPEAKER_FRESH_SEC
+                           and bool(self._speaker.get('other_speaker')) == other_speaker
+                           else None)
 
             system_prompt = build_system_prompt(
                 oh_schema, person_ctx, memory_context, scene_ctx, face_search_ctx,
-                addressing)
+                addressing, speaker)
+            if speaker:
+                self.get_logger().info(
+                    f'Speaker for this turn: {speaker.get("name") or "?"} '
+                    f'({speaker.get("confidence")}, sim={speaker.get("similarity")}), '
+                    f'in frame: {speaker.get("face_name") or ("face" if speaker.get("face_visible") else "nobody")}')
             if scene_ctx:
                 _scene_age = time.time() - scene_ctx.get('updated_at', 0)
                 _scene_labels = [o['label'] for o in scene_ctx.get('objects', [])]
@@ -1878,7 +2182,9 @@ class LLMNode(LifecycleNode):
                 self.get_logger().info(
                     'Scene context for this turn: empty (scene_manager_node not responding?)')
 
-            self.history.append({'role': 'user', 'content': user_text})
+            # Who said it, when several people talk (see _speaker_tag)
+            turn_text = f'{speaker_tag}{user_text}' if speaker_tag else user_text
+            self.history.append({'role': 'user', 'content': turn_text})
             # Trim the history: count user messages as turns (not raw entries).
             # One turn with a tool call = 3-4 entries, so a raw count would be wrong.
             while sum(1 for m in self.history if m['role'] == 'user') > self.history_max:
@@ -1888,13 +2194,13 @@ class LLMNode(LifecycleNode):
 
             messages = [{'role': 'system', 'content': system_prompt}]
             messages += self.history if self.keep_history else \
-                        [{'role': 'user', 'content': user_text}]
+                        [{'role': 'user', 'content': turn_text}]
             if image_b64:
                 # self.history holds a text placeholder (see the append above) —
                 # the image is only substituted into the outgoing messages; the last
                 # user message is always this very turn.
                 messages[-1] = {**messages[-1],
-                                 'content': _build_user_content(user_text, image_b64)}
+                                 'content': _build_user_content(turn_text, image_b64)}
 
             payload = {
                 'model':       self.model,
@@ -1906,7 +2212,21 @@ class LLMNode(LifecycleNode):
                 'chat_template_kwargs': {'enable_thinking': False},
             }
 
-            full_content, api_tool_calls_r1 = self._stream_with_tts(payload)
+            full_content, api_tool_calls_r1 = self._stream_with_tts(payload, echo_of=user_text)
+            if not api_tool_calls_r1 and _is_user_echo(full_content.strip(), user_text):
+                # Parroted the user (not spoken — see echo_of). One retry with a nudge,
+                # through the normal R1 path: with it the model does what was asked
+                # (e.g. calls look_direction). The Qwen template only allows a system
+                # message first — hence a user-role note.
+                self.get_logger().warn(
+                    f'LLM parroted the user: "{full_content.strip()[:60]}" — retrying R1')
+                payload = dict(payload)
+                payload['messages'] = messages + [{
+                    'role': 'user',
+                    'content': '[Системная заметка]: ты только что дословно повторил реплику '
+                               'пользователя — так нельзя. Не повторяй его слова, ответь ему '
+                               'по существу или выполни просьбу инструментом.'}]
+                full_content, api_tool_calls_r1 = self._stream_with_tts(payload, echo_of=user_text)
             response_msg = {
                 'role':       'assistant',
                 'content':    full_content,
@@ -2016,6 +2336,23 @@ class LLMNode(LifecycleNode):
                     self.get_logger().info(
                         f'robot_control/broadcast_message: skipping R2 — '
                         f'the BT handles speech ({time.time()-_t0:.1f}s)')
+                    # Exception: goodbye. The BT has no Speak for it (unlike sleep →
+                    # /robot/sleep_text) — it only tears the session down, and after
+                    # go_idle person_present=False would kill a BT Speak anyway. The
+                    # farewell phrase goes straight to TTS, past the BT gate.
+                    for tc in tool_calls:
+                        if tc['function']['name'] != 'robot_control':
+                            continue
+                        _args = tc['function'].get('arguments', {})
+                        if isinstance(_args, str):
+                            _args = json.loads(_args)
+                        if _args.get('action') == 'goodbye':
+                            bye = (_args.get('text') or _args.get('speak_text') or '').strip()
+                            if bye:
+                                with self._lock:
+                                    _vs = self._voice_style.get('emotion', '')
+                                self.get_logger().info(f'Goodbye phrase → TTS: "{bye}"')
+                                self._send_tts_chunk(bye, _vs)
                 else:
                     # The tools returned data — the LLM is needed to form the reply.
                     # web_search removed from tools: if the search already ran (successfully or
@@ -2210,6 +2547,13 @@ class LLMNode(LifecycleNode):
                     f'robot ({time.time()-_t0:.1f}s): "{user_text[:60]}"')
             else:
                 text = response_msg.get('content', '').strip()
+                if _is_user_echo(text, user_text):
+                    # Parroted again after the retry above: stay silent and keep the
+                    # parrot out of the history — otherwise the model copies it on
+                    # every next turn.
+                    self.history.pop()
+                    self.get_logger().warn(f'LLM parroted the user again: "{text[:60]}" — staying silent')
+                    return
                 self.history.append({'role': 'assistant', 'content': text})
                 self.get_logger().info(f'Text response in {time.time()-_t0:.1f}s: "{text}"')
                 # The text has already been streamed to TTS; the BT only handles the emotion/gesture
@@ -2235,9 +2579,10 @@ class LLMNode(LifecycleNode):
         No /tts_cancel_queue here, unlike command_callback: the previous reply's
         TTS may still be playing and the user should hear it — Speak goals queue.
         """
-        text = self._pending.take()
-        if not text:
+        item = self._pending.take()
+        if not item:
             return
+        text, tag, other = item if isinstance(item, tuple) else (item, None, False)
         with self._lock:
             if self._introducing:
                 self.get_logger().info(f'Queued command dropped (/introducing): "{text[:60]}"')
@@ -2247,7 +2592,9 @@ class LLMNode(LifecycleNode):
                 return
             self._processing = True
         self.get_logger().info(f'Running queued command: "{text[:60]}"')
-        threading.Thread(target=self._query_llm, args=(text,), daemon=True).start()
+        threading.Thread(target=self._query_llm, args=(text,),
+                         kwargs={'speaker_tag': tag, 'other_speaker': other},
+                         daemon=True).start()
 
     # ── Executing tool calls ────────────────────────────────────────────
 
@@ -2347,13 +2694,30 @@ class LLMNode(LifecycleNode):
         'времени — используй все вместе, один кадр может быть смазан или не в фокусе.'
     )
 
+    # The eye cameras run at 1280x960 for lip reading (face_tracker); the vision
+    # model gets 640 px wide frames — 4x fewer image tokens, same as before.
+    _LLM_IMAGE_MAX_W = 640
+
+    @classmethod
+    def _jpeg_b64_for_llm(cls, jpeg: bytes) -> str:
+        import cv2
+        import numpy as np
+        img = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is not None and img.shape[1] > cls._LLM_IMAGE_MAX_W:
+            scale = cls._LLM_IMAGE_MAX_W / img.shape[1]
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if ok:
+                jpeg = buf.tobytes()
+        return base64.b64encode(jpeg).decode()
+
     def _tool_look_and_describe(self, args: dict) -> dict:
         """A snapshot RIGHT NOW from BOTH eye cameras (left and right — in case
         one is out of focus/blurry) → analysis via a separate vision model."""
         query = (args.get('query') or '').strip() or 'Опиши коротко и по делу, что видишь.'
         with self._lock:
             left, right = self._latest_eye_jpeg, self._latest_eye_jpeg_right
-        images_b64 = [base64.b64encode(j).decode() for j in (left, right) if j]
+        images_b64 = [self._jpeg_b64_for_llm(j) for j in (left, right) if j]
         if not images_b64:
             return {'success': False, 'error': 'Камера недоступна или кадр ещё не пришёл'}
         return self._call_vision_model(images_b64, query, self._VISION_SYS_HINT)
@@ -2398,7 +2762,7 @@ class LLMNode(LifecycleNode):
         with self._lock:
             left_2, right_2 = self._latest_eye_jpeg, self._latest_eye_jpeg_right
 
-        images_b64 = [base64.b64encode(j).decode()
+        images_b64 = [self._jpeg_b64_for_llm(j)
                       for j in (left_1, right_1, left_2, right_2) if j]
         if not images_b64:
             return {'success': False, 'error': 'Камера недоступна или кадр ещё не пришёл'}
@@ -2802,9 +3166,19 @@ class LLMNode(LifecycleNode):
                 # open after the person turned away or left.
                 raw = data.get('looking_at_robot')
                 self._looking_at_robot = None if raw is None else bool(raw)
+                self._introduce_on_address = bool(data.get('introduce_on_address', False))
                 self._social_ctx_ts    = time.monotonic()
         except Exception:
             pass
+
+    def _speaker_cb(self, msg: String):
+        """Voice-id of the last utterance from identity_manager (see _build_speaker_block)."""
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        with self._lock:
+            self._speaker = data
 
     def _scene_context_cb(self, msg: String):
         """Scene summary (objects + people) from scene_manager_node → cache for the system prompt."""
@@ -3198,11 +3572,14 @@ class LLMNode(LifecycleNode):
         )
 
         self.create_subscription(String, 'voice_command',   self.command_callback,         10)
+        self.create_subscription(String, 'voice_command_other', self.other_command_callback, 10)
+        self.create_subscription(String, '/speaker_evidence', self._speaker_evidence_cb, 10)
         self.create_subscription(String, '/telegram_ask',   self._telegram_ask_cb,         10)
         self.create_subscription(String, 'search_result',   self._search_result_callback,  10)
         self.create_subscription(String, 'person_context',  self._person_context_callback, 10)
         self.create_subscription(String, '/social_context', self._social_context_cb,       10)
         self.create_subscription(String, '/scene/objects',  self._scene_context_cb,        10)
+        self.create_subscription(String, '/voice/speaker',  self._speaker_cb,              10)
         self.create_subscription(String, '/behavior/face_search_status',
                                   self._face_search_status_cb,                             10)
         self.create_subscription(String, 'openhab_schema',  self._oh_schema_callback,      10)
@@ -3226,6 +3603,8 @@ class LLMNode(LifecycleNode):
         # every addressed utterance, consumer: behavior_manager_node
         # (face-search retry). See _parse_direction_hint/command_callback.
         self._direction_hint_pub = self.create_lifecycle_publisher(String, '/voice/direction_hint', 10)
+        self._speech_addressed_pub = self.create_lifecycle_publisher(String, '/speech_addressed', 10)
+        self._sv_confirm_pub = self.create_lifecycle_publisher(String, '/voice/sv_confirm', 10)
 
         self._mem_client         = self.create_client(MemoryQuery, '/memory/query')
         self._tts_direct_client  = ActionClient(self, Speak, 'speak')
@@ -3239,6 +3618,8 @@ class LLMNode(LifecycleNode):
         self._tts_cancel_pub.on_activate(state)
         self._conv_end_pub.on_activate(state)
         self._direction_hint_pub.on_activate(state)
+        self._speech_addressed_pub.on_activate(state)
+        self._sv_confirm_pub.on_activate(state)
         self._check_servers()
         # Background warmup: wait for the schema from openhab_bridge (10-15s), then
         # send a minimal request — loads the model and fills the KV cache.
@@ -3288,6 +3669,8 @@ class LLMNode(LifecycleNode):
         self._tts_cancel_pub.on_deactivate(state)
         self._conv_end_pub.on_deactivate(state)
         self._direction_hint_pub.on_deactivate(state)
+        self._speech_addressed_pub.on_deactivate(state)
+        self._sv_confirm_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):

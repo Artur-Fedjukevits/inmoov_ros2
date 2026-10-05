@@ -10,8 +10,16 @@ Does NOT send direct commands. Data only.
 State machine:
   IDLE        — no face in frame
   RECOGNIZING — face present, waiting for identification
-  INTERACTING — we know who is in front of us, tracking emotion
-  INTRODUCING — unknown person, collecting name via voice
+  INTERACTING — someone is in front of us (known, or an unknown face waiting
+                silently), tracking emotion
+  INTRODUCING — unknown person addressed the robot, collecting name via voice
+
+Social policy (2026-10-03, "как у людей"):
+  - a known person is greeted at most once per day (persisted in greet_log_path,
+    survives IDLE and restarts); after that the robot only answers when addressed;
+  - an unknown face is NOT introduced to proactively: the robot waits silently
+    until that person addresses it (llm_node addressee gate → /speech_addressed),
+    and only then asks the name.
 
 Publishes:
   /social_context  (String JSON → behavior_manager Blackboard)
@@ -23,12 +31,16 @@ Publishes:
   /introducing     (Bool → llm_node gate)
   /face_expression (String → face_expressions_node, facial mirroring)
   /vision/enable   (Bool, latched)
+  /speaker_evidence (String JSON) — per phrase, who spoke (gaze + lips + SV)
+      and whether gaze-only vs gaze+lips gates agree; see fuse_speaker_evidence
 
 Subscribes:
   /face/identity  (String JSON)
   /face/emotion   (String JSON)
   /face/tracks    (String JSON)
   /voice_command  (String) — intercepted while in INTRODUCING state
+  /speech_addressed (String) — llm_node: an unknown face addressed the robot → introduce
+  /face/mouth_activity/{left,right} (String JSON) — face_tracker lip verdicts per phrase
 
 Author: Artur Fedjukevits
 Assisted by: Claude Code (Anthropic)
@@ -36,18 +48,99 @@ License: GNU General Public License v3.0 (see repository root LICENSE)
 """
 
 import collections
+import datetime
 import json
+import os
 import random
 import re
 import time
 import threading
 
+import numpy as np
 import requests
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String, Bool
 from inmoov_msgs.srv import MemoryQuery
+
+
+def fuse_speaker_evidence(mouth: dict, primary_tid, gaze_samples,
+                          yaw_threshold: float, frontal_fraction: float,
+                          gaze_pad_sec: float = 0.5, min_coverage: float = 0.5) -> dict:
+    """Who spoke this phrase — gaze + lips + SV. llm_node vetoes a gaze-only
+    address on who = offscreen / other_face (see its _gaze_lips_check).
+
+    mouth        — /face/mouth_activity/{side} message (face_tracker, lip_activity)
+    primary_tid  — identity_manager's primary track on that side
+    gaze_samples — [(stamp, track_id, yaw_proxy[, pitch_proxy]), ...] from /face/tracks
+
+    Gaze is taken over the phrase itself (± gaze_pad_sec), not "right now" as the
+    llm_node gate does — by the time STT is done the head may have turned.
+
+    who:
+      'primary'    — the primary face's lips moved with the speech, no other face did
+      'other_face' — another face in view spoke, the primary did not
+      'offscreen'  — the primary face stayed silent and nobody in view spoke
+      'unknown'    — not enough lip data / ambiguous
+    gaze_gate  — today's llm_node rule (gaze alone), evaluated over the phrase
+    fused_gate — proposed rule: gaze, VETOED by positive evidence that someone
+                 else spoke (who = offscreen / other_face). 'unknown' lips don't
+                 veto: requiring who='primary' rejected 2 of 8 real questions in
+                 the live run 2026-10-03 (lips 'unknown', excess 0.016 / 0.043).
+    Both gates are None for an SV-rejected phrase (it is gated by name only).
+
+    A face seen for less than min_coverage of the speech is ignored: with no rest
+    window its reference is the speech itself, and briefly visible faces all came
+    out 'speaking' (live seg#13: three tracks, coverage 0.08-0.17).
+    """
+    t0, t1 = mouth['t_start'], mouth['t_end']
+    win  = [g for g in gaze_samples
+            if g[1] == primary_tid and t0 - gaze_pad_sec <= g[0] <= t1 + gaze_pad_sec]
+    yaws = [g[2] for g in win]
+    pitches = [g[3] for g in win if len(g) > 3 and g[3] is not None]
+    gaze_frac = (sum(1 for y in yaws if y < yaw_threshold) / len(yaws)) if len(yaws) >= 2 else None
+    gaze = None if gaze_frac is None else gaze_frac >= frontal_fraction
+
+    by_tid  = {t['track_id']: t for t in mouth.get('tracks', [])
+               if t.get('coverage', 1.0) >= min_coverage}
+    primary = by_tid.get(primary_tid)
+    lips    = primary['verdict'] if primary else None
+    others  = sorted(tid for tid, t in by_tid.items()
+                     if tid != primary_tid and t['verdict'] == 'speaking')
+
+    if lips == 'speaking' and not others:
+        who = 'primary'
+    elif others and lips != 'speaking':
+        who = 'other_face'
+    elif lips == 'silent' and not others:
+        who = 'offscreen'
+    else:
+        who = 'unknown'
+
+    sv_rejected = bool(mouth.get('sv_rejected'))
+    gaze_gate   = None if sv_rejected else bool(gaze)
+    fused_gate  = None if sv_rejected else bool(gaze) and who not in ('offscreen', 'other_face')
+    return {
+        'segment_id':     mouth.get('segment_id'),
+        't_end':          t1,
+        'side':           mouth.get('side'),
+        'primary_track':  primary_tid,
+        'gaze_frac':      None if gaze_frac is None else round(gaze_frac, 2),
+        'gaze_n':         len(yaws),
+        # Diagnostics for tuning the gaze test (live 2026-10-03: "looking" at the
+        # head's hardware limit while talking to someone else)
+        'yaw_med':        round(float(np.median(yaws)), 2) if yaws else None,
+        'pitch_med':      round(float(np.median(pitches)), 2) if pitches else None,
+        'gaze':           gaze,
+        'lips':           lips,
+        'excess':         primary['excess'] if primary else None,
+        'others_speaking': others,
+        'sv_rejected':    sv_rejected,
+        'who':            who,
+        'gaze_gate':      gaze_gate,
+        'fused_gate':     fused_gate,
+    }
 
 
 class State:
@@ -93,9 +186,16 @@ class IdentityManagerNode(LifecycleNode):
         self._voice_id_grace_ts  = 0.0    # voice identification from IDLE (watchdog grace)
         # Greet cooldown by name (independent of person_id — tracker may change id)
         self._greeted_names: dict[str, float] = {}   # name → timestamp
+        self._greet_log: dict[str, str] = {}          # str(person_id) → day greeted (persisted)
+        # The unknown face in this session already went through an introduction that
+        # gave no name — don't ask again; the LLM just talks to them.
+        self._intro_declined = False
         # After an OakD veto: block _tracks_cb until the next body signal.
         # This breaks the infinite "Hello/Goodbye" loop on face_detection false positives.
         self._waiting_for_body: bool = False
+        # When the current IDLE → RECOGNIZING session started: the OakD veto counts
+        # body absence from here, not from a body seen minutes before the session.
+        self._session_start_ts: float = 0.0
 
         # Left-primary / right-fallback tracking: if the left camera is silent
         # longer than track_eye_fallback_sec — switch to the right one.
@@ -111,6 +211,9 @@ class IdentityManagerNode(LifecycleNode):
         # is gone: /social_context reports looking_at_robot=None instead of the last
         # verdict (a stale True kept the llm_node addressee gate open after leaving).
         self._gaze_ts: float = 0.0
+        # (frame stamp, track_id, yaw_proxy) of the primary track — for the speaker
+        # fusion, which looks at the gaze DURING a phrase (~20 s @ 5 Hz detection)
+        self._gaze_hist: collections.deque = collections.deque(maxlen=100)
 
         # Voice fingerprint of the current session (from voice_detector via /voice_embedding)
         self._session_voice_emb: list | None = None
@@ -120,6 +223,8 @@ class IdentityManagerNode(LifecycleNode):
         # Up to 3 recordings per session are allowed, with at least a 2-minute interval.
         self._session_voice_save_count: int = 0
         self._session_voice_last_save_ts: float = 0.0
+        # Voice embeddings waiting for the lip verdict before the DB (_resolve_voice_saves)
+        self._pending_voice_saves: list = []
 
         # Verification of a claimed identity (in INTRODUCING mode)
         # Tiers: face_sim < FACE_VETO → different person; >= FACE_ACCEPT → accept;
@@ -268,6 +373,7 @@ class IdentityManagerNode(LifecycleNode):
                         # New face from IDLE — start recognizing
                         self._primary_track = new_track
                         self._state = State.RECOGNIZING
+                        self._session_start_ts = time.time()
                         self.get_logger().info('Face detected — recognizing...')
                         self._pub_person_present(True)
                     else:
@@ -308,6 +414,17 @@ class IdentityManagerNode(LifecycleNode):
                                 self._frontal_scores.clear()
                             self._gaze_ts = now
                             self._frontal_scores.append(yaw_proxy)
+                            # Pitch-proxy (diagnostic only): where the nose sits between the
+                            # eye line (0) and the mouth line (1) — shifts when the head
+                            # tilts down/up; yaw alone misses looking at the table/phone
+                            pitch_proxy = None
+                            if len(kps) >= 5:
+                                eye_y   = (kps[0][1] + kps[1][1]) / 2.0
+                                mouth_y = (kps[3][1] + kps[4][1]) / 2.0
+                                if mouth_y - eye_y > 1.0:
+                                    pitch_proxy = (kps[2][1] - eye_y) / (mouth_y - eye_y)
+                            self._gaze_hist.append((data.get('stamp') or time.time(),
+                                                    self._primary_track, yaw_proxy, pitch_proxy))
                             if len(self._frontal_scores) >= 3:
                                 frontal_fraction = sum(
                                     1 for s in self._frontal_scores
@@ -317,6 +434,40 @@ class IdentityManagerNode(LifecycleNode):
                                     frontal_fraction >= self._gaze_frontal_fraction
                                 )
                         break
+
+    def _mouth_activity_cb(self, msg: String):
+        """Speaker fusion: logs who spoke each phrase and whether the gaze-only and
+        gaze+lips gates agree; publishes /speaker_evidence — llm_node vetoes a
+        gaze-only address with it."""
+        if self._sleeping:
+            return
+        try:
+            mouth = json.loads(msg.data)
+        except Exception:
+            return
+        with self._lock:
+            if mouth.get('side') != self._tracks_eye or self._state == State.IDLE:
+                return   # track ids of the other eye don't match _primary_track
+            primary = self._primary_track
+            hist    = list(self._gaze_hist)
+        ev = fuse_speaker_evidence(mouth, primary, hist,
+                                   self._gaze_yaw_threshold, self._gaze_frontal_fraction)
+        self._speaker_evidence_pub.publish(String(data=json.dumps(ev)))
+        self._resolve_voice_saves(ev)
+
+        if ev['sv_rejected']:
+            verdict = 'other speaker (SV) — name-only gate'
+        elif ev['gaze_gate'] == ev['fused_gate']:
+            verdict = f'agree: {"PASS" if ev["fused_gate"] else "block"}'
+        else:
+            verdict = (f'DISAGREE: gaze={"PASS" if ev["gaze_gate"] else "block"} '
+                       f'fused={"PASS" if ev["fused_gate"] else "block"}')
+        self.get_logger().info(
+            f'Speaker seg#{ev["segment_id"]}: who={ev["who"]} '
+            f'(track {primary} lips={ev["lips"]} excess={ev["excess"]}, '
+            f'others={ev["others_speaking"] or "-"}) gaze={ev["gaze"]} '
+            f'frac={ev["gaze_frac"]} n={ev["gaze_n"]} yaw={ev["yaw_med"]} '
+            f'pitch={ev["pitch_med"]} → {verdict}')
 
     def _identity_cb(self, msg: String):
         if self._sleeping:
@@ -366,6 +517,7 @@ class IdentityManagerNode(LifecycleNode):
                     self._greeted_names[name] = now
                     self._last_emotion        = 'neutral'
                 self._set_introducing(False)
+                self._mark_greeted_today(person_id)
                 threading.Thread(
                     target=self._update_seen_and_embedding,
                     args=(person_id,), daemon=True).start()
@@ -423,7 +575,7 @@ class IdentityManagerNode(LifecycleNode):
                     return
                 self.get_logger().info(
                     f'INTERACTING: unknown after {absent_sec:.0f}s absence of '
-                    f'{current_name} — starting introduction')
+                    f'{current_name} — switching to them')
                 with self._lock:
                     self._state             = State.RECOGNIZING
                     self._current_person    = {}
@@ -528,6 +680,14 @@ class IdentityManagerNode(LifecycleNode):
         except Exception:
             return
 
+        if data.get('other_speaker'):
+            # SV-rejected phrase: not the interlocutor — keep it out of the session
+            # gallery; only tell llm_node who it is (multi-person talk)
+            if self._state != State.IDLE:
+                threading.Thread(target=self._lookup_voice, args=(emb, True),
+                                 daemon=True).start()
+            return
+
         self._session_voice_emb = emb
         self._session_voice_gallery.append({'embedding': emb, 'timestamp': ts})
 
@@ -542,21 +702,33 @@ class IdentityManagerNode(LifecycleNode):
                 args=(emb,), daemon=True).start()
             return
 
-        if state == State.INTERACTING and person_id is not None:
+        # Whose voice is this: the SV anchor the phrase was accepted against. The face
+        # in view is not proof — live 2026-10-05: the anchor stayed Artur's while the
+        # face was Nicole, and Artur's phrases were being saved into Nicole's gallery
+        # (only memory_node's centroid check stopped it).
+        anchor_ok = data.get('anchor_person_id') == person_id
+        if state == State.INTERACTING and person_id is not None and not anchor_ok:
+            self.get_logger().info(
+                f'Voice embedding not saved: SV anchor is person_id='
+                f'{data.get("anchor_person_id")}, the face is {person_id}')
+        elif state == State.INTERACTING and person_id is not None:
             # Save up to _SV_SESSION_MAX recordings per session with interval _SV_SESSION_GAP.
             # memory_node will apply the 7-day rule: if the gallery is full and fresh — it skips.
             now = time.time()
             gap_ok   = (now - self._session_voice_last_save_ts) >= self._SV_SESSION_GAP
             count_ok = self._session_voice_save_count < self._SV_SESSION_MAX
             if count_ok and gap_ok:
-                self._session_voice_save_count  += 1
-                self._session_voice_last_save_ts = now
+                # Saved only once the lips confirm the face in view spoke this phrase
+                # (see _resolve_voice_saves). Live 2026-10-04: Herman's voice passed SV
+                # against Nicole's anchor (0.41) while Nicole was in frame — and went
+                # into her gallery; then Herman was recognized as Nicole by voice.
+                with self._lock:
+                    self._expire_voice_saves(now)
+                    self._pending_voice_saves.append(
+                        {'person_id': person_id, 'emb': emb, 'ts': ts, 'added': now})
                 self.get_logger().info(
-                    f'Voice embedding accepted (pid={person_id}), '
-                    f'recording {self._session_voice_save_count}/{self._SV_SESSION_MAX} — saving to DB')
-                threading.Thread(
-                    target=self._add_voice_to_gallery,
-                    args=(person_id, emb, ts), daemon=True).start()
+                    f'Voice embedding (pid={person_id}) — waiting for the lips to confirm '
+                    f'before saving to DB')
             elif not count_ok:
                 self.get_logger().debug(
                     f'Voice gallery: limit {self._SV_SESSION_MAX}/session reached, skipping')
@@ -565,7 +737,12 @@ class IdentityManagerNode(LifecycleNode):
                 self.get_logger().debug(
                     f'Voice gallery: too early (another {remaining:.0f}s until next recording)')
 
-        elif state == State.RECOGNIZING:
+        if state == State.INTERACTING:
+            # Only to tell llm_node who is speaking (/voice/speaker) — the person
+            # being looked at is not necessarily the one talking.
+            threading.Thread(target=self._lookup_voice, args=(emb,), daemon=True).start()
+
+        if state == State.RECOGNIZING:
             threading.Thread(
                 target=self._try_voice_identification,
                 args=(emb,), daemon=True).start()
@@ -575,15 +752,88 @@ class IdentityManagerNode(LifecycleNode):
                 target=self._try_voice_id_in_introducing,
                 args=(emb,), daemon=True).start()
 
+    _VOICE_SAVE_WAIT_SEC  = 5.0   # no lip verdict by then → not saved
+    _VOICE_SAVE_MATCH_SEC = 1.5   # phrase end (lips) vs embedding time
+
+    def _expire_voice_saves(self, now: float):
+        """Under self._lock."""
+        keep = []
+        for p in self._pending_voice_saves:
+            if now - p['added'] > self._VOICE_SAVE_WAIT_SEC:
+                self.get_logger().info(
+                    f'Voice embedding (pid={p["person_id"]}) not saved: no lip data for the phrase')
+            else:
+                keep.append(p)
+        self._pending_voice_saves = keep
+
+    def _resolve_voice_saves(self, ev: dict):
+        """A lip verdict arrived: save the pending voice embedding of that phrase to
+        the DB only if the face in view spoke it (who='primary')."""
+        if ev.get('sv_rejected') or ev.get('t_end') is None:
+            return
+        now = time.time()
+        with self._lock:
+            self._expire_voice_saves(now)
+            match = [p for p in self._pending_voice_saves
+                     if abs(ev['t_end'] - p['ts']) <= self._VOICE_SAVE_MATCH_SEC]
+            if not match:
+                return
+            for p in match:
+                self._pending_voice_saves.remove(p)
+            p = match[-1]
+            ok = (ev.get('who') == 'primary'
+                  and p['person_id'] == self._current_person.get('person_id')
+                  and self._session_voice_save_count < self._SV_SESSION_MAX)
+            if ok:
+                self._session_voice_save_count  += 1
+                self._session_voice_last_save_ts = now
+                n = self._session_voice_save_count
+        if not ok:
+            self.get_logger().info(
+                f'Voice embedding (pid={p["person_id"]}) not saved: lips show '
+                f'who={ev.get("who")} (lips={ev.get("lips")}) — maybe not their voice')
+            return
+        self.get_logger().info(
+            f'Voice embedding confirmed by lips (pid={p["person_id"]}), '
+            f'recording {n}/{self._SV_SESSION_MAX} — saving to DB')
+        threading.Thread(target=self._add_voice_to_gallery,
+                         args=(p['person_id'], p['emb'], p['ts']), daemon=True).start()
+
+    def _lookup_voice(self, emb: list, other_speaker: bool = False):
+        """lookup_by_voice for one utterance + publish who is speaking on
+        /voice/speaker for llm_node. The robot may be looking at one person
+        while another one, out of frame, talks to it — live bug 2026-09-30:
+        "смотрю на Николь", Artur said "я справа", the LLM got confused."""
+        result = self._call_memory({'op': 'lookup_by_voice', 'embedding': emb,
+                                    'high_threshold': self._voice_high_threshold,
+                                    'uncertain_threshold': self._voice_uncertain_threshold})
+        now = time.time()
+        with self._lock:
+            face_name    = self._current_person.get('name', '')
+            face_visible = (self._state != State.IDLE and
+                            now - self._last_face_time < self._no_face_timeout)
+        res = result or {}
+        conf = res.get('confidence') or 'unknown'
+        name = (res.get('name') or res.get('best_candidate_name')) if conf in ('high', 'uncertain') else ''
+        self._speaker_pub.publish(String(data=json.dumps({
+            'ts':           now,
+            'confidence':   conf,
+            'name':         name or '',
+            'similarity':   round(float(res.get('similarity', 0.0) or 0.0), 3),
+            'face_name':    face_name or '',
+            'face_visible': face_visible,
+            # Not the current interlocutor (SV-rejected) — see voice_detector
+            'other_speaker': other_speaker,
+        }, ensure_ascii=False)))
+        return result
+
     def _try_voice_id_from_idle(self, emb: list):
         """Voice identification from IDLE (no face visible, wake word triggered).
 
         If the voice is recognized with high confidence — transition to INTERACTING as with
         normal face recognition. The 2Hz loop will publish person_present=True on the next tick.
         """
-        result = self._call_memory({'op': 'lookup_by_voice', 'embedding': emb,
-                                    'high_threshold': self._voice_high_threshold,
-                                    'uncertain_threshold': self._voice_uncertain_threshold})
+        result = self._lookup_voice(emb)
         if not result or result.get('confidence') != 'high':
             sim  = result.get('similarity', 0) if result else 0
             name = result.get('name', '?')     if result else '?'
@@ -612,9 +862,7 @@ class IdentityManagerNode(LifecycleNode):
 
     def _try_voice_identification(self, emb: list):
         """Try to recognize the person by voice while face recognition is still running."""
-        result = self._call_memory({'op': 'lookup_by_voice', 'embedding': emb,
-                                    'high_threshold': self._voice_high_threshold,
-                                    'uncertain_threshold': self._voice_uncertain_threshold})
+        result = self._lookup_voice(emb)
         if not result or result.get('confidence') != 'high':
             sim  = result.get('similarity', 0) if result else 0
             name = result.get('name', '?')     if result else '?'
@@ -644,9 +892,7 @@ class IdentityManagerNode(LifecycleNode):
         uncertain  → ask "Вы случайно не {name}?" ("Aren't you {name} by any chance?") → pending confirm
         unknown    → ignore
         """
-        result = self._call_memory({'op': 'lookup_by_voice', 'embedding': emb,
-                                    'high_threshold': self._voice_high_threshold,
-                                    'uncertain_threshold': self._voice_uncertain_threshold})
+        result = self._lookup_voice(emb)
         if not result:
             return
 
@@ -675,6 +921,7 @@ class IdentityManagerNode(LifecycleNode):
             self.get_logger().info(
                 f'INTRODUCING: voice recognized — {name} (id={person_id}, sim={sim:.3f})')
             self._set_introducing(False)
+            self._mark_greeted_today(person_id)
             self._should_greet = True
             self._greet_text   = f'Прости, {name}! Я тебя не узнал по лицу, но узнал по голосу.'
             threading.Thread(
@@ -723,9 +970,12 @@ class IdentityManagerNode(LifecycleNode):
                 f'Voice gallery NOT saved: pid={person_id}, '
                 f'reason={result.get("reason", "?")} (age={result.get("oldest_age_days", "?")}d)')
 
-    def _publish_voice_anchor(self, person_id: int, name: str):
-        """Loads the voice gallery from the DB and sends it to voice_detector."""
-        result = self._call_memory({'op': 'get_voice_gallery', 'person_id': person_id})
+    def _publish_voice_anchor(self, person_id: int | None, name: str):
+        """Loads the voice gallery from the DB and sends it to voice_detector.
+        No voice in the DB (or no person_id) → an empty anchor: SV drops the previous
+        person's gallery and learns this voice from scratch."""
+        result = (self._call_memory({'op': 'get_voice_gallery', 'person_id': person_id})
+                  if person_id is not None else None)
         if result and result.get('has_voice'):
             msg = String()
             msg.data = json.dumps({
@@ -737,6 +987,8 @@ class IdentityManagerNode(LifecycleNode):
             n = len(result['gallery'])
             self.get_logger().info(f'Voice gallery sent to SV: {name} ({n} entries)')
         else:
+            self._voice_anchor_pub.publish(String(data=json.dumps(
+                {'person_id': person_id, 'name': name, 'gallery': []}, ensure_ascii=False)))
             self.get_logger().info(f'No voice fingerprint for {name} — SV will learn from scratch')
 
     # ── Voice response in introduction mode ───────────────────────────────
@@ -767,6 +1019,7 @@ class IdentityManagerNode(LifecycleNode):
                 with self._lock:
                     self._state = State.INTERACTING
                     self._introduce_attempts = 0
+                    self._intro_declined = True
             else:
                 self.get_logger().info(
                     f'STT: silence (attempt {attempts}/{self._max_attempts}) — re-asking')
@@ -797,6 +1050,7 @@ class IdentityManagerNode(LifecycleNode):
                 with self._lock:
                     self._state = State.INTERACTING
                     self._introduce_attempts = 0
+                    self._intro_declined = True
             else:
                 self.get_logger().info(
                     f'Name not found (attempt {attempts}/{self._max_attempts}) — re-asking')
@@ -967,6 +1221,7 @@ class IdentityManagerNode(LifecycleNode):
                 with self._lock:
                     self._state              = State.INTERACTING
                     self._introduce_attempts = 0
+                    self._intro_declined     = True
             else:
                 self._introduce_pending = True
                 self._introduce_text    = 'Прошу прощения! Как вас зовут?'
@@ -1055,6 +1310,7 @@ class IdentityManagerNode(LifecycleNode):
 
         self.get_logger().info(f'Verification succeeded: {name} (id={person_id})')
         self._set_introducing(False)
+        self._mark_greeted_today(person_id)
         self._should_greet = True
         self._greet_text   = f'Прости, {name}! Я тебя не узнал. Больше постараюсь запомнить!'
         threading.Thread(
@@ -1134,6 +1390,7 @@ class IdentityManagerNode(LifecycleNode):
                 voice_gallery = list(self._session_voice_gallery)
 
             self._set_introducing(False)
+            self._mark_greeted_today(person_id)
 
             # Save the new person's voice gallery
             if voice_gallery:
@@ -1175,15 +1432,54 @@ class IdentityManagerNode(LifecycleNode):
 
     # ── State logic ─────────────────────────────────────────────────────
 
+    # ── Once-a-day greeting ──────────────────────────────────────────────
+
+    def _greet_day(self) -> str:
+        shifted = datetime.datetime.now() - datetime.timedelta(hours=self._greet_day_start_hour)
+        return shifted.date().isoformat()
+
+    def _load_greet_log(self) -> dict:
+        try:
+            with open(self._greet_log_path, encoding='utf-8') as f:
+                data = json.load(f)
+            return {str(k): str(v) for k, v in data.items()}
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            self.get_logger().warn(f'Greet log {self._greet_log_path} unreadable ({e}) — starting empty')
+            return {}
+
+    def _greeted_today(self, person_id) -> bool:
+        if not person_id:
+            return False
+        with self._lock:
+            return self._greet_log.get(str(person_id)) == self._greet_day()
+
+    def _mark_greeted_today(self, person_id):
+        if not person_id:
+            return
+        with self._lock:
+            self._greet_log[str(person_id)] = self._greet_day()
+            data = dict(self._greet_log)
+        try:
+            tmp = self._greet_log_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            os.replace(tmp, self._greet_log_path)
+        except Exception as e:
+            self.get_logger().warn(f'Greet log not saved: {e}')
+
     def _on_known(self, person_id: int, name: str):
         """Transition to INTERACTING for a known person.
 
         Called from RECOGNIZING (face recognition) or IDLE (voice identification).
         """
         now = time.time()
+        greeted_today = self._greeted_today(person_id)   # takes the lock itself
         with self._lock:
             # Cooldown by name — independent of person_id (the tracker may change the id)
-            already_greeted = (now - self._greeted_names.get(name, 0)) < self._greet_cooldown
+            already_greeted = ((now - self._greeted_names.get(name, 0)) < self._greet_cooldown
+                               or greeted_today)
             goodbye_ts = self._post_goodbye_names.get(name, 0)
 
         # Post-farewell cooldown: the person said goodbye themselves — don't greet until the wake word
@@ -1213,7 +1509,7 @@ class IdentityManagerNode(LifecycleNode):
                 self._greeted_names[name]      = now   # refresh the cooldown
                 self._last_emotion             = 'neutral'
                 self._current_person_last_seen = now
-            reason = 'cooldown active' if already_greeted else 'a voice dialogue was active'
+            reason = 'already greeted today' if already_greeted else 'a voice dialogue was active'
             self.get_logger().info(
                 f'{name} recognized (id={person_id}), {reason} — straight to INTERACTING without a greeting')
             threading.Thread(
@@ -1237,6 +1533,13 @@ class IdentityManagerNode(LifecycleNode):
         self.get_logger().info(
             f'Unconfident recognition: probably {name} (id={person_id}) — '
             f'silent INTERACTING, not starting an introduction')
+        # The voice anchor too — otherwise SV keeps the PREVIOUS person's voice and
+        # rejects this one (live 2026-10-05: Nicole recognized "probably", every
+        # phrase of hers judged against Artur's anchor). A wrong guess is caught by
+        # the lips (llm_node accepts a lips-confirmed SV-rejected phrase).
+        threading.Thread(
+            target=self._publish_voice_anchor,
+            args=(person_id, name), daemon=True).start()
         if person_id is not None:
             threading.Thread(
                 target=self._fetch_and_publish_context,
@@ -1250,6 +1553,7 @@ class IdentityManagerNode(LifecycleNode):
             self._last_emotion             = 'neutral'
             self._current_person_last_seen = now
 
+        self._mark_greeted_today(person_id)
         self.get_logger().info(f'Greeting: {name} (id={person_id})')
 
         threading.Thread(
@@ -1290,21 +1594,47 @@ class IdentityManagerNode(LifecycleNode):
     ]
 
     def _on_unknown(self):
+        """An unknown face is locked: wait silently, don't introduce proactively.
+
+        The robot keeps looking at the person (INTERACTING, person_id=None), and the
+        introduction starts only when they address it — see _speech_addressed_cb.
+        People don't walk up to everyone they see and ask their name either.
+        """
         now = time.time()
         with self._lock:
             if self._state == State.INTRODUCING:
                 return   # already asking
-            if (now - self._introduce_last) < self._introduce_cooldown:
-                self._state = State.INTERACTING
-                return
             # OakD gate: if OAK-D is active and hasn't seen a body for >10s — the face is a
-            # false positive, don't start an introduction (the watchdog will move to IDLE on its own)
+            # false positive (the watchdog will move to IDLE on its own)
             if self._last_human_time > 0.0 and (now - self._last_human_time) > 10.0:
                 self.get_logger().warn(
                     f'Unknown face, but OakD has not seen a body for '
                     f'{now - self._last_human_time:.0f}s — '
-                    f'skipping the introduction (probably a face_detection false positive)')
+                    f'ignoring it (probably a face_detection false positive)')
                 return
+            self._state                    = State.INTERACTING
+            self._current_person           = {}
+            self._last_emotion             = 'neutral'
+            self._current_person_last_seen = now
+        self.get_logger().info(
+            'Unknown person — waiting silently; introduction only if they address the robot')
+
+    def _speech_addressed_cb(self, msg: String):
+        """llm_node judged an utterance addressed to the robot while an unknown face
+        is in front of it (social_context.introduce_on_address) — now introduce."""
+        with self._lock:
+            unknown_waiting = (self._state == State.INTERACTING
+                               and not self._current_person.get('person_id')
+                               and not self._intro_declined)
+        if unknown_waiting:
+            self.get_logger().info(f'Unknown person addressed the robot: "{msg.data[:60]}"')
+            self._start_introduction()
+
+    def _start_introduction(self):
+        now = time.time()
+        with self._lock:
+            if self._state == State.INTRODUCING:
+                return   # already asking
             self._state = State.INTRODUCING
             self._introduce_last     = now
             self._introduce_attempts = 0
@@ -1369,12 +1699,14 @@ class IdentityManagerNode(LifecycleNode):
             self._voice_emo_pend           = None
             self._introduce_attempts       = 0
             self._greeted_names            = {}
+            self._intro_declined           = False
             self._enrolled_track_id        = None
             self._face_hunt_since          = 0.0
             self._last_dialogue_ts         = 0.0
             self._session_voice_emb        = None
             self._session_voice_gallery    = []
             self._session_voice_save_count   = 0
+            self._pending_voice_saves        = []
             self._session_voice_last_save_ts = 0.0
             self._current_person_last_seen = 0.0
             self._pending_name_confirm     = None
@@ -1417,8 +1749,20 @@ class IdentityManagerNode(LifecycleNode):
             # seen a body for longer than no_human_timeout — treat face_detection as a false
             # positive and go to IDLE. This is critical: the left camera can detect a
             # poster/reflection indefinitely, while the real person has been gone for a while.
-            if self._last_human_time > 0.0:
-                body_absent_sec = now - self._last_human_time
+            # Not applied while the face is recognized as the current person (a locked track
+            # republishes every frame): a poster is not "Артур with sim=0.85", while OAK-D
+            # routinely loses the body of someone standing close (<1 m) or turned sideways.
+            # Also not applied during an active dialogue (the LLM answered < 60s ago).
+            # Absence is counted from the later of the last body and the session start —
+            # otherwise a body seen minutes ago killed a fresh session within one tick,
+            # before recognition could even finish (live bug 2026-09-30).
+            current_face_seen = (self._current_person_last_seen > 0.0 and
+                                 (now - self._current_person_last_seen) < self._no_face_timeout)
+            dialogue_active = (self._last_dialogue_ts > 0.0 and
+                               (now - self._last_dialogue_ts) < 60.0)
+            if (self._last_human_time > 0.0 and not current_face_seen
+                    and not dialogue_active):
+                body_absent_sec = now - max(self._last_human_time, self._session_start_ts)
                 if body_absent_sec > self._no_human_timeout:
                     go_idle     = True
                     idle_reason = (
@@ -1480,6 +1824,7 @@ class IdentityManagerNode(LifecycleNode):
                 self._voice_emo_pend           = None
                 self._introduce_attempts       = 0
                 self._greeted_names            = {}
+                self._intro_declined           = False
                 self._enrolled_track_id        = None
                 self._face_hunt_since          = 0.0
                 self._last_dialogue_ts         = 0.0
@@ -1487,6 +1832,7 @@ class IdentityManagerNode(LifecycleNode):
                 self._session_voice_emb        = None
                 self._session_voice_gallery    = []
                 self._session_voice_save_count   = 0
+                self._pending_voice_saves        = []
                 self._session_voice_last_save_ts = 0.0
                 self._current_person_last_seen = 0.0
                 self._pending_name_confirm     = None
@@ -1543,6 +1889,9 @@ class IdentityManagerNode(LifecycleNode):
             emotion         = self._last_emotion or 'neutral'
             intro           = (state == State.INTRODUCING)
             looking         = self._looking_at_robot
+            intro_on_addr   = (state == State.INTERACTING
+                               and not self._current_person.get('person_id')
+                               and not self._intro_declined)
             has_face        = (len(self._frontal_scores) >= 3
                                and time.monotonic() - self._gaze_ts <= self._GAZE_STALE_SEC)
 
@@ -1555,6 +1904,9 @@ class IdentityManagerNode(LifecycleNode):
             'emotion':           emotion,
             'state':             state,
             'introducing':       intro,
+            # An unknown face waits silently: llm_node hands the next addressed
+            # utterance to /speech_addressed (→ introduction) instead of the LLM.
+            'introduce_on_address': intro_on_addr,
             # True if the interlocutor is looking the robot in the eye (yaw-proxy < 30% of
             # inter-eye dist, >50% of frames over the last ~1.5s). None if no face kps in the
             # last _GAZE_STALE_SEC (face gone / no data) or fewer than 3 frames yet.
@@ -1683,6 +2035,10 @@ class IdentityManagerNode(LifecycleNode):
         self._dp('no_human_timeout_sec',         30.0)
         self._dp('max_face_hunt_sec',            90.0)
         self._dp('greet_cooldown_sec',          120.0)
+        # Once-a-day greeting: person_id → day, persisted across restarts.
+        # The day starts at greet_day_start_hour (a 01:00 return is still "today").
+        self._dp('greet_log_path',   os.path.expanduser('~/inmoov_greet_log.json'))
+        self._dp('greet_day_start_hour',          4)
         self._dp('emotion_react_thresh',          0.70)
         self._dp('introduce_cooldown_sec',       60.0)
         self._dp('max_introduce_attempts',        3)
@@ -1720,6 +2076,9 @@ class IdentityManagerNode(LifecycleNode):
         self._voice_uncertain_threshold    = self.get_parameter('voice_uncertain_threshold').value
         self._gaze_yaw_threshold           = self.get_parameter('gaze_yaw_threshold').value
         self._gaze_frontal_fraction        = self.get_parameter('gaze_frontal_fraction').value
+        self._greet_log_path               = self.get_parameter('greet_log_path').value
+        self._greet_day_start_hour         = int(self.get_parameter('greet_day_start_hour').value)
+        self._greet_log                    = self._load_greet_log()
 
         latched_qos = QoSProfile(
             depth=1,
@@ -1735,10 +2094,13 @@ class IdentityManagerNode(LifecycleNode):
         self.create_subscription(Bool,   '/wake_detected',     self._wakeword_cb,        10)
         self.create_subscription(Bool,   '/human_detected',    self._human_detected_cb,  10)
         self.create_subscription(String, '/voice_command',     self._voice_cmd_cb,       10)
+        self.create_subscription(String, '/speech_addressed',  self._speech_addressed_cb, 10)
         self.create_subscription(String, '/voice_embedding',   self._voice_embedding_cb, 10)
         self.create_subscription(Bool,   '/robot_sleep',       self._robot_sleep_cb,     latched_qos)
         self.create_subscription(Bool,   '/go_idle',           self._go_idle_cb,         10)
         self.create_subscription(String, '/llm_response',      self._llm_response_seen_cb, 10)
+        self.create_subscription(String, '/face/mouth_activity/left',  self._mouth_activity_cb, 10)
+        self.create_subscription(String, '/face/mouth_activity/right', self._mouth_activity_cb, 10)
 
         self._social_ctx_pub     = self.create_lifecycle_publisher(String, '/social_context',  10)
         self._context_pub        = self.create_lifecycle_publisher(String, '/person_context',  10)
@@ -1746,7 +2108,9 @@ class IdentityManagerNode(LifecycleNode):
         self._face_expr_pub      = self.create_lifecycle_publisher(String, '/face_expression', 10)
         self._introducing_pub    = self.create_lifecycle_publisher(Bool,   '/introducing',     10)
         self._voice_anchor_pub   = self.create_lifecycle_publisher(String, '/voice_anchor',    10)
+        self._speaker_pub        = self.create_lifecycle_publisher(String, '/voice/speaker',   10)
         self._robot_sleep_pub    = self.create_lifecycle_publisher(Bool,   '/robot_sleep',     latched_qos)
+        self._speaker_evidence_pub = self.create_lifecycle_publisher(String, '/speaker_evidence', 10)
 
         self._mem = self.create_client(MemoryQuery, '/memory/query')
         self.get_logger().info('IdentityManager configured')
@@ -1760,6 +2124,7 @@ class IdentityManagerNode(LifecycleNode):
         self._introducing_pub.on_activate(state)
         self._voice_anchor_pub.on_activate(state)
         self._robot_sleep_pub.on_activate(state)
+        self._speaker_evidence_pub.on_activate(state)
         self._watchdog_timer = self.create_timer(0.5, self._watchdog)
         self._ctx_timer      = self.create_timer(0.5, self._publish_social_context)
         self.get_logger().info('IdentityManager ready')
@@ -1779,6 +2144,7 @@ class IdentityManagerNode(LifecycleNode):
         self._introducing_pub.on_deactivate(state)
         self._voice_anchor_pub.on_deactivate(state)
         self._robot_sleep_pub.on_deactivate(state)
+        self._speaker_evidence_pub.on_deactivate(state)
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
