@@ -67,7 +67,9 @@ from inmoov_msgs.srv import MemoryQuery
 
 def fuse_speaker_evidence(mouth: dict, primary_tid, gaze_samples,
                           yaw_threshold: float, frontal_fraction: float,
-                          gaze_pad_sec: float = 0.5, min_coverage: float = 0.5) -> dict:
+                          gaze_pad_sec: float = 0.5, min_coverage: float = 0.5,
+                          strong_fraction: float = 0.8, strong_yaw: float = 0.15,
+                          tail_sec: float = 1.5) -> dict:
     """Who spoke this phrase — gaze + lips + SV. llm_node vetoes a gaze-only
     address on who = offscreen / other_face (see its _gaze_lips_check).
 
@@ -89,6 +91,13 @@ def fuse_speaker_evidence(mouth: dict, primary_tid, gaze_samples,
                  veto: requiring who='primary' rejected 2 of 8 real questions in
                  the live run 2026-10-03 (lips 'unknown', excess 0.016 / 0.043).
     Both gates are None for an SV-rejected phrase (it is gated by name only).
+    gaze_strong — a confident look: frontal for >= strong_fraction of the phrase,
+                 median yaw <= strong_yaw, and not looking away at its end
+                 (the last tail_sec + pad — one finishes a question to the robot
+                 looking at it). Live 2026-10-05 seg#27: a 7 s talk to someone else
+                 passed the 0.5 gaze test at frac=0.61 yaw=0.20; real questions in
+                 the log are frac 0.88-1.0, yaw 0.02-0.18. llm_node needs it to
+                 override SV, and tells the LLM when the gaze was only weak.
 
     A face seen for less than min_coverage of the speech is ignored: with no rest
     window its reference is the speech itself, and briefly visible faces all came
@@ -101,6 +110,12 @@ def fuse_speaker_evidence(mouth: dict, primary_tid, gaze_samples,
     pitches = [g[3] for g in win if len(g) > 3 and g[3] is not None]
     gaze_frac = (sum(1 for y in yaws if y < yaw_threshold) / len(yaws)) if len(yaws) >= 2 else None
     gaze = None if gaze_frac is None else gaze_frac >= frontal_fraction
+    yaw_med = float(np.median(yaws)) if yaws else None
+    tail = [g[2] for g in win if g[0] >= t1 - tail_sec]
+    tail_frac = (sum(1 for y in tail if y < yaw_threshold) / len(tail)) if len(tail) >= 2 else None
+    gaze_tail = None if tail_frac is None else tail_frac >= frontal_fraction
+    gaze_strong = (gaze_frac is not None and gaze_frac >= strong_fraction
+                   and yaw_med <= strong_yaw and gaze_tail is not False)
 
     by_tid  = {t['track_id']: t for t in mouth.get('tracks', [])
                if t.get('coverage', 1.0) >= min_coverage}
@@ -130,9 +145,11 @@ def fuse_speaker_evidence(mouth: dict, primary_tid, gaze_samples,
         'gaze_n':         len(yaws),
         # Diagnostics for tuning the gaze test (live 2026-10-03: "looking" at the
         # head's hardware limit while talking to someone else)
-        'yaw_med':        round(float(np.median(yaws)), 2) if yaws else None,
+        'yaw_med':        None if yaw_med is None else round(yaw_med, 2),
         'pitch_med':      round(float(np.median(pitches)), 2) if pitches else None,
         'gaze':           gaze,
+        'gaze_tail_frac': None if tail_frac is None else round(tail_frac, 2),
+        'gaze_strong':    gaze_strong,
         'lips':           lips,
         'excess':         primary['excess'] if primary else None,
         'others_speaking': others,
@@ -450,7 +467,10 @@ class IdentityManagerNode(LifecycleNode):
             primary = self._primary_track
             hist    = list(self._gaze_hist)
         ev = fuse_speaker_evidence(mouth, primary, hist,
-                                   self._gaze_yaw_threshold, self._gaze_frontal_fraction)
+                                   self._gaze_yaw_threshold, self._gaze_frontal_fraction,
+                                   strong_fraction=self._gaze_strong_fraction,
+                                   strong_yaw=self._gaze_strong_yaw,
+                                   tail_sec=self._gaze_tail_sec)
         self._speaker_evidence_pub.publish(String(data=json.dumps(ev)))
         self._resolve_voice_saves(ev)
 
@@ -466,7 +486,8 @@ class IdentityManagerNode(LifecycleNode):
             f'(track {primary} lips={ev["lips"]} excess={ev["excess"]}, '
             f'others={ev["others_speaking"] or "-"}) gaze={ev["gaze"]} '
             f'frac={ev["gaze_frac"]} n={ev["gaze_n"]} yaw={ev["yaw_med"]} '
-            f'pitch={ev["pitch_med"]} → {verdict}')
+            f'pitch={ev["pitch_med"]} tail={ev["gaze_tail_frac"]} '
+            f'strong={ev["gaze_strong"]} → {verdict}')
 
     def _identity_cb(self, msg: String):
         if self._sleeping:
@@ -2051,6 +2072,9 @@ class IdentityManagerNode(LifecycleNode):
         self._dp('name_extract_model', 'qwen3.8-27b')
         self._dp('gaze_yaw_threshold',  0.30)
         self._dp('gaze_frontal_fraction', 0.50)
+        self._dp('gaze_strong_fraction',  0.80)
+        self._dp('gaze_strong_yaw',       0.15)
+        self._dp('gaze_tail_sec',         1.5)
 
         self._no_face_timeout              = self.get_parameter('no_face_timeout_sec').value
         self._no_human_timeout             = self.get_parameter('no_human_timeout_sec').value
@@ -2072,6 +2096,9 @@ class IdentityManagerNode(LifecycleNode):
         self._voice_uncertain_threshold    = self.get_parameter('voice_uncertain_threshold').value
         self._gaze_yaw_threshold           = self.get_parameter('gaze_yaw_threshold').value
         self._gaze_frontal_fraction        = self.get_parameter('gaze_frontal_fraction').value
+        self._gaze_strong_fraction         = self.get_parameter('gaze_strong_fraction').value
+        self._gaze_strong_yaw              = self.get_parameter('gaze_strong_yaw').value
+        self._gaze_tail_sec                = self.get_parameter('gaze_tail_sec').value
         self._greet_log_path               = self.get_parameter('greet_log_path').value
         self._greet_day_start_hour         = int(self.get_parameter('greet_day_start_hour').value)
         self._greet_log                    = self._load_greet_log()

@@ -999,7 +999,7 @@ def _build_face_search_block(face_search_ctx: dict | None) -> str:
 def _build_addressing_block(addressing: str | None) -> str:
     """Why the current voice utterance was let through the addressee gate.
 
-    addressing: 'name' / 'gaze' / 'wake' / '' (reason unknown, e.g. a queued
+    addressing: 'name' / 'gaze' / 'gaze_weak' / 'wake' / '' (reason unknown, e.g. a queued
     phrase), None — not a voice request (Telegram): no block at all.
     'name' and 'wake' are explicit calls to the robot: no [ignore] rule (live
     2026-10-05: a phrase right after "Эй, Лёня" was dropped by the LLM as [ignore]).
@@ -1015,8 +1015,18 @@ def _build_addressing_block(addressing: str | None) -> str:
                 'она точно обращена к тебе, всегда отвечай (даже если фраза обрывочная '
                 'или непонятная — переспроси).\n')
     why = {
-        'gaze': 'собеседник смотрит тебе в глаза',
+        'gaze':      'собеседник смотрит тебе в глаза',
+        'gaze_weak': 'собеседник лишь временами смотрел в твою сторону',
     }.get(addressing, 'причина неизвестна')
+    weak = ''
+    if addressing == 'gaze_weak':
+        # Live 2026-10-05: "Сейчас сделаю. Ты точно не голодный?" said to someone
+        # at the table got "Я робот, мне не нужна еда"
+        weak = (f'Взгляд был неуверенным: человек мог стоять лицом к тебе, а говорить '
+                f'с кем-то рядом. Бытовые реплики другим людям (предложить поесть, '
+                f'«сейчас сделаю», «ты не голодный?», просьбы что-то принести, '
+                f'разговор о делах семьи) без явного обращения к тебе → '
+                f'{_NOT_ADDRESSED_MARKER}. ')
     return (
         f'\nАдресность ({why}): микрофон слышит всё вокруг, и реплика могла быть '
         f'сказана НЕ тебе — кусок телефонного разговора, человек говорит с кем-то '
@@ -1026,7 +1036,7 @@ def _build_addressing_block(addressing: str | None) -> str:
         f'вызывай инструменты, выведи ровно {_NOT_ADDRESSED_MARKER} и больше ничего. '
         f'Если хочется ответить «я не совсем понял», «я тут ни при чём», «о ком ты '
         f'говоришь?» — это почти всегда значит, что говорили не тебе → '
-        f'{_NOT_ADDRESSED_MARKER}. Если же реплика продолжает ваш разговор (ответ на '
+        f'{_NOT_ADDRESSED_MARKER}. {weak}Если же реплика продолжает ваш разговор (ответ на '
         f'твой вопрос, уточнение) или это понятная просьба/вопрос к тебе — отвечай как обычно.\n'
     )
 
@@ -1984,9 +1994,19 @@ class LLMNode(LifecycleNode):
         it IS the interlocutor and SV was wrong (live 2026-10-05: the anchor stayed
         on the previous person). Then it's handled as theirs and its voice joins
         the live SV gallery (/voice/sv_confirm). Otherwise another person: answered
-        only when calling the robot by name."""
+        only when calling the robot by name.
+        SV against is real evidence, so the gaze must be confident (gaze_strong):
+        live 2026-10-05 seg#27 — "Ты точно не голодный?" said to someone else at
+        the table, the face in view chewing (lips 'speaking'), gaze frac=0.61 —
+        got an answer and the wrong voice into the live SV gallery."""
         ev = self._await_lips(t_text, sv_rejected=True)
-        if ev and ev.get('who') == 'primary' and ev.get('lips') == 'speaking' and ev.get('gaze'):
+        lips_ok = ev and ev.get('who') == 'primary' and ev.get('lips') == 'speaking'
+        if lips_ok and not ev.get('gaze_strong'):
+            self.get_logger().info(
+                f'LLM: SV said another voice; the face in view spoke but its gaze is not '
+                f'confident (frac={ev.get("gaze_frac")}, yaw={ev.get("yaw_med")}, '
+                f'tail={ev.get("gaze_tail_frac")}) — not overriding SV')
+        elif lips_ok:
             self.get_logger().info(
                 f'LLM: SV said another voice, but the face in view spoke it '
                 f'(lips excess={ev.get("excess")}, gaze) — the interlocutor')
@@ -2017,8 +2037,14 @@ class LLMNode(LifecycleNode):
                 f'LLM: gaze vetoed by lips (who={who}, lips={ev.get("lips")}, '
                 f'excess={ev.get("excess")}) — skipping: "{text[:60]}"')
             return
-        self.get_logger().info(f'LLM: gaze confirmed by lips (who={who or "no data"})')
-        self._accept_command(text, 'gaze', False, lips_who=who)
+        # Only positive evidence of a weak look marks it: no lip data / an older
+        # identity_manager without gaze_strong keeps plain 'gaze'
+        weak = bool(ev) and ev.get('gaze_strong') is False
+        self.get_logger().info(
+            f'LLM: gaze confirmed by lips (who={who or "no data"})'
+            + (f' — weak gaze (frac={ev.get("gaze_frac")}, yaw={ev.get("yaw_med")}, '
+               f'tail={ev.get("gaze_tail_frac")}), LLM told to doubt' if weak else ''))
+        self._accept_command(text, 'gaze_weak' if weak else 'gaze', False, lips_who=who)
 
     def _accept_command(self, text: str, addressing: str, other_speaker: bool,
                         lips_who: str | None = None):
@@ -2053,7 +2079,7 @@ class LLMNode(LifecycleNode):
             # to someone else, or another person speaks (live 2026-10-03: "Не мерить."
             # with the watcher's lips still). Gaze introduces only when the lips show
             # that very face spoke; otherwise the name or the wake word is needed.
-            if addressing == 'gaze' and lips_who != 'primary':
+            if addressing in ('gaze', 'gaze_weak') and lips_who != 'primary':
                 self.get_logger().info(
                     f'LLM: unknown person, gaze without their lips speaking '
                     f'(who={lips_who or "no data"}) — skipping: "{text[:60]}"')

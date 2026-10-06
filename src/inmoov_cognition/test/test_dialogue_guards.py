@@ -460,6 +460,23 @@ def test_fusion_briefly_seen_faces_ignored():
     assert ev['others_speaking'] == [] and ev['fused_gate'] is True
 
 
+def test_fusion_gaze_strong():
+    ev = _fuse(_mouth([(1, 'speaking')]))
+    assert ev['gaze_strong'] is True and ev['gaze_tail_frac'] == 1.0
+    # live seg#27: frontal only ~60% of the phrase → passes the 0.5 test, not strong
+    half = [(10.0 + 0.2 * k, 1, 0.1 if k % 5 < 3 else 0.5) for k in range(10)]
+    ev = _fuse(_mouth([(1, 'speaking')]), gaze=half)
+    assert ev['gaze'] is True and ev['gaze_strong'] is False
+    # head turned ~20°: frontal by the 0.30 test, but median yaw over 0.15
+    ev = _fuse(_mouth([(1, 'speaking')]), gaze=[(10.0 + 0.2 * k, 1, 0.2) for k in range(10)])
+    assert ev['gaze'] is True and ev['gaze_strong'] is False
+    # looked all along but turned away at the end of the phrase
+    away_end = [(10.0 + 0.2 * k, 1, 0.05 if k < 7 else 0.6) for k in range(10)] + \
+               [(12.1, 1, 0.6), (12.3, 1, 0.6), (12.4, 1, 0.6)]
+    ev = _fuse(_mouth([(1, 'speaking')]), gaze=away_end)
+    assert ev['gaze_tail_frac'] < 0.5 and ev['gaze_strong'] is False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Multi-person talk: another speaker's phrase (SV-rejected) → voice_command_other
 
@@ -554,6 +571,22 @@ def test_gaze_vetoed_when_face_in_view_was_silent(monkeypatch):
     assert s._queried == ['который час'] * 3
 
 
+def test_weak_gaze_passes_but_tells_the_llm(monkeypatch):
+    _run_threads_now(monkeypatch)
+    s = _stub()
+    s._lips_ev = {'who': 'unknown', 'gaze_strong': False, 'gaze_frac': 0.6, 'yaw_med': 0.2}
+    LLMNode.command_callback(s, String(data='ты точно не голодный'))
+    assert s._query_kw[-1]['addressing'] == 'gaze_weak'
+    for ev in ({'who': 'primary', 'gaze_strong': True}, {'who': 'primary'}, None):
+        s._processing = False
+        s._lips_ev = ev       # strong, an older identity_manager, no lip data
+        LLMNode.command_callback(s, String(data='который час'))
+        assert s._query_kw[-1]['addressing'] == 'gaze'
+    block = llm_node._build_addressing_block('gaze_weak')
+    assert '[ignore]' in block and 'неуверенным' in block
+    assert 'неуверенным' not in llm_node._build_addressing_block('gaze')
+
+
 def test_name_never_waits_for_lips(monkeypatch):
     _run_threads_now(monkeypatch)
     s = _stub()
@@ -588,16 +621,20 @@ def test_sv_rejected_but_lips_say_interlocutor(monkeypatch):
     _run_threads_now(monkeypatch)
     s = _stub()
     s._addressing_reason = lambda text: None
-    s._lips_ev = {'who': 'primary', 'lips': 'speaking', 'gaze': True,
+    s._lips_ev = {'who': 'primary', 'lips': 'speaking', 'gaze': True, 'gaze_strong': True,
                   'excess': 0.08, 'segment_id': 21}
     LLMNode.command_callback(s, String(data='зачем ходить в школу'), other_speaker=True)
     assert s._queried == ['зачем ходить в школу']
     assert s._query_kw[-1]['other_speaker'] is False
     assert json.loads(s._sv_confirm_pub.msgs[-1].data) == {'segment_id': 21}
 
-    # lips 'unknown' or not looking → still another person (needs the name)
-    for ev in ({'who': 'unknown', 'lips': 'unknown', 'gaze': True},
-               {'who': 'primary', 'lips': 'speaking', 'gaze': False}):
+    # lips 'unknown', not looking, or only a weak look → still another person (needs
+    # the name). Live 2026-10-05 seg#27: Artur talking at the table, Nicole in view
+    # chewing — lips 'speaking', gaze frac=0.61 → it must not override SV
+    for ev in ({'who': 'unknown', 'lips': 'unknown', 'gaze': True, 'gaze_strong': True},
+               {'who': 'primary', 'lips': 'speaking', 'gaze': False, 'gaze_strong': False},
+               {'who': 'primary', 'lips': 'speaking', 'gaze': True, 'gaze_strong': False,
+                'gaze_frac': 0.61, 'yaw_med': 0.2}):
         s._lips_ev = ev
         s._processing = False
         LLMNode.command_callback(s, String(data='налево нет'), other_speaker=True)
