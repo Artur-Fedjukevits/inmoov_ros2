@@ -250,8 +250,15 @@ class VisionHeadTrackerNode(LifecycleNode):
 
     def _enable_cb(self, msg: Bool):
         with self._lock:
+            was_enabled   = self._enabled
             self._enabled = msg.data
-            if msg.data:
+            if msg.data and not was_enabled:
+                # Drop the bboxes left over from before the disable: the timestamps
+                # below make them look fresh, and face_locked=True would go out for a
+                # face seen minutes ago (SoundScan takes face_locked as "found").
+                # Only on the rising edge — a repeated enable while tracking must not
+                # blink face_locked to False.
+                self._left_bbox = self._right_bbox = None
                 # Reset stale timestamps so as not to log "no track for 348 s"
                 # right after enabling (the tracker was disabled, the old timestamps remained)
                 now = time.time()

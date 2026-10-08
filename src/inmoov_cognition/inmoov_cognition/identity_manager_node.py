@@ -1696,6 +1696,20 @@ class IdentityManagerNode(LifecycleNode):
                 self._waiting_for_body = False
                 self.get_logger().info('OakD: body detected → lifting the face_detection block')
 
+    def _face_locked_cb(self, msg: Bool):
+        """The eye cameras have a face locked (/head_tracker/face_locked) — the main
+        truth: OAK-D sits in the torso and sees a narrower scene, so it must not veto
+        a face the eyes are looking at. Counts as a body signal for the veto and
+        _on_unknown (live bug 2026-10-05: IDLE after 30 s of OAK-D silence while
+        the robot was looking at the person)."""
+        if self._sleeping or not msg.data:
+            return
+        with self._lock:
+            self._last_human_time = time.time()
+        if self._waiting_for_body:
+            self._waiting_for_body = False
+            self.get_logger().info('FaceLocked: face locked → lifting the face_detection block')
+
     def _go_idle_cb(self, msg: Bool):
         """Forced transition to IDLE from the BT (say_goodbye LLM tool call)."""
         if not msg.data or self._sleeping:
@@ -2065,7 +2079,7 @@ class IdentityManagerNode(LifecycleNode):
         self._dp('post_goodbye_ignore_sec',    1800.0)
         self._dp('post_goodbye_track_block_sec', 30.0)
         self._dp('llm_url', 'http://192.168.10.118:18020/v1/chat/completions')
-        self._dp('voice_high_threshold',    0.62)
+        self._dp('voice_high_threshold',    0.58)
         self._dp('voice_uncertain_threshold', 0.50)
         self._dp('llm_fallback_url', '')   # optional backup endpoint; empty = none
         self._dp('bearer_token', '')
@@ -2116,6 +2130,7 @@ class IdentityManagerNode(LifecycleNode):
         self.create_subscription(String, '/face/tracks/right', self._tracks_right_cb,    10)
         self.create_subscription(Bool,   '/wake_detected',     self._wakeword_cb,        10)
         self.create_subscription(Bool,   '/human_detected',    self._human_detected_cb,  10)
+        self.create_subscription(Bool,   '/head_tracker/face_locked', self._face_locked_cb, 10)
         self.create_subscription(String, '/voice_command',     self._voice_cmd_cb,       10)
         self.create_subscription(String, '/speech_addressed',  self._speech_addressed_cb, 10)
         self.create_subscription(String, '/voice_embedding',   self._voice_embedding_cb, 10)

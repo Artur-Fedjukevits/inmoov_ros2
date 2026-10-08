@@ -199,6 +199,7 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
         # Was a track actually locked BEFORE the manual command (not just "the
         # head was at rest/center") — see _resume_head_tracker.
         self._had_lock_before_turn = False
+        self._last_pan = 0.0
         # /joint_commanded = commands the Arduino nodes actually accepted (after arbitration)
         self._sub_joint = node.create_subscription(
             JointState, '/joint_commanded', self._track_joint_cb, 10)
@@ -283,6 +284,8 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
             self._had_lock_before_turn = getattr(self._node, '_face_locked', False)
             self._override_active  = True
 
+        self._node.stop_face_sweep()
+        self._last_pan = pan
         rothead = max(30.0, min(140.0, self._REST_ROTHEAD + pan))
         neck    = max(0.0,  min(100.0, self._REST_NECK    + tilt))
 
@@ -367,6 +370,16 @@ class ExecuteRobotCommand(py_trees.behaviour.Behaviour):
             self._node.get_logger().info(
                 'Head: there was no face before the command either — staying at the '
                 'current (just-confirmed) position, not rolling back')
+            if (not self._node._face_locked
+                    and abs(self._last_pan) >= self._TORSO_FOLLOW_MIN_PAN):
+                # The turn did not bring a face into view — keep turning the same way
+                # until face_tracker locks one (see BehaviorManagerNode.start_face_sweep).
+                self._torso_moved     = False
+                self._override_active = False
+                self._head_timer      = None
+                self._node.release_joints(self._SOURCE, self._HEAD_JOINTS)
+                self._node.start_face_sweep(1 if self._last_pan > 0 else -1, 'manual_turn')
+                return
         self._torso_moved      = False
         self._override_active  = False
 
@@ -755,11 +768,16 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
         _, target, dur  = self._PHASES[0]
         self._phase_end = time.monotonic() + dur
         self._node.enable_face_detection(True)
+        # face_locked is published only while head_tracker is enabled; its own commands
+        # (priority 40) lose to the scan lease (60) until we hand over.
+        self._node.enable_head_tracker(True)
         self._head_cmd(target)
         self._node.get_logger().info(
             f'PIRScan: starting — turning left (rothead={target:.0f}°), face_detection enabled')
 
     def update(self) -> py_trees.common.Status:
+        if self._node._face_locked:
+            return self._found()
         if time.monotonic() < self._phase_end:
             return py_trees.common.Status.RUNNING
 
@@ -775,10 +793,19 @@ class PIRScanBehaviour(py_trees.behaviour.Behaviour):
 
         return py_trees.common.Status.RUNNING
 
+    def _found(self) -> py_trees.common.Status:
+        """face_tracker locked a face mid-scan — stop where we are, head_tracker takes over."""
+        self._completed = True
+        self._node.release_joints('bt_scan', ('rothead', 'neck'))
+        self._bb.pir.scan_active = False
+        self._node.get_logger().info('PIRScan: face locked — control handed to head_tracker')
+        return py_trees.common.Status.SUCCESS
+
     def _done(self) -> py_trees.common.Status:
         """Scan finished — no face found. Disable detection."""
         self._completed = True
         self._node.release_joints('bt_scan', ('rothead', 'neck'))
+        self._node.enable_head_tracker(False)
         self._node.enable_face_detection(False)
         self._bb.pir.scan_active = False
         self._node.get_logger().info('PIRScan: finished — no face detected, face_detection disabled')
@@ -810,16 +837,16 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     case (PIR motion without voice still uses PIRScanBehaviour — there is no
     direction to work with there).
 
-    Stops EXACTLY where it is as soon as OAK-D has seen a person
-    (/human_detected — faster and coarser than full face recognition
-    /social/person_present) — the torso does NOT return to center, and
-    control is handed to head_tracker (which reads face_tracker) for precise
-    visual fine-tuning. If no person is found within DWELL_TIMEOUT — the
-    torso returns to center, face_detection is disabled, failure (same as
-    the old PIRScan).
+    Stops EXACTLY where it is as soon as the eyes lock a face
+    (/head_tracker/face_locked — they have priority) or OAK-D sees a person
+    (/human_detected — a coarser hint, then the head is aimed by its angle) —
+    the torso does NOT return to center, and control is handed to head_tracker
+    for precise visual fine-tuning. If no person is found within DWELL_TIMEOUT —
+    the torso returns to center, face_detection and head_tracker are disabled,
+    failure (same as the old PIRScan).
 
     The midstom sign was verified by hand 2026-08-22: 60°=left, 120°=right —
-    the OPPOSITE convention from rothead (there 120=left, 60=right).
+    the SAME convention as rothead (>90 = right, verified 2026-08-24).
     Don't mix these up in future edits.
     """
 
@@ -828,7 +855,7 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
     _RIGHT  = 120.0   # verified by hand 2026-08-22: midstom=120° — torso fully RIGHT (opposite convention from rothead!)
     _TURN_VEL = 1.0
 
-    _GO_DURATION    = 0.6   # ~30° at ~50°/s (see the _SCAN_VEL calculation in PIRScanBehaviour)
+    _GO_DURATION    = 0.9   # was 0.6 — often undershot (see the _SCAN_VEL calculation in PIRScanBehaviour)
     _DWELL_TIMEOUT  = 8.0   # how long to wait for /human_detected after turning before giving up
     _MIN_CONFIDENCE = 0.15  # below this the direction is "unknown", don't turn (stay centered)
     _MIN_ANGLE_DEG  = 15.0  # |angle_deg| smaller than this also counts as "near center", don't turn
@@ -898,13 +925,22 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
                 f'— turning torso left')
 
         self._node.enable_face_detection(True)
+        # The eyes have priority over OAK-D: face_locked is published only while
+        # head_tracker is enabled. Its head commands lose to our bt_scan lease
+        # until _found() releases it; the eye joints are free. Live bug
+        # 2026-10-08: sitting at a table, the eyes recognized the person while
+        # OAK-D (in the torso, table in the way) saw no body — the scan timed out
+        # and turned away.
+        self._node.enable_head_tracker(True)
         if self._moved:
             self._turn_cmd(self._target)
         self._phase_end = time.monotonic() + self._GO_DURATION
 
     def update(self) -> py_trees.common.Status:
+        if self._node._face_locked:
+            return self._found(by_eyes=True)
         if getattr(self._node, '_human_detected', False):
-            return self._found()
+            return self._found(by_eyes=False)
 
         now = time.monotonic()
         if self._phase == 0:
@@ -937,20 +973,30 @@ class SoundScanBehaviour(py_trees.behaviour.Behaviour):
                 return py_trees.common.Status.RUNNING
             return self._done()
 
-    def _found(self) -> py_trees.common.Status:
+    def _found(self, by_eyes: bool) -> py_trees.common.Status:
         self._completed = True
         self._node.release_joints('bt_scan', self._JOINTS)
         self._bb.sound.scan_active = False
-        self._node.aim_head_at_human()   # aim the head using OAK-D right away, don't wait for face_detection to find it
+        if by_eyes:
+            # The eyes already hold the face — an OAK-D aim would only pull the head
+            # off it. If the torso faces elsewhere, _torso_follow_tick brings it along.
+            self._node.get_logger().info(
+                'SoundScan: the eyes locked a face — stopping, handing control to head_tracker')
+        else:
+            self._node.aim_head_at_human()   # aim the head using OAK-D right away, don't wait for face_detection to find it
+            self._node.get_logger().info(
+                'SoundScan: OAK-D saw a person — stopping, handing control to head_tracker')
         self._node.enable_head_tracker(True)
-        self._node.get_logger().info(
-            'SoundScan: OAK-D saw a person — stopping, handing control to head_tracker')
         return py_trees.common.Status.SUCCESS
 
     def _done(self) -> py_trees.common.Status:
         self._completed = True
         self._node.release_joints('bt_scan', self._JOINTS)
         self._node.enable_face_detection(False)
+        if self._node._last_manual_turn_mono <= self._started_mono:
+            # Enabled in initialise() for face_locked. After a manual turn
+            # ExecuteRobotCommand decides about head_tracker itself.
+            self._node.enable_head_tracker(False)
         self._bb.sound.scan_active = False
         # First failure of the session (right after the wake word) — count it as
         # attempt #1 in the shared face-search retry counter, so that the "second
@@ -1011,11 +1057,10 @@ class FaceSearchAttempt(py_trees.behaviour.Behaviour):
         if target is not None:
             # Short lease: the turn itself (~0.6 s) with a margin; no release needed.
             # head_tracker keeps the head there afterwards (it syncs to /joint_commanded).
-            rothead = node.turn_toward(target, 'bt_scan', JointCommand.PRIORITY_BT_SCAN,
-                                       1.5, vel=1.0)
+            node.start_face_sweep(1 if target > SoundScanBehaviour._CENTER else -1, source)
             node.get_logger().info(
                 f'FaceSearch: attempt #{node._face_search_attempts} — '
-                f'{source} → midstom={target:.0f}° rothead={rothead:.0f}°')
+                f'{source} → sweeping {"right" if target > SoundScanBehaviour._CENTER else "left"}')
         elif source == 'manual_command':
             node.get_logger().info(
                 f'FaceSearch: attempt #{node._face_search_attempts} — '
@@ -1379,6 +1424,20 @@ class BehaviorManagerNode(LifecycleNode):
         self._human_detected        = False
         self._last_human_angle      = 0.0   # /human_angle_deg (OAK-D, atan2(x_mm,z_mm)) — SoundScanBehaviour aims the head before enable_head_tracker
 
+        # ── Face sweep (turn torso+head to the limit until a face is locked) ──
+        self._sweep_dir        = 0       # 0 = idle, +1 = right, -1 = left
+        self._sweep_start_mono = 0.0
+        self._sweep_end_mono   = None    # when both joints reached the limit
+        self._sweep_midstom    = 90.0
+        self._sweep_rothead    = 90.0
+        self._sweep_source     = ''
+        self._sweep_timer      = None
+        self._known_midstom    = 90.0    # /joint_commanded
+        self._known_rothead    = 90.0
+        # ── Torso follow (see _torso_follow_tick) ──
+        self._follow_expect_midstom  = None    # midstom of our last step; None = not following
+        self._follow_at_limit_logged = False
+
         # ── Face-search retry (repeated face search on every utterance until
         # head_tracker locks a face — see FaceSearchAttempt/_face_locked_cb) ──
         self._face_locked                   = False   # /head_tracker/face_locked
@@ -1569,6 +1628,175 @@ class BehaviorManagerNode(LifecycleNode):
                          vel=SoundScanBehaviour._TURN_VEL)
         self.get_logger().info(
             f'AimHead: aiming the head at the person (OAK-D angle={angle:.0f}° → rothead={rothead:.0f}°)')
+
+    # ── Face sweep: turn to the limit until face_tracker locks a face ─────
+
+    # deg/s ramp rates; the eye cameras (narrow FOV) see the face at any point on the way
+    _SWEEP_TORSO_RATE   = 25.0
+    _SWEEP_HEAD_RATE    = 35.0
+    _SWEEP_LIMIT_DWELL  = 3.0     # wait at the limit before giving up
+    _SWEEP_MAX_SEC      = 25.0
+    _SWEEP_MIN_LOCK_SEC = 0.3     # ignore a stale face_locked right after the start
+
+    def _track_joint_cb(self, msg: JointState):
+        for name, pos in zip(msg.name, msg.position):
+            if name == 'rothead':
+                self._known_rothead = pos * 180.0 / math.pi + 90.0
+            elif name == 'midstom':
+                self._known_midstom = pos * 180.0 / math.pi + 90.0
+
+    def start_face_sweep(self, direction: int, source: str) -> None:
+        """Turn the torso and head in `direction` (+1 right / -1 left) until
+        /head_tracker/face_locked, ramping from the current pose to the limit.
+        If OAK-D (/human_detected) reports a more precise angle on the way,
+        the head is aimed there instead. A lock hands control to head_tracker."""
+        if not self.lc_active or direction == 0:
+            return
+        direction = 1 if direction > 0 else -1
+        if self._sweep_dir == direction:
+            return   # already sweeping that way
+        self._sweep_dir        = direction
+        self._sweep_start_mono = time.monotonic()
+        self._sweep_end_mono   = None
+        self._sweep_midstom    = self._known_midstom
+        self._sweep_rothead    = self._known_rothead
+        self._sweep_source     = source
+        self.enable_face_detection(True)
+        self.enable_head_tracker(True)   # face_locked is published only while it is enabled
+        self.get_logger().info(
+            f'FaceSweep: started {"right" if direction > 0 else "left"} ({source}) from '
+            f'midstom={self._sweep_midstom:.0f}° rothead={self._sweep_rothead:.0f}°')
+
+    def stop_face_sweep(self, reason: str = '', release: bool = True) -> None:
+        if self._sweep_dir == 0:
+            return
+        self._sweep_dir = 0
+        if release:
+            self.release_joints('bt_scan', ('midstom', 'rothead', 'neck'))
+        if reason:
+            self.get_logger().info(f'FaceSweep: {reason}')
+
+    def _sweep_tick(self):
+        if self._sweep_dir == 0:
+            self._torso_follow_tick()
+            return
+        if not self.lc_active:
+            self._sweep_dir = 0
+            return
+        now = time.monotonic()
+        if self._bb.robot.sleep:
+            self.stop_face_sweep('sleep — stopped')
+            return
+        if self._face_locked and now - self._sweep_start_mono > self._SWEEP_MIN_LOCK_SEC:
+            self.stop_face_sweep('face locked — control handed to head_tracker')
+            self.enable_head_tracker(True)
+            return
+        if now - self._sweep_start_mono > self._SWEEP_MAX_SEC:
+            self.stop_face_sweep('timeout — no face found')
+            return
+
+        dt   = 0.1
+        d    = self._sweep_dir
+        rest = SoundScanBehaviour._CENTER
+        if self._human_detected:
+            # OAK-D sees a person: aim the head at its angle; the torso keeps turning
+            # only if the angle is beyond what the head alone can cover.
+            angle   = self._last_human_angle
+            want    = SoundScanBehaviour._ROTHEAD_CENTER + angle * SoundScanBehaviour._AIM_GAIN
+            want    = max(SoundScanBehaviour._ROTHEAD_MIN,
+                          min(SoundScanBehaviour._ROTHEAD_MAX, want))
+            step    = self._SWEEP_HEAD_RATE * dt
+            self._sweep_rothead += max(-step, min(step, want - self._sweep_rothead))
+            if abs(want - SoundScanBehaviour._ROTHEAD_CENTER) >= 45.0:
+                self._sweep_midstom += d * self._SWEEP_TORSO_RATE * dt
+        else:
+            self._sweep_rothead += d * self._SWEEP_HEAD_RATE * dt
+            self._sweep_midstom += d * self._SWEEP_TORSO_RATE * dt
+        self._sweep_rothead = max(SoundScanBehaviour._ROTHEAD_MIN,
+                                  min(SoundScanBehaviour._ROTHEAD_MAX, self._sweep_rothead))
+        self._sweep_midstom = max(SoundScanBehaviour._LEFT,
+                                  min(SoundScanBehaviour._RIGHT, self._sweep_midstom))
+        lim_h = SoundScanBehaviour._ROTHEAD_MAX if d > 0 else SoundScanBehaviour._ROTHEAD_MIN
+        lim_t = SoundScanBehaviour._RIGHT if d > 0 else SoundScanBehaviour._LEFT
+        at_limit = (not self._human_detected and
+                    self._sweep_rothead == lim_h and self._sweep_midstom == lim_t)
+        if at_limit:
+            if self._sweep_end_mono is None:
+                self._sweep_end_mono = now
+                self.get_logger().info('FaceSweep: reached the limit, waiting for a face')
+            elif now - self._sweep_end_mono > self._SWEEP_LIMIT_DWELL:
+                self.stop_face_sweep('no face found up to the limit')
+                return
+        else:
+            self._sweep_end_mono = None
+
+        self.note_own_torso_move()
+        self.send_joints('bt_scan', JointCommand.PRIORITY_BT_SCAN, 0.6,
+                         {'midstom': self._sweep_midstom, 'rothead': self._sweep_rothead,
+                          'neck': SoundScanBehaviour._NECK_REST}, vel=1.0)
+
+    # ── Torso follow: the eyes hold a face that OAK-D (in the torso) does not see ──
+
+    _FOLLOW_START_DEG = 20.0   # head this far off center starts bringing the torso along
+    _FOLLOW_STOP_DEG  = 5.0    # ...and the torso stops once the head is back this close
+    _FOLLOW_STEP_DEG  = 1.0    # per 0.1 s tick = 10°/s, slow enough for the eyes to keep the face
+
+    def _torso_follow_tick(self) -> None:
+        """The eyes have priority, OAK-D is only a hint — and the hint works the
+        other way too: when head_tracker holds a face but OAK-D sees no body, the
+        torso is probably facing elsewhere. Turn it toward the head, rotating
+        rothead back by the same step so the gaze stays on the face. A torso at
+        its limit is left there. Commands carry lease 0: they win over
+        head_tracker (priority 60 > 40) without taking the head from it, and
+        head_tracker re-syncs its rothead from /joint_commanded."""
+        if (not self.lc_active or not self._face_locked or self._human_detected
+                or self._bb.robot.sleep or self._bb.pir.scan_active
+                or self._bb.sound.scan_active or self.manual_turn_recent()):
+            self._stop_torso_follow()
+            return
+        offset = self._known_rothead - SoundScanBehaviour._ROTHEAD_CENTER
+        if self._follow_expect_midstom is None:
+            if abs(offset) < self._FOLLOW_START_DEG:
+                return
+        else:
+            if abs(self._known_midstom - self._follow_expect_midstom) > 0.5:
+                # Our last torso step was not accepted — someone else holds midstom.
+                # Stop, or rothead alone would keep turning away from the face.
+                self._stop_torso_follow('torso is held by another source')
+                return
+            if abs(offset) < self._FOLLOW_STOP_DEG:
+                self._stop_torso_follow('torso caught up with the head')
+                return
+        side  = 1.0 if offset > 0 else -1.0
+        limit = SoundScanBehaviour._RIGHT if side > 0 else SoundScanBehaviour._LEFT
+        room  = (limit - self._known_midstom) * side
+        if room <= 0.0:
+            if not self._follow_at_limit_logged:   # once per lock, not every tick
+                self.get_logger().info(
+                    f'TorsoFollow: torso at its limit (midstom={self._known_midstom:.0f}°), '
+                    f'leaving it there — the head keeps the face')
+            self._follow_at_limit_logged = True
+            self._follow_expect_midstom  = None
+            return
+        if self._follow_expect_midstom is None:
+            self.get_logger().info(
+                f'TorsoFollow: eyes hold a face, OAK-D sees no body, head off center '
+                f'(rothead={self._known_rothead:.0f}°) — turning the torso '
+                f'{"right" if side > 0 else "left"}')
+        step    = min(self._FOLLOW_STEP_DEG, room, abs(offset))
+        midstom = self._known_midstom + side * step
+        rothead = self._known_rothead - side * step
+        self._follow_expect_midstom = midstom
+        self.note_own_torso_move()
+        self.send_joints('torso_follow', JointCommand.PRIORITY_BT_SCAN, 0.0,
+                         {'midstom': midstom, 'rothead': rothead})
+
+    def _stop_torso_follow(self, reason: str = '') -> None:
+        if self._follow_expect_midstom is not None and reason:
+            self.get_logger().info(f'TorsoFollow: {reason}')
+        self._follow_expect_midstom = None
+        if not self._face_locked:
+            self._follow_at_limit_logged = False
 
     # ── Face-search retry (see FaceSearchAttempt) ─────────────────────────
 
@@ -2118,6 +2346,7 @@ class BehaviorManagerNode(LifecycleNode):
         self.create_subscription(Float32, '/human_angle_deg', self._human_angle_cb,   10)
         self.create_subscription(Bool,   '/head_tracker/face_locked', self._face_locked_cb, 10)
         self.create_subscription(String, '/voice/direction_hint', self._direction_hint_cb, 10)
+        self.create_subscription(JointState, '/joint_commanded', self._track_joint_cb, 10)
 
         self.get_logger().info('BehaviorManager configured')
         return TransitionCallbackReturn.SUCCESS
@@ -2131,6 +2360,7 @@ class BehaviorManagerNode(LifecycleNode):
         self.enable_face_detection(False)
         self.enable_head_tracker(False)
         self._tick_timer = self.create_timer(1.0 / self._tick_rate, self._tick)
+        self._sweep_timer = self.create_timer(0.1, self._sweep_tick)
         self.get_logger().info(
             f'BehaviorManager v2 ready (eternal tree @ {self._tick_rate:.0f} Hz). '
             f'Tavily: {"configured" if self.get_parameter("tavily_api_key").value else "not configured"}'
@@ -2139,6 +2369,10 @@ class BehaviorManagerNode(LifecycleNode):
 
     def on_deactivate(self, state):
         self.lc_active = False
+        self._sweep_dir = 0
+        if self._sweep_timer:
+            self.destroy_timer(self._sweep_timer)
+            self._sweep_timer = None
         if self._tick_timer:
             self.destroy_timer(self._tick_timer)
             self._tick_timer = None
