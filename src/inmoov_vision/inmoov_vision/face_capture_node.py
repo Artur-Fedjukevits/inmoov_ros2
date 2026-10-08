@@ -61,7 +61,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool
 
 _LEFT_PATH  = '/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0'
-_RIGHT_PATH = '/dev/v4l/by-path/pci-0000:c8:00.3-usb-0:1.3:1.0-video-index0'
+_RIGHT_PATH = '/dev/v4l/by-path/pci-0000:c8:00.3-usb-0:1.2:1.0-video-index0'
 
 _REOPEN_AFTER = 10   # consecutive failures before reopen attempt
 _REOPEN_WAIT  = 2.0  # seconds between reopen attempts

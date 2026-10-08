@@ -216,7 +216,7 @@ Memory:
 Vision:
 - `vision` (default `true`) — gates all camera/face/OAK nodes via `IfCondition`; with `false` they are neither started nor managed by `lifecycle_manager`
 - `cam_left` (default `/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0`)
-- `cam_right` (default `/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0`)
+- `cam_right` (default `/dev/v4l/by-path/pci-0000:c8:00.3-usb-0:1.2:1.0-video-index0`)
 - `fps` (`15`), `detection_hz` (`5.0`), `det_thresh` (`0.5`), `analysis_hz` (`2.0`)
 - `gain_head` (`0.3`), `gain_eye` (`0.6`)
 - `rest_rothead` (`90.0`), `rest_neck` (`40.0`)

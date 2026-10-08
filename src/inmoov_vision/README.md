@@ -109,7 +109,7 @@ camera could be opened.
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
 | `cam_left` | string | `/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0` | V4L2 device of the left eye (must be a **string**, not an integer index). |
-| `cam_right` | string | `/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0` | V4L2 device of the right eye. |
+| `cam_right` | string | `/dev/v4l/by-path/pci-0000:c8:00.3-usb-0:1.2:1.0-video-index0` | V4L2 device of the right eye. |
 | `fps` | int | `15` | Capture/publish rate (timer period `1/fps`); also requested from the camera. |
 | `width` | int | `640` | Capture width. |
 | `height` | int | `480` | Capture height. |
@@ -539,7 +539,7 @@ Vision-related launch arguments of `inmoov.launch.py`:
 | Launch argument | Default | Goes to |
 |---|---|---|
 | `cam_left` | `/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.1:1.0-video-index0` | `face_capture_node.cam_left` |
-| `cam_right` | `/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1.2:1.0-video-index0` | `face_capture_node.cam_right` |
+| `cam_right` | `/dev/v4l/by-path/pci-0000:c8:00.3-usb-0:1.2:1.0-video-index0` | `face_capture_node.cam_right` |
 | `fps` | `15` | `face_capture_node.fps` |
 | `detection_hz` | `5.0` | both `face_detection_node.detection_hz` |
 | `det_thresh` | `0.5` | both `face_detection_node.det_thresh` |
