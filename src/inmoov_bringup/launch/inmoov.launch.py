@@ -538,18 +538,21 @@ def generate_launch_description():
         }],
     )
 
-    # STT: Parakeet-TDT-0.6b-v3 (ONNX/CPU) — replaced whisper.cpp on 2026-08-27,
-    # 2-4x faster in live testing.
-    parakeet_stt = LifecycleNode(
+    # STT (2026-10-08): GigaAM-v3 e2e-rnnt (Russian, punctuation) — more accurate
+    # and ~2x faster than Parakeet, which stays in the same node only as the
+    # fallback for English speech. parakeet_stt_node (Parakeet alone) is kept as
+    # an executable to switch back to.
+    gigaam_stt = LifecycleNode(
         package='inmoov_voice',
-        executable='parakeet_stt_node',
-        name='parakeet_stt_node',
+        executable='gigaam_stt_node',
+        name='gigaam_stt_node',
         namespace='',
         output='screen',
         respawn=True,
         respawn_delay=2.0,
         parameters=[{
-            'language': 'ru',
+            'output_topic': 'voice_command',
+            'other_output_topic': 'voice_command_other',
         }],
     )
 
@@ -795,7 +798,7 @@ def generate_launch_description():
         video_ws,
         face_expressions,
         voice_emotion,
-        parakeet_stt,
+        gigaam_stt,
         vision_group,
         llm_node,
         openhab_bridge,

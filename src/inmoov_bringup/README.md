@@ -151,7 +151,7 @@ Nodes launched, by tier: `memory_node` (0); `audio_source_node`,
 `sound_localization_node` (1); `wakeword_node`, `voice_detector_node`,
 `tts_node`, `joint_state_publisher`, `face_expressions`,
 `face_detection_node_{left,right}` (2); `face_tracker_node_{left,right}`,
-`voice_emotion_node`, `parakeet_stt_node` (3); `face_recognition_node`,
+`voice_emotion_node`, `gigaam_stt_node` (3); `face_recognition_node`,
 `face_gallery_node`, `emotion_recognition_node`, `vision_head_tracker_node`,
 `human_detection_node`, `scene_manager_node`, `llm_node`,
 `openhab_bridge_node` (4); `identity_manager_node`, `behavior_manager_node`
@@ -256,7 +256,7 @@ built in the same workspace and provide the nodes referenced in
 - `inmoov_control` — `arduino_left_node`, `arduino_right_node`, `joint_state_publisher`, `face_expressions_node`
 - `inmoov_memory` — `memory_node`
 - `inmoov_vision` — `face_capture_node`, `oak_node`, `face_detection_node`, `face_tracker_node`, `face_recognition_node`, `face_gallery_node`, `emotion_recognition_node`, `vision_head_tracker_node`, `human_detection_node`, `scene_manager_node`
-- `inmoov_voice` — `audio_source_node`, `sound_localization_node`, `wakeword_node`, `voice_detector_node`, `tts_node`, `voice_emotion_node`, `parakeet_stt_node`
+- `inmoov_voice` — `audio_source_node`, `sound_localization_node`, `wakeword_node`, `voice_detector_node`, `tts_node`, `voice_emotion_node`, `gigaam_stt_node`, `parakeet_stt_node` (not launched)
 
 All of the above nodes must implement the ROS2 managed-lifecycle interface
 (`change_state`/`get_state` services) since `lifecycle_manager` drives them

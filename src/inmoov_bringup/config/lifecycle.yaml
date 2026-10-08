@@ -65,7 +65,7 @@ lifecycle_manager:
           - face_tracker_node_left
           - face_tracker_node_right
           - voice_emotion_node
-          - parakeet_stt_node
+          - gigaam_stt_node     # STT: GigaAM-v3, Parakeet fallback for English
         critical: []
         # all: retry → degraded (the robot can still work without them, just worse)
       # ── Tier 4: Intelligence ────────────────────────────────────────────

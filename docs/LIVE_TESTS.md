@@ -76,6 +76,15 @@ Audio under load — `ca20843` (systemd unit: `CPUAffinity=0-13` instead of
 - [ ] No TTS crackle during long answers. If it is frequent, check
       `cpu.stat` throttling of the unit's cgroup
 
+STT switched to `gigaam_stt_node` (GigaAM-v3 e2e-rnnt, Parakeet only as the
+fallback for English):
+
+- [ ] Normal Russian dialogue: transcripts in the log (`gigaam recognized in …`)
+      are right, with punctuation; nothing dropped from quiet phrases
+- [ ] A phrase in English → `parakeet recognized in …`, answered sensibly
+- [ ] «Леонид, который час?» from a distance, not looking at the robot →
+      answered (the full name is in `llm_node._ROBOT_NAMES`)
+
 Voice emotion fusion — pre-`cadf411`:
 
 - [ ] Angry face + neutral voice: does the robot react to the emotion at

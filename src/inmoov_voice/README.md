@@ -27,7 +27,7 @@ flowchart LR
     AS -- raw_audio --> WW[wakeword_node]
     AS -- raw_audio --> VD[voice_detector_node<br/>Silero VAD + ECAPA-TDNN]
     WW -- wake_detected --> VD
-    VD -- audio_to_whisper --> STT[parakeet_stt_node]
+    VD -- audio_to_whisper --> STT[gigaam_stt_node]
     VD -- audio_to_whisper --> VE[voice_emotion_node]
     STT -- voice_command --> LLM["llm_node<br/>(inmoov_cognition)"]
     STT -- voice_command --> VD
@@ -53,8 +53,8 @@ Dialogue cycle:
    present) it records a phrase with Silero VAD, optionally filtering out
    foreign voices with ECAPA-TDNN speaker verification, and publishes the
    finished phrase on `audio_to_whisper`.
-4. `parakeet_stt_node` transcribes the phrase and publishes the text on
-   `voice_command`. `voice_emotion_node` classifies the same segment.
+4. `gigaam_stt_node` transcribes the phrase (GigaAM-v3, Parakeet for English)
+   and publishes the text on `voice_command`. `voice_emotion_node` classifies the same segment.
 5. `llm_node` (other package) answers through the `/speak` action;
    `tts_node` streams audio from an HTTP TTS server, plays it, drives the jaw
    from the audio level and holds a face expression for the phrase, and
@@ -63,7 +63,7 @@ Dialogue cycle:
    pair, and publishes a coarse left/right bearing of the sound source.
 
 Note: the topic name `audio_to_whisper` is a leftover from the
-whisper.cpp era; the STT is now Parakeet.
+whisper.cpp era; the STT is now GigaAM-v3 (+ Parakeet for English).
 
 ## Nodes
 
@@ -75,6 +75,7 @@ Executables registered in [`setup.py`](setup.py):
 | `wakeword_node` | `inmoov_voice.openwakeword_node:main` | `wakeword_node` |
 | `voice_detector_node` | `inmoov_voice.voice_detector_node:main` | `voice_detector_node` |
 | `parakeet_stt_node` | `inmoov_voice.parakeet_stt_node:main` | `parakeet_stt_node` |
+| `gigaam_stt_node` | `inmoov_voice.gigaam_stt_node:main` | `gigaam_stt_node` |
 | `tts_node` | `inmoov_voice.tts_node:main` | `tts_node` |
 | `voice_emotion_node` | `inmoov_voice.voice_emotion_node:main` | `voice_emotion_node` |
 | `sound_localization_node` | `inmoov_voice.sound_localization_node:main` | `sound_localization_node` |
@@ -304,6 +305,47 @@ short, empty result, exception) an **empty string** is still published, so
 | `audio_to_whisper` | `std_msgs/Float32MultiArray` | subscribe (10) | Sample rate is taken from `layout.dim[0].stride` if the label is `sample_rate`, otherwise 16000. |
 | `voice_command` (`output_topic`) | `std_msgs/String` | publish (lifecycle, 10) | Transcript, or `''`. |
 
+### `gigaam_stt_node`
+
+Source: [`inmoov_voice/gigaam_stt_node.py`](inmoov_voice/gigaam_stt_node.py).
+
+The production STT since 2026-10-08. The primary model is Sber
+**GigaAM-v3 e2e-RNNT** (Russian only, punctuation and "ё", ONNX int8, CPU, via
+`onnx-asr`): on 28 test clips and 164 live phrases it was more accurate on
+Russian and about twice as fast as Parakeet, which often turned Russian
+far-field speech into foreign word salad. GigaAM cannot do English, so
+**Parakeet-TDT-0.6B-v3** is loaded in the same process as the fallback: it
+transcribes the segment when the GigaAM transcript is empty, has fewer than
+`fallback_min_cps` characters per second of audio, or more than
+`fallback_max_latin` of its letters are Latin (GigaAM writes English as Latin
+gibberish rather than nothing).
+
+Both models often miss the unusual name "Лёня"; `llm_node` also accepts
+"Леонид", and the wake word "Эй, Лёня" opens a grace window.
+
+Queueing and the empty-string-on-failure contract are the same as in
+`parakeet_stt_node`. With `compare_parakeet` on, Parakeet runs on every phrase
+and both transcripts are logged, optionally to `compare_log` (JSONL) with the
+audio in `save_audio_dir`.
+
+**Parameters**
+
+| Name | Type | Default | Meaning |
+|---|---|---|---|
+| `model_name` | string | `gigaam-v3-e2e-rnnt` | Primary model for `onnx_asr.load_model`. |
+| `quantization` | string | `int8` | Primary model quantization. |
+| `fallback_model_name` | string | `nemo-parakeet-tdt-0.6b-v3` | Fallback model. |
+| `fallback_quantization` | string | `''` | Fallback quantization (full precision). |
+| `fallback_language` | string | `ru` | Passed to the fallback's `recognize`; English still comes out. |
+| `fallback_min_cps` | double | `2.0` | Fewer characters per second of audio → use the fallback. |
+| `fallback_max_latin` | double | `0.5` | Larger share of Latin letters → use the fallback. |
+| `min_audio_sec` | double | `0.8` | Shorter audio is not transcribed. |
+| `output_topic` | string | `voice_command` | Main interlocutor's transcript (`''` when not recognized). |
+| `other_output_topic` | string | `voice_command_other` | Phrases marked `other_speaker`; `''` = not published. |
+| `compare_parakeet` | bool | `False` | Also run the fallback on every phrase and log both. |
+| `compare_log` | string | `''` | JSONL comparison log; `''` disables. |
+| `save_audio_dir` | string | `''` | WAV per phrase; `''` disables. |
+
 ### `tts_node`
 
 Source: [`inmoov_voice/tts_node.py`](inmoov_voice/tts_node.py).
@@ -506,7 +548,7 @@ ros2 topic echo /sound_direction
 | Service | Used by | Details |
 |---|---|---|
 | **TTS HTTP server** | `tts_node` | `tts_server_url` / `tts_fallback_url` (defaults: `http://192.168.10.118:8000` and `''` — no fallback). Endpoints used: `GET /health`, `POST /tts/stream` (see above). The code comments refer to an "OmniVoice / audio.cpp" server with `server.json -> voice_presets` (`neutral`, `happy`, `sad`, `surprise`), after a migration from CosyVoice3. **The server is not part of this repository**; any server implementing these two endpoints works. The `192.168.10.118` default is a private LAN address and must be overridden. |
-| **STT** | `parakeet_stt_node` | No server: the model runs in-process (`onnx-asr`, CPU). |
+| **STT** | `gigaam_stt_node` | No server: the model runs in-process (`onnx-asr`, CPU). |
 | **Model downloads** | `voice_detector_node`, `voice_emotion_node` | Silero VAD via `torch.hub` (GitHub, cached in `~/.cache/torch/hub`), SpeechBrain models via Hugging Face. |
 | **LLM** | (not this package) | `voice_command` is consumed by `llm_node` in `inmoov_cognition`. |
 
@@ -524,7 +566,7 @@ and then `ros2 lifecycle set /<node> configure` / `activate`.
 Where the nodes live in `inmoov_bringup/config/lifecycle.yaml`: tier 1
 (hardware) `audio_source_node`, `sound_localization_node`; tier 2 `wakeword_node`,
 `voice_detector_node`, `tts_node`; tier 3 `voice_emotion_node`,
-`parakeet_stt_node`.
+`gigaam_stt_node` (`parakeet_stt_node` is kept as an executable, not launched).
 
 ## Requirements / Setup
 
@@ -539,7 +581,7 @@ and `setup.py` only `setuptools`, so install these yourself):
 - `pyaudio` (audio source; needs `portaudio` system libraries)
 - `sounddevice` (TTS playback and sound localization)
 - `openwakeword` (wake word)
-- `onnx-asr` (Parakeet STT; imported as `onnx_asr`)
+- `onnx-asr` (GigaAM / Parakeet STT; imported as `onnx_asr`)
 - `speechbrain` (speaker verification, voice emotion)
 
 **Models**
@@ -554,7 +596,8 @@ and `setup.py` only `setuptools`, so install these yourself):
   (default `~/.cache/speechbrain/spkrec-ecapa-voxceleb`).
 - *Voice emotion*: `speechbrain/emotion-recognition-wav2vec2-IEMOCAP`, saved to
   `savedir` (see parameter).
-- *Parakeet*: `nemo-parakeet-tdt-0.6b-v3` (int8), resolved by `onnx-asr`.
+- *GigaAM*: `gigaam-v3-e2e-rnnt` (int8), *Parakeet*: `nemo-parakeet-tdt-0.6b-v3`
+  (full precision), both resolved by `onnx-asr` into the Hugging Face cache.
 
 **Audio**
 
